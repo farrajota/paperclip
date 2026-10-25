@@ -1312,6 +1312,8 @@ describe("sandbox managed runtime", () => {
     const selectedPath = path.join(change === "root_symlink" ? workspaceLocalDir : draftsDir, "report.md");
     await mkdir(draftsDir);
     await writeFile(selectedPath, "selected work\n");
+    const siblings = ["a-sibling.txt", "b-sibling.txt", "c-sibling.txt"];
+    for (const name of siblings) await writeFile(path.join(workspaceLocalDir, name), `allowed ${name}\n`);
     const workspaceInputDir = change.startsWith("root_alias") ? path.join(rootDir, "workspace-alias") : workspaceLocalDir;
     if (change.startsWith("root_alias")) await symlink(workspaceLocalDir, workspaceInputDir);
     const outsideDir = path.join(rootDir, "outside");
@@ -1320,12 +1322,21 @@ describe("sandbox managed runtime", () => {
     await mkdir(path.join(outsideDir, "drafts"));
     await writeFile(path.join(outsideDir, "drafts", "report.md"), "private outside content\n");
     const syncIn = vi.fn(async (operations: SandboxSyncOperation[]) => {
-      if (change.startsWith("root_alias")) {
+      if (change === "ENOENT" || change === "case_alias" || change.startsWith("root_alias")) {
         const overlay = operations.flatMap((operation) => operation.files)
           .find((file) => path.basename(file.targetPath) === "workspace-upload.tar");
         expect(overlay).toBeDefined();
-        const contents = await execFile("tar", ["-xOf", overlay!.sourcePath, "drafts/report.md"]);
-        expect(contents.stdout).toBe("selected work\n");
+        for (const name of siblings) {
+          const contents = await execFile("tar", ["-xOf", overlay!.sourcePath, name]);
+          expect(contents.stdout).toBe(`allowed ${name}\n`);
+        }
+        if (change === "ENOENT") {
+          const members = await execFile("tar", ["-tf", overlay!.sourcePath]);
+          expect(members.stdout.split("\n")).not.toContain("drafts/report.md");
+        } else {
+          const contents = await execFile("tar", ["-xOf", overlay!.sourcePath, "drafts/report.md"]);
+          expect(contents.stdout).toBe("selected work\n");
+        }
       }
       return { operations: [] };
     });

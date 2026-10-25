@@ -98,6 +98,10 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("routine routes end-to-end", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let preparedRouteModules: Promise<[
+    typeof import("../routes/routines.js"),
+    typeof import("../middleware/index.js"),
+  ]>;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-routines-e2e-");
@@ -138,7 +142,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     await tempDb?.cleanup();
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -158,13 +162,16 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     registerRoutineServiceMock();
     vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
     vi.clearAllMocks();
-  });
-
-  async function createApp(actor: Record<string, unknown>) {
-    const [{ routineRoutes }, { errorHandler }] = await Promise.all([
+    // Finish reset-dependent module preparation before a case can outlive its spies.
+    preparedRouteModules = Promise.all([
       import("../routes/routines.js"),
       import("../middleware/index.js"),
     ]);
+    await preparedRouteModules;
+  });
+
+  async function createApp(actor: Record<string, unknown>) {
+    const [{ routineRoutes }, { errorHandler }] = await preparedRouteModules;
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {

@@ -77,10 +77,10 @@ function registerModuleMocks() {
   }));
 }
 
+let preparedMiddleware: Promise<typeof import("../middleware/index.js")>;
+
 async function createApp(routeType: "project" | "goal") {
-  const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
-    "../middleware/index.js",
-  );
+  const { errorHandler } = await preparedMiddleware;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -109,7 +109,7 @@ async function createApp(routeType: "project" | "goal") {
 }
 
 describe("project and goal telemetry routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../telemetry.js");
     vi.doUnmock("../services/index.js");
@@ -146,6 +146,8 @@ describe("project and goal telemetry routes", () => {
       status: "planned",
     });
     mockLogActivity.mockResolvedValue(undefined);
+    preparedMiddleware = vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js");
+    await preparedMiddleware;
   });
 
   it("emits telemetry when a project is created", async () => {

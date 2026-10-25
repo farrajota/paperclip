@@ -156,11 +156,13 @@ function mockManagedRuntime(method: "api_key" | "subscription") {
   );
 }
 
+let preparedRouteModules: Promise<[
+  typeof import("../routes/agents.js"),
+  typeof import("../middleware/index.js"),
+]>;
+
 async function createApp() {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const [{ agentRoutes }, { errorHandler }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -242,6 +244,12 @@ describe("agent test-environment route", () => {
     await unregisterTestAdapter("external_test");
     const { registerServerAdapter } = await import("../adapters/index.js");
     registerServerAdapter(externalAdapter);
+    // Resolve cold imports after registry setup, before a case can outlive its mocks.
+    preparedRouteModules = Promise.all([
+      vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   afterEach(async () => {

@@ -101,16 +101,13 @@ function registerWorkspaceRouteMocks() {
 }
 
 let appImportCounter = 0;
+let preparedProjectRouteModules: Promise<[
+  typeof import("../routes/projects.js"),
+  typeof import("../middleware/index.js"),
+]>;
 
 async function createProjectApp(actor: Record<string, unknown>) {
-  registerWorkspaceRouteMocks();
-  appImportCounter += 1;
-  const routeModulePath = `../routes/projects.js?workspace-runtime-routes-authz-${appImportCounter}`;
-  const middlewareModulePath = `../middleware/index.js?workspace-runtime-routes-authz-${appImportCounter}`;
-  const [{ projectRoutes }, { errorHandler }] = await Promise.all([
-    import(routeModulePath) as Promise<typeof import("../routes/projects.js")>,
-    import(middlewareModulePath) as Promise<typeof import("../middleware/index.js")>,
-  ]);
+  const [{ projectRoutes }, { errorHandler }] = await preparedProjectRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -207,7 +204,7 @@ describe("workspace runtime service route authorization", () => {
   const workspaceId = "22222222-2222-4222-8222-222222222222";
   const executionWorkspaceId = "33333333-3333-4333-8333-333333333333";
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
@@ -292,6 +289,15 @@ describe("workspace runtime service route authorization", () => {
     mockExecutionWorkspaceService.update.mockResolvedValue(buildExecutionWorkspace());
     mockAssertCanManageProjectWorkspaceRuntimeServices.mockResolvedValue(undefined);
     mockAssertCanManageExecutionWorkspaceRuntimeServices.mockResolvedValue(undefined);
+    registerWorkspaceRouteMocks();
+    appImportCounter += 1;
+    const routeModulePath = `../routes/projects.js?workspace-runtime-routes-authz-${appImportCounter}`;
+    const middlewareModulePath = `../middleware/index.js?workspace-runtime-routes-authz-${appImportCounter}`;
+    preparedProjectRouteModules = Promise.all([
+      import(routeModulePath) as Promise<typeof import("../routes/projects.js")>,
+      import(middlewareModulePath) as Promise<typeof import("../middleware/index.js")>,
+    ]);
+    await preparedProjectRouteModules;
   });
 
   it("rejects agent callers for project workspace runtime service mutations when workspace auth denies access", async () => {

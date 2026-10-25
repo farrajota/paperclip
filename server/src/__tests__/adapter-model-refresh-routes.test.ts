@@ -103,11 +103,13 @@ function registerModuleMocks() {
 
 const refreshableAdapterType = "refreshable_adapter_route_test";
 
+let preparedRouteModules: Promise<[
+  typeof import("../routes/agents.js"),
+  typeof import("../middleware/index.js"),
+]>;
+
 async function createApp() {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const [{ agentRoutes }, { errorHandler }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -177,6 +179,13 @@ describe("adapter model refresh route", () => {
     mockListOpenCodeModels.mockReset();
     mockListOpenCodeModels.mockResolvedValue([{ id: "dynamic-opencode-model", label: "dynamic-opencode-model" }]);
     await unregisterTestAdapter(refreshableAdapterType);
+    // Model lookup reads the live registry at request time, after case registration.
+    // Await cold imports here so a timed-out case cannot outlive registry teardown.
+    preparedRouteModules = Promise.all([
+      vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   afterEach(async () => {

@@ -154,6 +154,9 @@ function registerModuleMocks() {
   }));
 }
 
+let preparedAgentRoutes: typeof import("../routes/agents.js")["agentRoutes"];
+let preparedErrorHandler: typeof import("../middleware/index.js")["errorHandler"];
+
 async function createApp(
   db: Record<string, unknown> = {},
   actor: Record<string, unknown> = {
@@ -165,23 +168,14 @@ async function createApp(
   },
   options: { chatRunRetries?: typeof mockChatRunRetries } = {},
 ) {
-  // Vitest tracks factory-mock resolution in one shared call stack. Importing
-  // these graphs concurrently can drop the services/index factory mock and
-  // accidentally run real DB-backed activity logging against this test stub.
-  const { agentRoutes } = await vi.importActual<
-    typeof import("../routes/agents.js")
-  >("../routes/agents.js");
-  const { errorHandler } = await vi.importActual<
-    typeof import("../middleware/index.js")
-  >("../middleware/index.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", agentRoutes(db as any, options));
-  app.use(errorHandler);
+  app.use("/api", preparedAgentRoutes(db as any, options));
+  app.use(preparedErrorHandler);
   return app;
 }
 
@@ -277,7 +271,7 @@ async function requestApp(
 }
 
 describe("agent live run routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/agents.js");
     vi.doUnmock("../services/heartbeat.js");
@@ -398,6 +392,14 @@ describe("agent live run routes", () => {
       skipped: 0,
       skipReasons: [],
     });
+    // Resolve cold imports before requests can outlive this case's mock state.
+    // Keep imports sequential: concurrent factory resolution can lose mocks.
+    ({ agentRoutes: preparedAgentRoutes } = await vi.importActual<
+      typeof import("../routes/agents.js")
+    >("../routes/agents.js"));
+    ({ errorHandler: preparedErrorHandler } = await vi.importActual<
+      typeof import("../middleware/index.js")
+    >("../middleware/index.js"));
   });
 
   describe("heartbeat run ID validation", () => {

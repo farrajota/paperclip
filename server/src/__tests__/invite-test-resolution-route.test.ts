@@ -44,6 +44,11 @@ function createInvite(overrides: Record<string, unknown> = {}) {
   };
 }
 
+let preparedRouteModules: Promise<[
+  typeof import("../routes/access.js"),
+  typeof import("../middleware/index.js"),
+]>;
+
 async function createApp(
   db: Record<string, unknown>,
   network: {
@@ -51,10 +56,7 @@ async function createApp(
     requestHead: ReturnType<typeof vi.fn>;
   },
 ) {
-  const [access, middleware] = await Promise.all([
-    import("../routes/access.js"),
-    import("../middleware/index.js"),
-  ]);
+  const [access, middleware] = await preparedRouteModules;
   const app = express();
   app.use((req, _res, next) => {
     (req as any).actor = { type: "anon" };
@@ -75,8 +77,13 @@ async function createApp(
 }
 
 describe("GET /invites/:token/test-resolution", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    preparedRouteModules = Promise.all([
+      import("../routes/access.js"),
+      import("../middleware/index.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   it("rejects private, local, multicast, and reserved targets before probing", async () => {

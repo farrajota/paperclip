@@ -173,11 +173,13 @@ type TestActor =
       runId: string | null;
     };
 
+let preparedRouteModules: Promise<[
+  typeof import("../middleware/index.js"),
+  typeof import("../routes/issues.js"),
+]>;
+
 async function createApp(actor?: TestActor) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    import("../middleware/index.js"),
-    import("../routes/issues.js"),
-  ]);
+  const [{ errorHandler }, { issueRoutes }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -196,7 +198,7 @@ async function createApp(actor?: TestActor) {
 }
 
 describe("issue execution policy routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/issues.js");
@@ -263,6 +265,12 @@ describe("issue execution policy routes", () => {
       };
     });
     mockAccessService.hasPermission.mockResolvedValue(false);
+    // Finish cold module preparation before a case can outlive its own mocks.
+    preparedRouteModules = Promise.all([
+      import("../middleware/index.js"),
+      import("../routes/issues.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   it("reauthorizes a terminal verdict against the review policy held under the update lock", async () => {

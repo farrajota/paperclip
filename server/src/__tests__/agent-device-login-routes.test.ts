@@ -350,6 +350,10 @@ function createFakeRuntime(promptOutput: string = PROMPT_OUTPUT): LoginSessionRu
 }
 
 let currentActor: Record<string, unknown>;
+let preparedRouteModules: Promise<[
+  typeof import("../routes/agents.js"),
+  typeof import("../middleware/index.js"),
+]>;
 
 function boardActor(userId: string, companyIds: string[] = [COMPANY_1, COMPANY_2]): Record<string, unknown> {
   return {
@@ -362,10 +366,7 @@ function boardActor(userId: string, companyIds: string[] = [COMPANY_1, COMPANY_2
 }
 
 async function createApp() {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const [{ agentRoutes }, { errorHandler }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -385,7 +386,7 @@ describe("adapter device-login routes", () => {
   // `afterEach` whether or not the route removed them itself.
   const accountHomeTestDirs: string[] = [];
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.clearAllMocks();
     mockDeviceLoginPromotion.mockResolvedValue({
@@ -424,6 +425,12 @@ describe("adapter device-login routes", () => {
           ? { plugin: { id: "plugin-daytona" }, driver: { supportsLoginPty: true } }
           : null,
     );
+    // Complete cold imports while this case still owns its actor and store.
+    preparedRouteModules = Promise.all([
+      vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   afterEach(async () => {

@@ -36,11 +36,13 @@ function createDbStub(...selectResponses: unknown[][]) {
   };
 }
 
+let preparedRouteModules: Promise<[
+  typeof import("../routes/access.js"),
+  typeof import("../middleware/index.js"),
+]>;
+
 async function createApp(db: Record<string, unknown>) {
-  const [{ accessRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/access.js"),
-    import("../middleware/index.js"),
-  ]);
+  const [{ accessRoutes }, { errorHandler }] = await preparedRouteModules;
   const app = express();
   app.use((req, _res, next) => {
     (req as any).actor = { type: "anon" };
@@ -65,8 +67,13 @@ async function createApp(db: Record<string, unknown>) {
 }
 
 describe("invite-token endpoint rate limiting", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
+    preparedRouteModules = Promise.all([
+      import("../routes/access.js"),
+      import("../middleware/index.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   it(

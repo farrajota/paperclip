@@ -954,20 +954,37 @@ async function copySelectedWorkspaceEntries(input: {
   };
   await assertSourceRoot();
   const ignored = workspacePathMatcher(input.ignoredPaths);
-  try {
-  for (const relative of workspacePaths(input.relativePaths)) {
-    if (shouldExcludePath(relative, input.exclude) || ignored.matches(relative)) continue;
+  // Cache only bounded path spellings; every entry still checks live metadata.
+  let cachedParent: {
+    directory: string;
+    segments: readonly string[];
+    ancestors: readonly string[];
+  } | undefined;
+  const copySelectedEntry = async (relative: string): Promise<void> => {
     const sourcePath = path.join(sourceDir, relative);
-    const parentSegments = path.relative(sourceDir, path.dirname(sourcePath)).split(path.sep).filter(Boolean);
+    const parentDirectory = path.dirname(sourcePath);
+    let parent = cachedParent;
+    if (!parent || parent.directory !== parentDirectory) {
+      const segments = path.relative(sourceDir, parentDirectory).split(path.sep).filter(Boolean);
+      const cacheable = parentDirectory.length <= 4096 && segments.length <= 8 && !segments.includes("..");
+      let ancestor = sourceDir;
+      const ancestors = cacheable ? segments.map((segment) => (ancestor = path.join(ancestor, segment))) : [];
+      parent = { directory: parentDirectory, segments, ancestors };
+      if (cacheable) cachedParent = parent;
+    }
+    // Capture immutable references before another in-flight copy changes the cache.
+    const parentSegments = parent.segments;
+    const ancestorPaths = parent.ancestors;
     const assertParentDirectory = async () => {
       // Git selected this path before staging. A replaced ancestor must not
       // redirect the copy through a symlink, even to another workspace folder.
       // Inspect types instead of comparing realpath spelling: case-insensitive
       // filesystems can resolve Git's indexed casing to a renamed directory.
       let parentPath = sourceDir;
-      for (const segment of parentSegments) {
+      for (let index = 0; index < parentSegments.length; index++) {
+        const segment = parentSegments[index]!;
         if (segment === "..") throw new Error(`Workspace overlay directory escapes its root: ${relative}`);
-        parentPath = path.join(parentPath, segment);
+        parentPath = ancestorPaths[index] ?? path.join(parentPath, segment);
         if (!(await fs.lstat(parentPath)).isDirectory()) {
           throw new Error(`Workspace overlay ancestor is not a directory: ${relative}`);
         }
@@ -980,14 +997,49 @@ async function copySelectedWorkspaceEntries(input: {
       await assertParentDirectory();
       await fs.lstat(sourcePath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
     }
     await copyWorkspaceEntry(sourceDir, input.targetDir, relative);
     // Do not upload the staged tree if an ancestor changed during the copy.
     await assertSourceRoot();
     await assertParentDirectory();
-  }
+  };
+  const batch: string[] = [];
+  const copyBatch = async (): Promise<void> => {
+    if (batch.length === 0) return;
+    // Preserve input order for ancestors and conservative case/Unicode aliases.
+    const destinations = batch.map((relative) => path.resolve(path.join(input.targetDir, relative))
+      .replaceAll("\\", "/").normalize("NFC").toUpperCase());
+    let overlaps = false;
+    for (let i = 0; i < destinations.length && !overlaps; i++) {
+      for (let j = 0; j < i; j++) {
+        if (isRelativePathOrDescendant(destinations[i]!, destinations[j]!) ||
+            isRelativePathOrDescendant(destinations[j]!, destinations[i]!)) {
+          overlaps = true;
+          break;
+        }
+      }
+    }
+    if (overlaps) {
+      for (const relative of batch) await copySelectedEntry(relative);
+    } else {
+      // Drain every started copy before any failure closes the matcher or tree.
+      const results = await Promise.allSettled(batch.map(copySelectedEntry));
+      for (const result of results) {
+        if (result.status === "rejected") throw result.reason;
+      }
+    }
+    batch.length = 0;
+  };
+  try {
+    for (const relative of workspacePaths(input.relativePaths)) {
+      if (shouldExcludePath(relative, input.exclude) || ignored.matches(relative)) continue;
+      batch.push(relative);
+      // Keep manifest consumption and filesystem work bounded to four entries.
+      if (batch.length === 4) await copyBatch();
+    }
+    await copyBatch();
   } finally { ignored.close(); }
 }
 

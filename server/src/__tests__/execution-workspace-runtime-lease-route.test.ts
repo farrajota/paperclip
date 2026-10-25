@@ -89,6 +89,10 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
   let agentId = "";
   let canaryIssueId = "";
   let competingIssueId = "";
+  let preparedRouteModules: Promise<[
+    typeof import("../routes/execution-workspaces.js"),
+    typeof import("../middleware/index.js"),
+  ]>;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-runtime-lease-route-");
@@ -186,6 +190,12 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
       runtimeServices: [],
     } as never);
     mockExecutionWorkspaceService.update.mockResolvedValue({ id: executionWorkspaceId } as never);
+    // Await cold imports before requests can outlive this case's database rows.
+    preparedRouteModules = Promise.all([
+      import("../routes/execution-workspaces.js"),
+      import("../middleware/index.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   afterEach(async () => {
@@ -198,10 +208,7 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
   });
 
   async function createApp() {
-    const [{ executionWorkspaceRoutes }, { errorHandler }] = await Promise.all([
-      import("../routes/execution-workspaces.js"),
-      import("../middleware/index.js"),
-    ]);
+    const [{ executionWorkspaceRoutes }, { errorHandler }] = await preparedRouteModules;
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -316,10 +323,7 @@ describeEmbeddedPostgres("execution workspace runtime control lease enforcement"
   });
 
   it("leaves board actors unleased and unblocked", async () => {
-    const [{ executionWorkspaceRoutes }, { errorHandler }] = await Promise.all([
-      import("../routes/execution-workspaces.js"),
-      import("../middleware/index.js"),
-    ]);
+    const [{ executionWorkspaceRoutes }, { errorHandler }] = await preparedRouteModules;
     mockAssertCanManage.mockResolvedValue({
       actorType: "board",
       agentId: null,

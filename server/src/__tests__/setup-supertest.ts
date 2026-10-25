@@ -51,11 +51,10 @@ if (!SupertestTest.prototype.__paperclipLoopbackPatched) {
       throw new Error("Expected Supertest server to listen on a TCP port");
     }
 
-    const host = listeningAddress.address === "::"
-      ? "[::1]"
-      : listeningAddress.address === "0.0.0.0"
-        ? "127.0.0.1"
-        : listeningAddress.address;
+    // The dual-stack wildcard also accepts IPv4 where IPv6 loopback is blocked.
+    const host = listeningAddress.address === "::" || listeningAddress.address === "0.0.0.0"
+      ? "127.0.0.1"
+      : listeningAddress.address;
     const protocol = app instanceof TlsServer ? "https" : "http";
     return `${protocol}://${host}:${listeningAddress.port}${path}`;
   };

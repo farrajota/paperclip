@@ -5,6 +5,12 @@
 ### Patch Changes
 
 - Allow the Paperclip host to route adapter sandbox-sync full-tree Git enumeration through its process-wide bounded scheduler.
+- Stage independent Git overlay entries in batches of at most four, preserving
+  input order for overlapping destinations, per-entry root and ancestor checks,
+  exclusions, and settlement of started copies before failure cleanup. Manifest
+  consumption stays bounded; native command deadlines are unchanged.
+  Reuse only bounded ancestor path spellings, never filesystem metadata; all
+  root-identity and ancestor-type checks still run before and after each copy.
 
 ## 0.3.1
 

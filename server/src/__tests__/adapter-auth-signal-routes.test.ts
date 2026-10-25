@@ -124,11 +124,13 @@ function boardActor(userId: string, companyIds: string[] = [COMPANY_1, OTHER_COM
   };
 }
 
+let preparedRouteModules: Promise<[
+  typeof import("../routes/agents.js"),
+  typeof import("../middleware/index.js"),
+]>;
+
 async function createApp() {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const [{ agentRoutes }, { errorHandler }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -144,7 +146,7 @@ const authSignalPath = (companyId: string, type: string, environmentId?: string)
   `/api/companies/${companyId}/adapters/${type}/auth-signal${environmentId ? `?environmentId=${environmentId}` : ""}`;
 
 describe("adapter auth-signal route", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.clearAllMocks();
     currentActor = boardActor(OWNER_A);
@@ -176,6 +178,12 @@ describe("adapter auth-signal route", () => {
       effectiveHome: "/tmp/codex-home",
       sharedSourceHome: "/tmp/codex-shared-home",
     });
+    // Await cold imports in setup without changing the readiness request budget.
+    preparedRouteModules = Promise.all([
+      vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   afterEach(() => {

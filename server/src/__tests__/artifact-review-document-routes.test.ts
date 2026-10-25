@@ -136,11 +136,13 @@ function createStorageService(): StorageService {
   } as unknown as StorageService;
 }
 
+let preparedRouteModules: Promise<[
+  typeof import("../middleware/index.js"),
+  typeof import("../routes/issues.js"),
+]>;
+
 async function createApp(options?: { companyIds?: string[] }) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-  ]);
+  const [{ errorHandler }, { issueRoutes }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -210,12 +212,17 @@ function makeDocument(overrides: Record<string, unknown> = {}) {
 }
 
 describe("work product review-document route", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.clearAllMocks();
     registerRouteMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockWorkProductService.getById.mockResolvedValue(makeWorkProduct());
+    preparedRouteModules = Promise.all([
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+      vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   it("returns 404 when the work product belongs to another issue", async () => {

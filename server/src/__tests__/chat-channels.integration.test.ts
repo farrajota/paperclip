@@ -16136,6 +16136,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .where(eq(chatConversations.endpointId, endpoint.id));
       expect(rows).toHaveLength(1);
     });
+    // Conversation creation precedes the deferred owner's completed batch.
+    // Await that started batch; shutdown does not remove Slack lease rows.
+    await service.shutdown();
     const [conversation] = await db
       .select()
       .from(chatConversations)
@@ -16187,7 +16190,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).toHaveLength(0);
     });
     await competingService.shutdown();
-    await service.shutdown();
   });
 
   it("stops a conversation drain after its lease renewal fails", async () => {

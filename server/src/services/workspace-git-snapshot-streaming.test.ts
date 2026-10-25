@@ -34,7 +34,7 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
     readFile: async (file) => fs.readFile(file),
     listFiles: async (dir) => fs.readdir(dir),
     remove: async (file) => { await fs.rm(file, { recursive: true, force: true }); },
-    run: async (command) => { await execute("sh", ["-c", command]); },
+    run: async (command, options) => { await execute("sh", ["-c", command], { timeout: options.timeoutMs }); },
     syncIn: async (operations) => {
       for (const operation of operations) {
         for (const mapping of operation.files) {
@@ -43,7 +43,7 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
         }
         for (const command of operation.postUploadCommands ?? []) {
           commands.push(command.command);
-          await execute("sh", ["-c", command.command], { maxBuffer: 64 * 1024 });
+          await execute("sh", ["-c", command.command], { maxBuffer: 64 * 1024, timeout: command.timeoutMs });
         }
       }
       return { operations: [] };

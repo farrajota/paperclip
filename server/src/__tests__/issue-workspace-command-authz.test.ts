@@ -151,11 +151,13 @@ function registerRouteMocks() {
   }));
 }
 
+let preparedRouteModules: Promise<[
+  typeof import("../middleware/index.js"),
+  typeof import("../routes/issues.js"),
+]>;
+
 async function createApp(actor: Record<string, unknown>) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-  ]);
+  const [{ errorHandler }, { issueRoutes }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -190,7 +192,7 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
 }
 
 describe("issue workspace command authorization", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/access.js");
     vi.doUnmock("../services/activity-log.js");
@@ -261,6 +263,11 @@ describe("issue workspace command authorization", () => {
           onRejected,
         ),
     }));
+    preparedRouteModules = Promise.all([
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+      vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   it("rejects agent callers that create issue workspace runtime provision commands", async () => {

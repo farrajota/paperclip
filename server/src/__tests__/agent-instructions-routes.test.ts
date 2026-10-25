@@ -133,11 +133,13 @@ function boardActor() {
   };
 }
 
+let preparedRouteModules: Promise<[
+  typeof import("../routes/agents.js"),
+  typeof import("../middleware/index.js"),
+]>;
+
 async function createApp(actor: Record<string, unknown> = boardActor(), db: Record<string, unknown> = {}) {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const [{ agentRoutes }, { errorHandler }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -211,7 +213,7 @@ function makeReflectionCoachAgent(overrides: Record<string, unknown> = {}) {
 }
 
 describe("agent instructions bundle routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/agents.js");
     vi.doUnmock("../routes/authz.js");
@@ -288,6 +290,13 @@ describe("agent instructions bundle routes", () => {
         instructionsFilePath: "/tmp/agent-1/AGENTS.md",
       },
     });
+    // Cold imports must finish before the request budget starts, or a timed-out
+    // case can dispatch after the next case resets its service mocks.
+    preparedRouteModules = Promise.all([
+      vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    ]);
+    await preparedRouteModules;
   });
 
   it("returns bundle metadata", async () => {
