@@ -17,10 +17,19 @@ export async function openRunnerApiWorkspaceFile(path: string): Promise<FileHand
   let directory = await open("/", constants.O_RDONLY | constants.O_DIRECTORY);
   try {
     for (const part of parts.slice(0, -1)) {
-      // Linux magic descriptor links provide openat-style directory confinement.
-      const next = await open(`/proc/self/fd/${directory.fd}/${part}`, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-      await directory.close();
+      // Linux O_PATH lets O_NOFOLLOW open a symlink itself; fstat then rejects it
+      // unless the descriptor actually refers to a directory. O_DIRECTORY alone
+      // may accept an ancestor symlink on supported kernels.
+      const next = await open(`/proc/self/fd/${directory.fd}/${part}`, 0x200000 | constants.O_NOFOLLOW);
+      try {
+        if (!(await next.stat()).isDirectory()) throw new Error("Workspace path component is not a directory");
+      } catch (error) {
+        await next.close();
+        throw error;
+      }
+      const previous = directory;
       directory = next;
+      await previous.close();
     }
     return await open(`/proc/self/fd/${directory.fd}/${parts.at(-1)}`, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
   } finally { await directory.close(); }

@@ -4,13 +4,12 @@
 // runtime.
 //
 // The helper closes the time-of-check-to-time-of-use (TOCTOU) window. It opens
-// the filesystem root, then opens each session-home path component in turn with a
-// no-follow, directory-only open, relative to the previous directory descriptor. A
-// symlink at any component fails the walk. Node has no `openat`, so the helper
-// opens each next component through `/proc/self/fd/<dfd>/<component>`: the kernel
-// resolves the magic descriptor link, then applies `O_NOFOLLOW` to the final
-// component. This binds each open to the descriptor inode, not to a re-resolved
-// pathname, so it matches an `openat` walk.
+// the filesystem root, then opens each session-home component relative to the
+// previous directory descriptor. Linux O_PATH | O_NOFOLLOW returns a descriptor
+// for a final symlink itself rather than following it; fstat on that same opened
+// descriptor enforces that each component is a directory before advancing. Node
+// has no openat, so `/proc/self/fd/<dfd>/<component>` keeps each lookup bound to
+// the prior descriptor rather than re-resolving the original pathname.
 //
 // The helper opens `auth.json` relative to the final directory descriptor with
 // `O_NOFOLLOW`, runs `fstat` on that one descriptor, and reads only from it. The
@@ -42,9 +41,8 @@ if (typeof home !== "string" || !home.startsWith("/")) fail();
 const parts = home.split("/").filter((component) => component.length > 0);
 if (parts.length === 0) fail();
 
-// Open each component with a no-follow, directory-only open relative to the
-// previous descriptor. A symlink or a non-directory at any component throws, so
-// the read fails closed and never leaves the trusted tree.
+// O_PATH | O_NOFOLLOW opens a terminal symlink as a descriptor; fstat of that
+// same descriptor rejects it unless it is actually a directory.
 let dfd;
 try {
   dfd = fs.openSync("/", fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
@@ -52,14 +50,21 @@ try {
   fail();
 }
 for (const part of parts) {
+  let next;
   try {
-    dfd = fs.openSync(
+    next = fs.openSync(
       `/proc/self/fd/${dfd}/${part}`,
-      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+      0x200000 | fs.constants.O_NOFOLLOW,
     );
+    if (!fs.fstatSync(next).isDirectory()) throw new Error();
   } catch {
+    if (next !== undefined) fs.closeSync(next);
+    fs.closeSync(dfd);
     fail();
   }
+  const previous = dfd;
+  dfd = next;
+  fs.closeSync(previous);
 }
 
 // Open the credential relative to the final directory descriptor with a no-follow
@@ -68,8 +73,10 @@ let ffd;
 try {
   ffd = fs.openSync(`/proc/self/fd/${dfd}/${NAME}`, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
 } catch {
+  fs.closeSync(dfd);
   fail();
 }
+fs.closeSync(dfd);
 
 // Validate the opened descriptor, then read only from it.
 const st = fs.fstatSync(ffd);
