@@ -130,7 +130,7 @@ const describeLiveListeners = process.platform === "linux" ? describe : describe
 
 describeLiveListeners("diagnoseRuntimeListenerBinds against live listeners", () => {
   async function withListener<T>(
-    host: string | undefined,
+    host: string,
     body: (port: number) => Promise<T>,
   ): Promise<T> {
     const server = net.createServer();
@@ -146,8 +146,7 @@ describeLiveListeners("diagnoseRuntimeListenerBinds against live listeners", () 
         resolve(address.port);
       };
       server.once("error", onError);
-      if (host === undefined) server.listen(0, onListening);
-      else server.listen(0, host, onListening);
+      server.listen(0, host, onListening);
     });
     try {
       return await body(port);
@@ -155,26 +154,23 @@ describeLiveListeners("diagnoseRuntimeListenerBinds against live listeners", () 
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   }
+  it("names the port and the wildcard address for a real 0.0.0.0 listener", async () => {
+    await withListener("0.0.0.0", async (appPort) => {
+      const diagnosis = await diagnoseRuntimeListenerBinds([appPort]);
+      expect(diagnosis).toContain(`port ${appPort}`);
+      expect(diagnosis).toContain("0.0.0.0");
+      expect(diagnosis).toContain("--bind loopback");
+    });
+  });
 
   it("stays silent for a real loopback listener", async () => {
     await withListener("127.0.0.1", async (appPort) => {
       expect(await diagnoseRuntimeListenerBinds([appPort])).toBeNull();
     });
   });
-
-  it("names the port and the wildcard address for a real 0.0.0.0 listener", async () => {
-    await withListener(undefined, async (appPort) => {
-      const diagnosis = await diagnoseRuntimeListenerBinds([appPort]);
-      expect(diagnosis).toContain(`port ${appPort}`);
-      // Node's hostless listen is dual-stack, so /proc shows :: and/or 0.0.0.0.
-      expect(diagnosis).toMatch(/0\.0\.0\.0|::/);
-      expect(diagnosis).toContain("--bind loopback");
-    });
-  });
-
   it("catches the HMR companion port too, not just the app port", async () => {
     await withListener("127.0.0.1", async (appPort) => {
-      await withListener(undefined, async (hmrPort) => {
+      await withListener("0.0.0.0", async (hmrPort) => {
         const diagnosis = await diagnoseRuntimeListenerBinds([appPort, hmrPort]);
         expect(diagnosis).toContain(`port ${hmrPort}`);
         expect(diagnosis).not.toContain(`port ${appPort} is bound`);
