@@ -37,9 +37,16 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
     run: async (command, options) => { await execute("sh", ["-c", command], { timeout: options.timeoutMs }); },
     syncIn: async (operations) => {
       for (const operation of operations) {
-        for (const mapping of operation.files) {
-          await fs.mkdir(path.dirname(mapping.targetPath), { recursive: true });
-          await fs.copyFile(mapping.sourcePath, mapping.targetPath);
+        const createdDirectories = new Set<string>();
+        for (let start = 0; start < operation.files.length; start += 100) {
+          const files = operation.files.slice(start, start + 100);
+          const newDirectories = [...new Set(files.map((mapping) => path.dirname(mapping.targetPath)))].filter((dir) => !createdDirectories.has(dir));
+          const directoryResults = await Promise.allSettled(newDirectories.map(async (dir) => { await fs.mkdir(dir, { recursive: true }); createdDirectories.add(dir); }));
+          const directoryFailure = directoryResults.find((result) => result.status === "rejected");
+          if (directoryFailure) throw directoryFailure.reason;
+          const copyResults = await Promise.allSettled(files.map((mapping) => fs.copyFile(mapping.sourcePath, mapping.targetPath)));
+          const copyFailure = copyResults.find((result) => result.status === "rejected");
+          if (copyFailure) throw copyFailure.reason;
         }
         for (const command of operation.postUploadCommands ?? []) {
           commands.push(command.command);
@@ -121,10 +128,21 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   const runtime = await stage(snapshot);
   const remoteParent = path.join(remote, path.relative(repo, parent));
   let stagedCount = 0;
+  let stagedBatch: string[] = [];
+  const checkStagedBatch = async () => {
+    const results = await Promise.allSettled(stagedBatch.map((name) => fs.readFile(path.join(remoteParent, name), "utf8")));
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+      expect(result.value).toBe("base");
+    }
+    stagedCount += stagedBatch.length;
+    stagedBatch = [];
+  };
   for await (const entry of await fs.opendir(remoteParent)) {
-    expect(await fs.readFile(path.join(remoteParent, entry.name), "utf8")).toBe("base");
-    stagedCount++;
+    stagedBatch.push(entry.name);
+    if (stagedBatch.length === 100) await checkStagedBatch();
   }
+  if (stagedBatch.length > 0) await checkStagedBatch();
   expect(stagedCount).toBe(40_000);
   for (const name of unusual) expect(await fs.readFile(path.join(remote, name), "utf8")).toBe(name);
   const manifestFile = isPathManifest(snapshot.overlayPaths) ? snapshot.overlayPaths.filePath : "";
