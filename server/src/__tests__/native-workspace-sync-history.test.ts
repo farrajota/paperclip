@@ -11,15 +11,38 @@ import { runLocalGit } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { prepareNativeWorkspaceSync } from "../services/native-runtime/native-workspace-sync.js";
 
 const runner: CommandManagedRuntimeRunner = {
-  execute: (input) => new Promise((resolve) => {
+  execute: (input) => new Promise<{
+    exitCode: number;
+    signal: NodeJS.Signals | null;
+    timedOut: boolean;
+    stdout: string;
+    stderr: string;
+    pid: number | null;
+    startedAt: string;
+  }>((resolve, reject) => {
+    let stdinError: Error | undefined;
+    const startedAt = new Date().toISOString();
     const child = execFile(input.command, input.args ?? [], {
       cwd: input.cwd, env: { ...process.env, ...input.env },
       timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024,
-    }, (error, stdout, stderr) => resolve({
-      exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0,
-      signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr,
-    }));
-    child.stdin?.end(input.stdin ?? "");
+    }, (error, stdout, stderr) => {
+      if (stdinError) {
+        reject(stdinError);
+        return;
+      }
+      resolve({
+        exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0,
+        signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr,
+        pid: child.pid ?? null, startedAt,
+      });
+    });
+    if (child.stdin) {
+      child.stdin.once("error", (error) => { stdinError = error; });
+      if (input.stdin) child.stdin.end(input.stdin);
+      else child.stdin.end();
+    } else if (input.stdin) {
+      stdinError = new Error("Child stdin is unavailable");
+    }
   }),
 };
 
