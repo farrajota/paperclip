@@ -7423,6 +7423,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const cleanupRuntimeHome = await createRuntimeHome();
     const workspace = fixture.workspaces[0]!;
     const basePort = await findFreePort();
+    const occupant = await listenOnPort(basePort);
     const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-no-lsof-"));
     const fakeLsof = path.join(fakeBin, "lsof");
     const previousPath = process.env.PATH;
@@ -7454,6 +7455,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         executionWorkspaceId: workspace.id,
         workspaceCwd: workspace.cwd,
       }).catch(() => undefined);
+      await closeNetServer(occupant);
       await fs.rm(fakeBin, { recursive: true, force: true });
       await cleanupRuntimeHome();
       await fixture.cleanup();

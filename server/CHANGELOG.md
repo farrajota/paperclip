@@ -9,6 +9,8 @@
 
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 
+- Correct the workspace-runtime occupied-port regression fixture to keep a real listener bound while listener-owner lookup is unavailable. The unchanged rejection, full allocation-attempt assertions and 20-second deadline pass in the local native regression; exact Hetzner CI validation remains pending.
+
 ## 0.3.1
 
 ### Patch Changes
