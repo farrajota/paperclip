@@ -1,3 +1,4 @@
+import { syncBuiltinESMExports } from "node:module";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -14,6 +15,7 @@ import {
 import type { BrokerClient, BrokerListenerRequest } from "./runtime-exposure/broker-client.js";
 import {
   diagnoseRuntimeListenerBinds,
+  parseProcNetListeners,
   readListenerBindFacts,
 } from "./runtime-exposure/loopback-listener.js";
 import * as listenerBindModule from "./runtime-exposure/loopback-listener.js";
@@ -781,6 +783,54 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
 
     const ownerOutcomes = new Map<number, "known" | "unknown">();
     const presenceOutcomes = new Map<number, "present-loopback" | "present-nonloopback" | "absent" | "unknown">();
+    type ProcTable = "tcp" | "tcp6";
+    type ProcTableObservation = { outcome: "success" | "failure" | "unobserved"; ports: Map<number, boolean | null> };
+    const procTableObservations: Record<ProcTable, ProcTableObservation> = {
+      tcp: { outcome: "unobserved", ports: new Map() },
+      tcp6: { outcome: "unobserved", ports: new Map() },
+    };
+    const originalReadFile = fs.readFile.bind(fs);
+    const tableReadSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      const [filePath] = args;
+      const table: ProcTable | null = filePath === "/proc/net/tcp" ? "tcp"
+        : filePath === "/proc/net/tcp6" ? "tcp6" : null;
+      if (!table) return originalReadFile(...args);
+
+      const observation = procTableObservations[table];
+      try {
+        const content = await originalReadFile(...args);
+        try {
+          const text = String(content);
+          const rows = parseProcNetListeners(text);
+          const ports = [...allocatedPorts].slice(0, 2);
+          const ambiguousPorts = new Set<number>();
+          for (const line of text.split("\n").slice(1)) {
+            const columns = line.trim().split(/\s+/);
+            if (columns.length >= 10) continue;
+            const localPortHex = columns[1]?.split(":")[1]?.toUpperCase();
+            if (columns[3] !== "0A" || !localPortHex) continue;
+            for (const port of ports) {
+              if (localPortHex === port.toString(16).toUpperCase().padStart(4, "0")) ambiguousPorts.add(port);
+            }
+          }
+          observation.outcome = "success";
+          observation.ports = new Map(ports.map((port) => {
+            const wantHex = port.toString(16).toUpperCase().padStart(4, "0");
+            const listening = rows.some((row) => row.localPortHex.toUpperCase() === wantHex && row.state === "0A");
+            return [port, listening ? true : ambiguousPorts.has(port) ? null : false];
+          }));
+        } catch {
+          observation.outcome = "success";
+          observation.ports = new Map([...allocatedPorts].slice(0, 2).map((port) => [port, null]));
+        }
+        return content;
+      } catch (error) {
+        observation.outcome = "failure";
+        observation.ports = new Map([...allocatedPorts].slice(0, 2).map((port) => [port, null]));
+        throw error;
+      }
+    });
+    syncBuiltinESMExports();
     const originalOwnerLookup = localServiceSupervisor.readLocalServicePortOwner;
     const originalPresenceLookup = listenerBindModule.readListenerBindFacts;
     const ownerSpy = vi.spyOn(localServiceSupervisor, "readLocalServicePortOwner").mockImplementation(async (port) => {
@@ -811,6 +861,8 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
     })).then(() => null, (err: unknown) => err as Error).finally(() => {
       ownerSpy.mockRestore();
       presenceSpy.mockRestore();
+      tableReadSpy.mockRestore();
+      syncBuiltinESMExports();
     });
 
     type GuestBindRecord = { bindCompleted: true; addressFamily: string | null; port: number | null };
@@ -829,6 +881,11 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
       allocatedPorts: ports,
       ownership: ports.map((port) => ({ port, outcome: ownerOutcomes.get(port) ?? "unknown" })),
       presence: ports.map((port) => ({ port, outcome: presenceOutcomes.get(port) ?? "unknown" })),
+      tableReads: (["tcp", "tcp6"] as const).map((table) => ({
+        table,
+        outcome: procTableObservations[table].outcome,
+        ports: ports.map((port) => ({ port, listening: procTableObservations[table].ports.get(port) ?? null })),
+      })),
     };
     const line = JSON.stringify(record);
     console.log(line);

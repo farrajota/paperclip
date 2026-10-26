@@ -2,6 +2,7 @@ import { execFile, type ExecFileOptions } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 import { afterEach, expect, it } from "vitest";
 import { disposeGitWorkspaceSnapshot, readGitWorkspaceSnapshot, runLocalGit, setExpensiveWorkspaceGitExecutor, type GitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
@@ -9,6 +10,17 @@ import { isPathManifest, workspacePaths } from "@paperclipai/adapter-utils/works
 import { prepareSandboxManagedRuntime, type PreparedSandboxManagedRuntime, type SandboxManagedRuntimeClient } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { createWorkspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
 
+enum StreamDiagnosticPhase {
+  FixtureReady = "fixture_ready",
+  StandaloneUntrackedScan = "standalone_untracked_scan",
+  ScheduledUntrackedScan = "scheduled_untracked_scan",
+  StageAndContentChecks = "stage_and_content_checks",
+  SnapshotCleanup = "snapshot_cleanup",
+  IgnoredScan = "ignored_scan",
+  InitialTrackingCommit = "initial_tracking_commit",
+  ChangedScan = "changed_scan",
+  DeletionScanComplete = "deletion_scan_complete",
+}
 const exec = promisify(execFile);
 async function execute(command: string, args: string[], options: ExecFileOptions = {}): Promise<void> {
   try { await exec(command, args, options); }
@@ -61,6 +73,14 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
 // macOS adds per-file process and filesystem overhead to the real deletion lane.
 const realGitTimeoutMs = process.platform === "darwin" ? 300_000 : 180_000;
 it("streams and stages all four real Git filename lanes above 32 MiB through the shared scheduler", async () => {
+  const diagnosticStartedAt = performance.now();
+  const observePhase = (phase: StreamDiagnosticPhase) => {
+    console.log(JSON.stringify({
+      event: "native_stream_bounded_diagnostic",
+      phase,
+      elapsedMs: Math.floor(performance.now() - diagnosticStartedAt),
+    }));
+  };
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "pc-stream-git-")));
   directories.push(root);
   const repo = path.join(root, "repo");
@@ -108,13 +128,16 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   };
   await writeFiles(fileContent);
   const unusual = [" space ", "line\nbreak", "-option", "雪-💾", "wild[?]*"];
-  for (const name of unusual) await fs.writeFile(path.join(repo, name), name);
+  const unusualWriteResults = await Promise.allSettled(unusual.map((name) => fs.writeFile(path.join(repo, name), name)));
+  const unusualWriteFailure = unusualWriteResults.find((result) => result.status === "rejected");
+  if (unusualWriteFailure) throw unusualWriteFailure.reason;
   const scheduler = createWorkspaceGitOperationScheduler({ concurrency: 2, queueCapacity: 8 });
   const bindScheduler = () => setExpensiveWorkspaceGitExecutor((input) => scheduler.run({
     workspacePath: input.localDir, args: input.args, operation: input.operation,
     timeoutMs: input.timeout, onStdout: input.onStdout, signal: input.signal, cacheTtlMs: 0,
     maxStdoutBytes: 1, maxStderrBytes: 64 * 1024,
   }));
+  observePhase(StreamDiagnosticPhase.FixtureReady);
   const scan = async () => {
     const result = await readGitWorkspaceSnapshot(repo);
     expect(result).not.toBeNull();
@@ -138,9 +161,11 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   const standalone = await scan();
   checkLargeLane(standalone.overlayPaths);
   await disposeGitWorkspaceSnapshot(standalone);
+  observePhase(StreamDiagnosticPhase.StandaloneUntrackedScan);
   bindScheduler();
   const snapshot = await scan();
   checkLargeLane(snapshot.overlayPaths);
+  observePhase(StreamDiagnosticPhase.ScheduledUntrackedScan);
   await fs.writeFile(path.join(parent, "late.js"), "must not stage");
   const commands: string[] = [];
   const remote = path.join(root, "remote");
@@ -187,23 +212,33 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
     await fs.rename(shortRemoteParent, remoteParent);
   };
   await checkStagedFiles();
-  for (const name of unusual) expect(await fs.readFile(path.join(remote, name), "utf8")).toBe(name);
+  const unusualReadResults = await Promise.allSettled(unusual.map((name) => fs.readFile(path.join(remote, name), "utf8")));
+  for (let index = 0; index < unusualReadResults.length; index++) {
+    const result = unusualReadResults[index]!;
+    if (result.status === "rejected") throw result.reason;
+    expect(result.value).toBe(unusual[index]);
+  }
+  observePhase(StreamDiagnosticPhase.StageAndContentChecks);
   const manifestFile = isPathManifest(snapshot.overlayPaths) ? snapshot.overlayPaths.filePath : "";
   await runtime.cleanupWorkspaceSnapshot();
   await expect(fs.stat(manifestFile)).rejects.toMatchObject({ code: "ENOENT" });
+  observePhase(StreamDiagnosticPhase.SnapshotCleanup);
   await fs.rm(path.join(parent, "late.js"));
 
   await fs.writeFile(path.join(repo, ".gitignore"), "*.js\n");
   const ignored = await scan();
   checkLargeLane(ignored.ignoredPaths);
   await disposeGitWorkspaceSnapshot(ignored);
+  observePhase(StreamDiagnosticPhase.IgnoredScan);
   await fs.rm(path.join(repo, ".gitignore"));
   await git(["add", "--", "."]);
   await git(["commit", "-qm", "track generated files"]);
+  observePhase(StreamDiagnosticPhase.InitialTrackingCommit);
   await writeFiles(changedContent);
   const changed = await scan();
   checkLargeLane(changed.overlayPaths);
   await disposeGitWorkspaceSnapshot(changed);
+  observePhase(StreamDiagnosticPhase.ChangedScan);
   // The generated names are already known; avoid recursively rediscovering
   // and statting every file, or traversing the long parents for each unlink.
   await withShortParent(async () => {
@@ -222,4 +257,5 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   expect(remaining).toBe(0);
   expect(commands.every((command) => command.length < 16 * 1024)).toBe(true);
   expect(scheduler.snapshot()).toMatchObject({ activeCount: 0, queuedCount: 0, inFlightCount: 0, cacheBytes: 0 });
+  observePhase(StreamDiagnosticPhase.DeletionScanComplete);
 }, realGitTimeoutMs);
