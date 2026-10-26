@@ -9,7 +9,7 @@
 
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 
-- Correct the workspace-runtime occupied-port regression fixture to keep a real listener bound while listener-owner lookup is unavailable. The unchanged rejection, full allocation-attempt assertions and 20-second deadline pass in the local native regression; exact Hetzner CI validation remains pending.
+- Observe allocated-port listener presence before looking up its owner so a stale empty result cannot discard a newly bound child. Unattributed listeners still fail closed, and attributable owners retain the 250 ms process-group stability check. All 196 affected local cases pass, including the unchanged 20-second unknown-owner regression and a synchronized startup-race regression; exact Hetzner CI qualification remains pending.
 
 ## 0.3.1
 

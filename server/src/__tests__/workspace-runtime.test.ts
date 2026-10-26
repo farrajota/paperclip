@@ -7418,6 +7418,92 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     }
   }, 20_000);
 
+  it("keeps the allocated port when the child binds after an empty owner snapshot", async () => {
+    const fixture = await createRuntimeFixture();
+    const cleanupRuntimeHome = await createRuntimeHome();
+    const workspace = fixture.workspaces[0]!;
+    const basePort = await findFreePort();
+    const spawnedPath = path.join(workspace.cwd, "spawned.marker");
+    const releasePath = path.join(workspace.cwd, "release-bind.marker");
+    const boundPath = path.join(workspace.cwd, "bound.marker");
+    const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-owner-race-"));
+    const previousPath = process.env.PATH;
+    const serverScript = [
+      "const fs=require('node:fs');",
+      `const release=${JSON.stringify(releasePath)};`,
+      "let binding=false;",
+      "const bind=()=>{",
+      "if(binding||!fs.existsSync(release))return;",
+      "binding=true;watcher.close();",
+      "require('node:http').createServer((_req,res)=>res.end('ok'))",
+      ".listen(Number(process.env.PORT),'127.0.0.1',()=>{",
+      `fs.writeFileSync(${JSON.stringify(boundPath)},process.env.PORT);`,
+      "});",
+      "};",
+      "const watcher=fs.watch(require('node:path').dirname(release),bind);",
+      `fs.writeFileSync(${JSON.stringify(spawnedPath)},'spawned');`,
+      "bind();",
+    ].join("");
+    // Capture a real empty lsof result, then release the child and return that
+    // snapshot only after it binds. Subsequent queries use the real owner.
+    const lsofScript = [
+      `#!${process.execPath}`,
+      "const fs=require('node:fs');",
+      `process.env.PATH=${JSON.stringify(previousPath ?? "")};`,
+      "const result=require('node:child_process').spawnSync('lsof',process.argv.slice(2),{encoding:'utf8'});",
+      `const release=${JSON.stringify(releasePath)};`,
+      `if(process.argv.includes(${JSON.stringify(`-iTCP:${basePort}`)})`,
+      `&&fs.existsSync(${JSON.stringify(spawnedPath)})&&!fs.existsSync(release)&&result.status===1&&!result.stdout?.trim()){`,
+      `const bound=${JSON.stringify(boundPath)};`,
+      "const finish=()=>{if(fs.existsSync(bound)){watcher.close();process.exit(1);}};",
+      "const watcher=fs.watch(require('node:path').dirname(bound),{signal:AbortSignal.timeout(5000)},finish);",
+      "watcher.on('close',()=>process.exit(2));",
+      `fs.writeFileSync(release,${JSON.stringify(String(basePort))});`,
+      "finish();",
+      "}else{",
+      "process.stdout.write(result.stdout??'');",
+      "process.stderr.write(result.stderr??'');",
+      "process.exit(result.status??1);",
+      "}",
+    ].join("\n");
+    await fs.writeFile(path.join(fakeBin, "lsof"), lsofScript, { mode: 0o755 });
+    process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
+
+    try {
+      const started = (await startRuntimeServicesForWorkspaceControl({
+        db,
+        actor: fixture.actor,
+        issue: null,
+        workspace: fixture.realizedWorkspace(workspace),
+        executionWorkspaceId: workspace.id,
+        config: fixedPortRuntimeConfig(basePort, `${JSON.stringify(process.execPath)} -e ${JSON.stringify(serverScript)}`),
+        adapterEnv: {},
+      }))[0]!;
+
+      expect(await fs.readFile(releasePath, "utf8")).toBe(String(basePort));
+      expect(await fs.readFile(boundPath, "utf8")).toBe(String(basePort));
+      expect(started).toMatchObject({ port: basePort, status: "running", healthStatus: "healthy" });
+      await expect(fetch(started.url!)).resolves.toMatchObject({ ok: true });
+      const persisted = await db
+        .select()
+        .from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.executionWorkspaceId, workspace.id))
+        .then((rows) => rows[0] ?? null);
+      expect(persisted).toMatchObject({ port: basePort, url: started.url, status: "running" });
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId: workspace.id,
+        workspaceCwd: workspace.cwd,
+      }).catch(() => undefined);
+      await fs.rm(fakeBin, { recursive: true, force: true });
+      await cleanupRuntimeHome();
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("does not accept an occupied allocated port when listener ownership is unavailable", async () => {
     const fixture = await createRuntimeFixture();
     const cleanupRuntimeHome = await createRuntimeHome();

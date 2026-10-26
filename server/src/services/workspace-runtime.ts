@@ -5156,6 +5156,10 @@ async function waitForAllocatedPortBind(input: {
       throw new Error("service process exited before binding its allocated port");
     }
 
+    // Observe presence before looking up ownership: the child can bind while
+    // an earlier empty owner lookup is in flight. A later presence snapshot
+    // must not turn that stale absence into a collision with our own child.
+    const listenerPresent = await hasLoopbackPortListener(input.port);
     const ownerPid = await readLocalServicePortOwner(input.port);
     if (ownerPid) {
       const childPid = input.child.pid ?? null;
@@ -5175,17 +5179,12 @@ async function waitForAllocatedPortBind(input: {
       return;
     }
 
-    // A present listener proves only that some listener appeared. If listener ownership cannot
-    // be attributed to this child after a stability delay, retry instead of accepting a sibling.
-    // The presence read never binds the port, so it cannot steal the port from the child.
-    if (await hasLoopbackPortListener(input.port)) {
-      await delay(250);
+    // A listener observed before the owner lookup still needs attribution.
+    // Reject an unknown owner without the stability delay reserved for known owners.
+    if (listenerPresent) {
       if (input.child.exitCode !== null || input.child.signalCode !== null) {
         throw new Error("service process exited after losing its allocated port");
       }
-      const stableOwnerPid = await readLocalServicePortOwner(input.port);
-      const childPid = input.child.pid ?? null;
-      if (stableOwnerPid && childPid && await isLocalServiceProcessOwnedBy(stableOwnerPid, childPid)) return;
       throw new RuntimeServicePortBindCollision(input.port);
     }
     await delay(50);
