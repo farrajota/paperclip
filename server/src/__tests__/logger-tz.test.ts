@@ -70,6 +70,7 @@ describe("logger translateTime respects TZ environment variable", () => {
 
   it("does not construct a pretty transport in production", async () => {
     vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("PAPERCLIP_LOG_LEVEL", undefined);
     await import("../middleware/logger.js");
 
     expect(mockTransport).not.toHaveBeenCalled();
