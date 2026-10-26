@@ -74,12 +74,14 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   const parent = path.join(repo, ...Array.from({ length: 3 }, () => "nested-".repeat(30)), "storybook-output");
   await fs.mkdir(parent, { recursive: true });
   const fileName = (index: number) => `${"asset-".repeat(36)}${index}.js`;
-  const writeFiles = async (content: string) => {
+  const fileContent = Buffer.from("base");
+  const changedContent = Buffer.from("changed");
+  const writeFiles = async (content: Buffer) => {
     for (let start = 0; start < 40_000; start += 100) {
       await Promise.all(Array.from({ length: 100 }, (_, offset) => fs.writeFile(path.join(parent, fileName(start + offset)), content)));
     }
   };
-  await writeFiles("base");
+  await writeFiles(fileContent);
   const unusual = [" space ", "line\nbreak", "-option", "雪-💾", "wild[?]*"];
   for (const name of unusual) await fs.writeFile(path.join(repo, name), name);
   const scheduler = createWorkspaceGitOperationScheduler({ concurrency: 2, queueCapacity: 8 });
@@ -130,10 +132,11 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   let stagedCount = 0;
   let stagedBatch: string[] = [];
   const checkStagedBatch = async () => {
-    const results = await Promise.allSettled(stagedBatch.map((name) => fs.readFile(path.join(remoteParent, name), "utf8")));
-    for (const result of results) {
+    const results = await Promise.allSettled(stagedBatch.map((name) => fs.readFile(path.join(remoteParent, name))));
+    for (let index = 0; index < results.length; index++) {
+      const result = results[index]!;
       if (result.status === "rejected") throw result.reason;
-      expect(result.value).toBe("base");
+      if (!result.value.equals(fileContent)) throw new Error(`Staged file has unexpected content: ${stagedBatch[index]}`);
     }
     stagedCount += stagedBatch.length;
     stagedBatch = [];
@@ -157,7 +160,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   await fs.rm(path.join(repo, ".gitignore"));
   await git(["add", "--", "."]);
   await git(["commit", "-qm", "track generated files"]);
-  await writeFiles("changed");
+  await writeFiles(changedContent);
   const changed = await scan();
   checkLargeLane(changed.overlayPaths);
   await disposeGitWorkspaceSnapshot(changed);
