@@ -784,10 +784,29 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
     const ownerOutcomes = new Map<number, "known" | "unknown">();
     const presenceOutcomes = new Map<number, "present-loopback" | "present-nonloopback" | "absent" | "unknown">();
     type ProcTable = "tcp" | "tcp6";
+    type ErrorCategory = "ENOENT" | "EACCES" | "EPERM" | "ENOSYS" | "EIO" | "EMFILE" | "ENFILE" | "EAGAIN" | "ETIMEDOUT" | "OTHER" | "NONE";
+    type TimedOutcome = { outcome: "success" | "failure" | "known" | "unknown" | "rejected"; errorCategory: ErrorCategory; reason: "not_exposed" | null; startedAtMs: number; durationMs: number };
+    type FirstLast = { first: TimedOutcome | null; last: TimedOutcome | null };
     type ProcTableObservation = { outcome: "success" | "failure" | "unobserved"; ports: Map<number, boolean | null> };
     const procTableObservations: Record<ProcTable, ProcTableObservation> = {
       tcp: { outcome: "unobserved", ports: new Map() },
       tcp6: { outcome: "unobserved", ports: new Map() },
+    };
+    const tableTimings: Record<ProcTable, FirstLast> = {
+      tcp: { first: null, last: null },
+      tcp6: { first: null, last: null },
+    };
+    const ownerTimings = new Map<number, FirstLast>();
+    const monotonicMs = () => Number(process.hrtime.bigint() / 1_000_000n);
+    const errorCategory = (error: unknown): ErrorCategory => {
+      if (error === null || typeof error !== "object" || !("code" in error)) return "OTHER";
+      const code = error.code;
+      return code === "ENOENT" || code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "EIO" || code === "EMFILE" || code === "ENFILE" || code === "EAGAIN" || code === "ETIMEDOUT" ? code : "OTHER";
+    };
+    const observeTiming = (slots: FirstLast, outcome: TimedOutcome["outcome"], category: ErrorCategory, startedAtMs: number, reason: "not_exposed" | null = null) => {
+      const observation = { outcome, errorCategory: category, reason, startedAtMs, durationMs: monotonicMs() - startedAtMs };
+      if (slots.first === null) slots.first = observation;
+      slots.last = observation;
     };
     const originalReadFile = fs.readFile.bind(fs);
     const tableReadSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
@@ -797,6 +816,7 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
       if (!table) return originalReadFile(...args);
 
       const observation = procTableObservations[table];
+      const startedAtMs = monotonicMs();
       try {
         const content = await originalReadFile(...args);
         try {
@@ -823,9 +843,11 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
           observation.outcome = "success";
           observation.ports = new Map([...allocatedPorts].slice(0, 2).map((port) => [port, null]));
         }
+        observeTiming(tableTimings[table], "success", "NONE", startedAtMs);
         return content;
       } catch (error) {
         observation.outcome = "failure";
+        observeTiming(tableTimings[table], "failure", errorCategory(error), startedAtMs);
         observation.ports = new Map([...allocatedPorts].slice(0, 2).map((port) => [port, null]));
         throw error;
       }
@@ -834,12 +856,27 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
     const originalOwnerLookup = localServiceSupervisor.readLocalServicePortOwner;
     const originalPresenceLookup = listenerBindModule.readListenerBindFacts;
     const ownerSpy = vi.spyOn(localServiceSupervisor, "readLocalServicePortOwner").mockImplementation(async (port) => {
+      const startedAtMs = monotonicMs();
+      let slots: FirstLast | undefined;
+      if (allocatedPorts.has(port)) {
+        slots = ownerTimings.get(port);
+        if (!slots) {
+          slots = { first: null, last: null };
+          ownerTimings.set(port, slots);
+        }
+      }
       try {
         const owner = await originalOwnerLookup(port);
-        if (allocatedPorts.has(port)) ownerOutcomes.set(port, owner === null ? "unknown" : "known");
+        if (allocatedPorts.has(port)) {
+          ownerOutcomes.set(port, owner === null ? "unknown" : "known");
+          observeTiming(slots!, owner === null ? "unknown" : "known", "NONE", startedAtMs, owner === null ? "not_exposed" : null);
+        }
         return owner;
       } catch (error) {
-        if (allocatedPorts.has(port)) ownerOutcomes.set(port, "unknown");
+        if (allocatedPorts.has(port)) {
+          ownerOutcomes.set(port, "unknown");
+          observeTiming(slots!, "rejected", errorCategory(error), startedAtMs);
+        }
         throw error;
       }
     });
@@ -889,6 +926,16 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
     };
     const line = JSON.stringify(record);
     console.log(line);
+    const timingRecord = {
+      event: "native_hmr_inspection_timing_diagnostic",
+      tableReads: (["tcp", "tcp6"] as const).map((table) => ({ table, ...tableTimings[table] })),
+      ownerLookups: ports.map((port) => ({
+        port,
+        first: ownerTimings.get(port)?.first ?? null,
+        last: ownerTimings.get(port)?.last ?? null,
+      })),
+    };
+    console.log(JSON.stringify(timingRecord));
 
     expect(error).not.toBeNull();
     expect(error!.message).toContain("listener_ownership_mismatch");
