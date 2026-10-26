@@ -16,6 +16,8 @@ import {
   diagnoseRuntimeListenerBinds,
   readListenerBindFacts,
 } from "./runtime-exposure/loopback-listener.js";
+import * as listenerBindModule from "./runtime-exposure/loopback-listener.js";
+import * as localServiceSupervisor from "./local-service-supervisor.js";
 import {
   classifyExposureHostCollisions,
   type ExposurePortHostState,
@@ -103,7 +105,10 @@ setInterval(() => {}, 1000);
  * this, which is why forcing the bind is necessary but not sufficient there.
  */
 const WILDCARD_HMR_GUEST = `
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 const argv = process.argv.slice(2);
 const at = argv.indexOf("--bind-host");
 const host = at >= 0 ? argv[at + 1] : "127.0.0.1";
@@ -111,7 +116,13 @@ const p = Number(process.env.PORT);
 const health = (rq, r) => { if (rq.url === "/api/health") { r.setHeader("content-type", "application/json"); r.end(JSON.stringify({ status: "ok" })); return true; } return false; };
 http.createServer((rq, r) => { if (health(rq, r)) return; r.statusCode = 200; r.end("ok"); }).listen(p, host);
 // No host argument: Vite's own HMR listener lands on the wildcard.
-http.createServer((_, r) => { r.statusCode = 426; r.end(); }).listen(p + 10000);
+const hmr = http.createServer((_, r) => { r.statusCode = 426; r.end(); });
+hmr.listen(p + 10000, () => {
+  const address = hmr.address();
+  try {
+    fs.writeFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "wildcard-hmr-bind.json"), JSON.stringify({ bindCompleted: true, addressFamily: address && typeof address === "object" ? address.family : null, port: address && typeof address === "object" ? address.port : null }));
+  } catch {}
+});
 setInterval(() => {}, 1000);
 `;
 
@@ -756,14 +767,71 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
     // `server.host`, so the HMR websocket binds `::` no matter what the bind mode
     // is. The argv rewrite fixes the app port; only the preflight catches this.
     const { broker, calls } = createBroker();
+    const allocatedPorts = new Set<number>();
+    const reserve = broker.reserve.bind(broker);
+    broker.reserve = async (runtimeId, requested) => {
+      const result = await reserve(runtimeId, requested);
+      for (const listener of requested) {
+        if (allocatedPorts.size === 2) break;
+        allocatedPorts.add(listener.port);
+      }
+      return result;
+    };
     installDeps({ broker });
 
+    const ownerOutcomes = new Map<number, "known" | "unknown">();
+    const presenceOutcomes = new Map<number, "present-loopback" | "present-nonloopback" | "absent" | "unknown">();
+    const originalOwnerLookup = localServiceSupervisor.readLocalServicePortOwner;
+    const originalPresenceLookup = listenerBindModule.readListenerBindFacts;
+    const ownerSpy = vi.spyOn(localServiceSupervisor, "readLocalServicePortOwner").mockImplementation(async (port) => {
+      try {
+        const owner = await originalOwnerLookup(port);
+        if (allocatedPorts.has(port)) ownerOutcomes.set(port, owner === null ? "unknown" : "known");
+        return owner;
+      } catch (error) {
+        if (allocatedPorts.has(port)) ownerOutcomes.set(port, "unknown");
+        throw error;
+      }
+    });
+    const presenceSpy = vi.spyOn(listenerBindModule, "readListenerBindFacts").mockImplementation(async (port) => {
+      try {
+        const facts = await originalPresenceLookup(port);
+        if (allocatedPorts.has(port)) presenceOutcomes.set(port, facts === null ? "unknown" : !facts.present ? "absent" : facts.loopbackOnly ? "present-loopback" : "present-nonloopback");
+        return facts;
+      } catch (error) {
+        if (allocatedPorts.has(port)) presenceOutcomes.set(port, "unknown");
+        throw error;
+      }
+    });
     const error = await startRuntimeServicesForWorkspaceControl(startInput({
       serviceName: "paperclip-dev",
       command: `${guestCommand("dev-runner-wildcard-hmr.mjs")} --bind lan`,
       expose: LEGACY_HTTP_EXPOSE,
       port: { type: "auto", envKey: "PORT" },
-    })).then(() => null, (err: unknown) => err as Error);
+    })).then(() => null, (err: unknown) => err as Error).finally(() => {
+      ownerSpy.mockRestore();
+      presenceSpy.mockRestore();
+    });
+
+    type GuestBindRecord = { bindCompleted: true; addressFamily: string | null; port: number | null };
+    let guestBind: GuestBindRecord | null = null;
+    try {
+      guestBind = JSON.parse(await fs.readFile(path.join(guestDir, "wildcard-hmr-bind.json"), "utf8")) as GuestBindRecord;
+    } catch {
+      guestBind = null;
+    }
+    const ports = [...allocatedPorts].slice(0, 2).sort((a, b) => a - b);
+    const record = {
+      event: "native_hmr_bounded_diagnostic",
+      guestBind: guestBind && guestBind.bindCompleted === true && ports.includes(guestBind.port ?? -1) && ["IPv4", "IPv6"].includes(guestBind.addressFamily ?? "")
+        ? { status: "completed", addressFamily: guestBind.addressFamily, port: guestBind.port }
+        : { status: "unknown", addressFamily: null, port: null },
+      allocatedPorts: ports,
+      ownership: ports.map((port) => ({ port, outcome: ownerOutcomes.get(port) ?? "unknown" })),
+      presence: ports.map((port) => ({ port, outcome: presenceOutcomes.get(port) ?? "unknown" })),
+    };
+    const line = JSON.stringify(record);
+    console.log(line);
 
     expect(error).not.toBeNull();
     expect(error!.message).toContain("listener_ownership_mismatch");

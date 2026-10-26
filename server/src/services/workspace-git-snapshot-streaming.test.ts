@@ -154,24 +154,39 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   };
   const runtime = await stage(snapshot);
   const remoteParent = path.join(remote, path.relative(repo, parent));
-  let stagedCount = 0;
-  let stagedBatch: string[] = [];
-  const checkStagedBatch = async () => {
-    const results = await Promise.allSettled(stagedBatch.map((name) => fs.readFile(path.join(remoteParent, name))));
-    for (let index = 0; index < results.length; index++) {
-      const result = results[index]!;
-      if (result.status === "rejected") throw result.reason;
-      if (!result.value.equals(fileContent)) throw new Error(`Staged file has unexpected content: ${stagedBatch[index]}`);
+  const shortRemoteParent = path.join(root, "staged-check");
+  const checkStagedFiles = async () => {
+    await fs.rename(remoteParent, shortRemoteParent);
+    try {
+      let stagedCount = 0;
+      let stagedBatch: string[] = [];
+      const checkStagedBatch = async () => {
+        const results = await Promise.allSettled(stagedBatch.map((name) => fs.readFile(path.join(shortRemoteParent, name))));
+        for (let index = 0; index < results.length; index++) {
+          const result = results[index]!;
+          if (result.status === "rejected") throw result.reason;
+          if (!result.value.equals(fileContent)) throw new Error(`Staged file has unexpected content: ${stagedBatch[index]}`);
+        }
+        stagedCount += stagedBatch.length;
+        stagedBatch = [];
+      };
+      for await (const entry of await fs.opendir(shortRemoteParent)) {
+        stagedBatch.push(entry.name);
+        if (stagedBatch.length === 100) await checkStagedBatch();
+      }
+      if (stagedBatch.length > 0) await checkStagedBatch();
+      expect(stagedCount).toBe(40_000);
+    } catch (error) {
+      try {
+        await fs.rename(shortRemoteParent, remoteParent);
+      } catch (restoreError) {
+        throw new AggregateError([error, restoreError], "Staged-file assertion and remote-directory restoration failed");
+      }
+      throw error;
     }
-    stagedCount += stagedBatch.length;
-    stagedBatch = [];
+    await fs.rename(shortRemoteParent, remoteParent);
   };
-  for await (const entry of await fs.opendir(remoteParent)) {
-    stagedBatch.push(entry.name);
-    if (stagedBatch.length === 100) await checkStagedBatch();
-  }
-  if (stagedBatch.length > 0) await checkStagedBatch();
-  expect(stagedCount).toBe(40_000);
+  await checkStagedFiles();
   for (const name of unusual) expect(await fs.readFile(path.join(remote, name), "utf8")).toBe(name);
   const manifestFile = isPathManifest(snapshot.overlayPaths) ? snapshot.overlayPaths.filePath : "";
   await runtime.cleanupWorkspaceSnapshot();
