@@ -73,13 +73,38 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   // limit while keeping each 40,000-name Git lane above the 32 MiB boundary.
   const parent = path.join(repo, ...Array.from({ length: 3 }, () => "nested-".repeat(30)), "storybook-output");
   await fs.mkdir(parent, { recursive: true });
+  const shortParent = path.join(root, "generated");
+  // Only fixture setup/update/deletion uses this short path. Restore the same
+  // directory before every Git, snapshot, transfer and assertion boundary.
+  const withShortParent = async (operation: () => Promise<void>) => {
+    await fs.rename(parent, shortParent);
+    try {
+      await operation();
+    } catch (error) {
+      try {
+        await fs.rename(shortParent, parent);
+      } catch (restoreError) {
+        throw new AggregateError([error, restoreError], "Fixture operation and generated-directory restoration failed");
+      }
+      throw error;
+    }
+    await fs.rename(shortParent, parent);
+  };
   const fileName = (index: number) => `${"asset-".repeat(36)}${index}.js`;
   const fileContent = Buffer.from("base");
   const changedContent = Buffer.from("changed");
+  const contentSource = path.join(root, "file-content");
   const writeFiles = async (content: Buffer) => {
-    for (let start = 0; start < 40_000; start += 100) {
-      await Promise.all(Array.from({ length: 100 }, (_, offset) => fs.writeFile(path.join(parent, fileName(start + offset)), content)));
-    }
+    // Keep the real files independent, but submit one copy instead of a
+    // separate open/write/close promise sequence for each tiny payload.
+    await fs.writeFile(contentSource, content);
+    await withShortParent(async () => {
+      for (let start = 0; start < 40_000; start += 100) {
+        const results = await Promise.allSettled(Array.from({ length: 100 }, (_, offset) => fs.copyFile(contentSource, path.join(shortParent, fileName(start + offset)))));
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure) throw failure.reason;
+      }
+    });
   };
   await writeFiles(fileContent);
   const unusual = [" space ", "line\nbreak", "-option", "雪-💾", "wild[?]*"];
@@ -164,7 +189,16 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   const changed = await scan();
   checkLargeLane(changed.overlayPaths);
   await disposeGitWorkspaceSnapshot(changed);
-  await fs.rm(parent, { recursive: true });
+  // The generated names are already known; avoid recursively rediscovering
+  // and statting every file, or traversing the long parents for each unlink.
+  await withShortParent(async () => {
+    for (let start = 0; start < 40_000; start += 100) {
+      const results = await Promise.allSettled(Array.from({ length: 100 }, (_, offset) => fs.unlink(path.join(shortParent, fileName(start + offset)))));
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure) throw failure.reason;
+    }
+  });
+  await fs.rmdir(parent);
   const deleted = await scan();
   checkLargeLane(deleted.deletedPaths);
   await stage(deleted);
