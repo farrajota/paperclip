@@ -1,10 +1,17 @@
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
+import postgres from "postgres";
 import {
   __embeddedPostgresStartMaxAttemptsForTests as MAX_ATTEMPTS,
   __setEmbeddedPostgresCtorProviderForTests,
   __startEmbeddedPostgresWithRetryForTests as startWithRetry,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 // A fake embedded-postgres constructor. It records every constructed instance so
 // the test can assert the retry uses a fresh port and a fresh data directory each
@@ -110,4 +117,45 @@ describe("startEmbeddedPostgresWithRetry", () => {
     // generic "embedded Postgres startup failed" text.
     expect((error as Error).message).toContain("Address already in use");
   });
+});
+
+describeEmbeddedPostgres("embedded Postgres diagnostic severity", () => {
+  it("keeps cascade cleanup quiet while retaining database warnings and errors", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-db-notice-boundary-");
+    const notices: unknown[] = [];
+    const client = postgres(database.connectionString, {
+      max: 1,
+      onnotice: (notice) => notices.push(notice),
+    });
+
+    try {
+      await client.unsafe(`
+        CREATE TEMP TABLE notice_parent (id integer PRIMARY KEY);
+        CREATE TEMP TABLE notice_child (parent_id integer REFERENCES notice_parent(id));
+        INSERT INTO notice_parent VALUES (1);
+        INSERT INTO notice_child VALUES (1);
+        TRUNCATE notice_parent CASCADE;
+      `);
+      expect(await client.unsafe(`
+        SELECT
+          (SELECT count(*)::integer FROM notice_parent) AS parent_count,
+          (SELECT count(*)::integer FROM notice_child) AS child_count
+      `)).toMatchObject([{ parent_count: 0, child_count: 0 }]);
+      await client.unsafe(`DO $$ BEGIN RAISE WARNING 'fixture warning remains visible'; END $$`);
+      await expect(client.unsafe("SELECT 1 / 0")).rejects.toMatchObject({ code: "22012" });
+      expect(notices).toEqual([
+        expect.objectContaining({
+          severity: "WARNING",
+          code: "01000",
+          message: "fixture warning remains visible",
+        }),
+      ]);
+    } finally {
+      try {
+        await client.end();
+      } finally {
+        await database.cleanup();
+      }
+    }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 });
