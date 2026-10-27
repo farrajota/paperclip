@@ -14,11 +14,14 @@ enum StreamDiagnosticPhase {
   FixtureReady = "fixture_ready",
   StandaloneUntrackedScan = "standalone_untracked_scan",
   ScheduledUntrackedScan = "scheduled_untracked_scan",
+  StageReady = "stage_ready",
   StageAndContentChecks = "stage_and_content_checks",
   SnapshotCleanup = "snapshot_cleanup",
   IgnoredScan = "ignored_scan",
   InitialTrackingCommit = "initial_tracking_commit",
+  ChangedFilesWritten = "changed_files_written",
   ChangedScan = "changed_scan",
+  FixtureDeletionComplete = "fixture_deletion_complete",
   DeletionScanComplete = "deletion_scan_complete",
 }
 const exec = promisify(execFile);
@@ -178,6 +181,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
     return runtime;
   };
   const runtime = await stage(snapshot);
+  observePhase(StreamDiagnosticPhase.StageReady);
   const remoteParent = path.join(remote, path.relative(repo, parent));
   const shortRemoteParent = path.join(root, "staged-check");
   const checkStagedFiles = async () => {
@@ -235,6 +239,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   await git(["commit", "-qm", "track generated files"]);
   observePhase(StreamDiagnosticPhase.InitialTrackingCommit);
   await writeFiles(changedContent);
+  observePhase(StreamDiagnosticPhase.ChangedFilesWritten);
   const changed = await scan();
   checkLargeLane(changed.overlayPaths);
   await disposeGitWorkspaceSnapshot(changed);
@@ -249,6 +254,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
     }
   });
   await fs.rmdir(parent);
+  observePhase(StreamDiagnosticPhase.FixtureDeletionComplete);
   const deleted = await scan();
   checkLargeLane(deleted.deletedPaths);
   await stage(deleted);
