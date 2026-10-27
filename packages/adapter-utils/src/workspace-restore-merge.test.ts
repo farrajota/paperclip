@@ -18,6 +18,7 @@ import {
   serializeDirectorySnapshot,
   withDirectoryMergeLock,
   WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE,
+  type DirectorySnapshot,
 } from "./workspace-restore-merge.js";
 
 describe("workspace restore merge", () => {
@@ -142,6 +143,34 @@ describe("workspace restore merge", () => {
       expect(snapshot.entries.has("runtime.sock")).toBe(false);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("hashes bytes appended after lstat beyond the small-file stream threshold", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-growth-"));
+    const filePath = path.join(rootDir, "small-at-lstat.txt");
+    const original = "tiny";
+    const grown = "g".repeat(64 * 1024);
+    await writeFile(filePath, original, "utf8");
+
+    const realLstat = fsPromises.lstat;
+    const lstatSpy = vi.spyOn(fsPromises, "lstat").mockImplementation(async (observedPath) => {
+      const stats = await realLstat(observedPath);
+      if (observedPath === filePath) await fsPromises.appendFile(filePath, grown, "utf8");
+      return stats;
+    });
+    let snapshot: DirectorySnapshot | null = null;
+    try {
+      snapshot = await captureDirectorySnapshot(rootDir, { exclude: [], diskBacked: true });
+      expect(snapshot.entries.get("small-at-lstat.txt")).toEqual({
+        kind: "file",
+        mode: (await realLstat(filePath)).mode,
+        hash: createHash("sha256").update(original + grown).digest("hex"),
+      });
+    } finally {
+      lstatSpy.mockRestore();
+      await disposeDirectorySnapshot(snapshot);
+      await rm(rootDir, { recursive: true, force: true });
     }
   });
 

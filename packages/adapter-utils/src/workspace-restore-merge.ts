@@ -134,10 +134,15 @@ export function directorySnapshotSha256(snapshot: DirectorySnapshot): string {
   return digest.digest("hex");
 }
 
-async function hashFile(filePath: string): Promise<string> {
+const SMALL_FILE_STREAM_THRESHOLD_BYTES = 64 * 1024;
+const SMALL_FILE_STREAM_HIGH_WATER_MARK_BYTES = 8 * 1024;
+
+async function hashFile(filePath: string, fileSize: number): Promise<string> {
   return await new Promise((resolve, reject) => {
     const hash = createHash("sha256");
-    const stream = createReadStream(filePath);
+    const stream = fileSize <= SMALL_FILE_STREAM_THRESHOLD_BYTES
+      ? createReadStream(filePath, { highWaterMark: SMALL_FILE_STREAM_HIGH_WATER_MARK_BYTES })
+      : createReadStream(filePath);
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("error", reject);
     stream.on("end", () => resolve(hash.digest("hex")));
@@ -159,7 +164,7 @@ async function* walkDirectory(
     } else if (stats.isSymbolicLink()) {
       yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
     } else if (stats.isFile()) {
-      yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath) }];
+      yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath, stats.size) }];
     }
   }
 }
@@ -185,7 +190,7 @@ async function readSnapshotEntry(root: string, relative: string): Promise<Snapsh
   return {
     kind: "file",
     mode: stats.mode,
-    hash: await hashFile(fullPath),
+    hash: await hashFile(fullPath, stats.size),
   };
 }
 

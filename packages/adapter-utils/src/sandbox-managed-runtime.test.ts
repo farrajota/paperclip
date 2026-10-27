@@ -18,6 +18,7 @@ import {
 
 import {
   assertSyncOperationsConfined,
+  createTarballFromDirectory,
   escapeTarExcludeLiteral,
   mirrorDirectory,
   prepareSandboxManagedRuntime,
@@ -1470,6 +1471,29 @@ describe("sandbox managed runtime", () => {
     const members = await listTarMembers(rootDir, "ignored-whitespace-workspace-upload.tar", workspaceUpload!.bytes);
     expect(members).not.toContain(ignoredName);
     expect(members).toContain("kept.txt");
+  });
+
+  it("preserves unusual UTF-8 filenames and content across a multi-chunk tar entry list", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-tar-list-"));
+    cleanupDirs.push(rootDir);
+    const sourceDir = path.join(rootDir, "source");
+    const targetDir = path.join(rootDir, "target");
+    const archivePath = path.join(rootDir, "workspace.tar");
+    await mkdir(sourceDir);
+    await mkdir(targetDir);
+    const names = Array.from({ length: 400 }, (_, index) =>
+      `-${String(index).padStart(3, "0")}-${"é".repeat(90)}\t\n'\\ `);
+    for (const [index, name] of names.entries()) {
+      await writeFile(path.join(sourceDir, name), `payload ${index}\n`);
+    }
+
+    await createTarballFromDirectory({ localDir: sourceDir, archivePath });
+    await execFile("tar", ["-xf", archivePath, "-C", targetDir]);
+
+    expect((await readdir(targetDir)).sort()).toEqual([...names].sort());
+    for (const [index, name] of names.entries()) {
+      expect(await readFile(path.join(targetDir, name), "utf8")).toBe(`payload ${index}\n`);
+    }
   });
 
   it("builds workspace/asset tarballs without a './' self-entry (so untar does not chmod/utime an unowned target dir)", async () => {

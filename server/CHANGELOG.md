@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Patch Changes
+- Select an 8 KiB bounded read buffer for baseline hashing of files observed at 64 KiB or smaller, while continuing to hash each stream through EOF; larger files retain the default stream buffer. This reduces small-file stream buffer allocation without changing snapshot content or claiming a measured speedup.
+- Reuse each selected workspace overlay entry's checked `lstat` result for its staging copy, removing a duplicate source metadata lookup without changing path checks or copy semantics; no benchmark result is claimed.
+
+- Write staging tar-entry and deleted-path NUL lists in bounded 64 KiB chunks instead of one filesystem write per filename, retaining exact filename bytes, path validation, ordered extraction/deletion, and awaited cleanup; no elapsed-time improvement is claimed.
+
 - Validate each opened Linux ancestor path descriptor as a directory before advancing workspace and device-login credential reads, preserving existing leaf validation and descriptor cleanup.
 
 - Restore the server's declared MCP SDK and HTTP-injection dependencies to the pinned workspace lockfile so the stable-based fork installs with `pnpm@9.15.4 --frozen-lockfile`; runtime dependency declarations are unchanged.

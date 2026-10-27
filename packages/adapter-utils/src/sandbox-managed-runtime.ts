@@ -4,9 +4,10 @@ import {
   constants as fsConstants,
   createReadStream,
   promises as fs,
+  type Stats,
 } from "node:fs";
 import os from "node:os";
-import { workspacePaths, workspacePathMatcher, writeWorkspacePaths, isPathManifest, type WorkspacePaths } from "./workspace-manifest.js";
+import { workspacePaths, workspacePathMatcher, isPathManifest, WORKSPACE_STREAM_CHUNK_BYTES, type WorkspacePaths } from "./workspace-manifest.js";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -824,6 +825,33 @@ async function execTar(args: string[]): Promise<void> {
   });
 }
 
+async function writeNulDelimitedFile(
+  filePath: string,
+  entries: Iterable<string> | AsyncIterable<string>,
+): Promise<void> {
+  const file = await fs.open(filePath, "wx", 0o600);
+  try {
+    // Batch bytes, not paths: long names and split UTF-8 sequences stay intact
+    // in the NUL-delimited file without retaining the whole selection in memory.
+    const chunk = Buffer.alloc(WORKSPACE_STREAM_CHUNK_BYTES);
+    let used = 0;
+    for await (const entry of entries) {
+      const record = Buffer.from(`${entry}\0`);
+      let offset = 0;
+      while (offset < record.length) {
+        const copied = record.copy(chunk, used, offset);
+        used += copied;
+        offset += copied;
+        if (used === chunk.length) {
+          await file.writeFile(chunk);
+          used = 0;
+        }
+      }
+    }
+    if (used > 0) await file.writeFile(chunk.subarray(0, used));
+  } finally { await file.close(); }
+}
+
 export async function createTarballFromDirectory(input: {
   localDir: string;
   archivePath: string;
@@ -839,12 +867,12 @@ export async function createTarballFromDirectory(input: {
   // entries avoids the self-entry entirely and is portable across GNU/BSD/busybox
   // tar (no GNU-only --no-overwrite-dir needed). --exclude still filters nested
   // matches and any named entry it matches.
+  async function* entryNames(): AsyncGenerator<string> {
+    for await (const entry of await fs.opendir(input.localDir)) yield entry.name;
+  }
   await withTempDir("paperclip-tar-list-", async (directory) => {
     const list = path.join(directory, "entries.nul");
-    const file = await fs.open(list, "wx", 0o600);
-    try {
-      for await (const entry of await fs.opendir(input.localDir)) await file.writeFile(`${entry.name}\0`);
-    } finally { await file.close(); }
+    await writeNulDelimitedFile(list, entryNames());
     await execTar(["-c", "--no-xattrs", ...(input.followSymlinks ? ["-h"] : []),
       "-f", input.archivePath, "-C", input.localDir, ...excludeArgs, "--null", "-T", list]);
   });
@@ -867,11 +895,15 @@ async function* walkDirectory(root: string, relative = "", childrenFirst = false
   }
 }
 
-async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relative: string): Promise<void> {
+async function copyWorkspaceEntry(
+  sourceRoot: string,
+  targetRoot: string,
+  relative: string,
+  sourceStats?: Stats,
+): Promise<void> {
   const sourcePath = path.join(sourceRoot, relative);
   const targetPath = path.join(targetRoot, relative);
-  const stats = await fs.lstat(sourcePath);
-
+  const stats = sourceStats ?? await fs.lstat(sourcePath);
   if (stats.isDirectory()) {
     await fs.mkdir(targetPath, { recursive: true });
     return;
@@ -990,17 +1022,17 @@ async function copySelectedWorkspaceEntries(input: {
         }
       }
     };
-    // Include root-level entries, and do not treat a missing root as an
-    // ordinary source file that disappeared after the snapshot.
-    await assertSourceRoot();
+    let sourceStats: Stats;
     try {
       await assertParentDirectory();
-      await fs.lstat(sourcePath);
+      sourceStats = await fs.lstat(sourcePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
     }
-    await copyWorkspaceEntry(sourceDir, input.targetDir, relative);
+    // Reuse the checked metadata for the copy's file/symlink branch.
+    await copyWorkspaceEntry(sourceDir, input.targetDir, relative, sourceStats);
+
     // Do not upload the staged tree if an ancestor changed during the copy.
     await assertSourceRoot();
     await assertParentDirectory();
@@ -1553,7 +1585,7 @@ export async function prepareSandboxManagedRuntime(input: {
             if (gitSnapshot && (isPathManifest(gitSnapshot.deletedPaths) ? gitSnapshot.deletedPaths.count : gitSnapshot.deletedPaths.length) > 0) {
               const deletedManifest = path.join(tempDir, "deleted.nul");
               const remoteDeletedManifest = path.posix.join(runtimeRootDir, "deleted.nul");
-              await writeWorkspacePaths(gitSnapshot.deletedPaths, deletedManifest);
+              await writeNulDelimitedFile(deletedManifest, workspacePaths(gitSnapshot.deletedPaths));
               workspaceFiles.push({ sourcePath: deletedManifest, targetPath: remoteDeletedManifest, kind: "file", access: "rw", writablePath: runtimeRootDir });
               workspacePostUploadCommands.push({ command: buildRemoveDeletedPathsCommand({ remoteDir: workspaceRemoteDir, manifestPath: remoteDeletedManifest }) });
             }
