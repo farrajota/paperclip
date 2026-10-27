@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSy
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { initializeNativeUiFailureRecords } from "./native-ui-failure-reporter.mjs";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
@@ -202,6 +203,7 @@ function parseCliOptions(argv) {
   let shardCount = null;
   let group = null;
   let dryRun = false;
+  let failureRecordsOutput = null;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -239,6 +241,17 @@ function parseCliOptions(argv) {
 
     if (arg.startsWith("--shard-count=")) {
       shardCount = parsePositiveInteger(arg.slice("--shard-count=".length), "--shard-count");
+      continue;
+    }
+
+    if (arg === "--failure-records-output") {
+      failureRecordsOutput = readOptionValue(argv, index, arg);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--failure-records-output=")) {
+      failureRecordsOutput = arg.slice("--failure-records-output=".length);
       continue;
     }
 
@@ -287,6 +300,13 @@ function parseCliOptions(argv) {
     fail(`Unknown group "${group}". Expected one of: ${allowedGeneralGroupNames.join(", ")}.`);
   }
 
+  if (failureRecordsOutput !== null && (mode !== generalModeName || group !== generalWorkspacesAGroupName)) {
+    fail("--failure-records-output is only valid with --mode general --group general-workspaces-a.");
+  }
+  if (failureRecordsOutput !== null && failureRecordsOutput.length === 0) {
+    fail("--failure-records-output requires a non-empty path.");
+  }
+
   if (shardIndex !== null) {
     if (shardIndex >= shardCount) {
       fail(`--shard-index must be less than --shard-count. Received ${shardIndex} of ${shardCount}.`);
@@ -300,6 +320,7 @@ function parseCliOptions(argv) {
       shardCount: shardCount ?? 1,
       group: null,
       dryRun,
+      failureRecordsOutput,
     };
   }
 
@@ -309,6 +330,7 @@ function parseCliOptions(argv) {
     shardCount,
     group,
     dryRun,
+    failureRecordsOutput,
   };
 }
 
@@ -327,7 +349,7 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return shardFiles.map((file) => byRepoPath.get(file));
 }
 
-function runVitest(args, label, testShard = null) {
+function runVitest(args, label, testShard = null, failureRecordsOutput = null, failureRecordsFinal = false) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
@@ -345,6 +367,10 @@ function runVitest(args, label, testShard = null) {
     PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
     TMPDIR: path.join(testRoot, "t"),
   };
+  if (failureRecordsOutput !== null) {
+    env.NATIVE_UI_FAILURE_RECORDS_OUTPUT = failureRecordsOutput;
+    env.NATIVE_UI_FAILURE_RECORDS_FINAL = String(failureRecordsFinal);
+  }
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
   if (testShard) {
@@ -366,6 +392,9 @@ function runVitest(args, label, testShard = null) {
     console.log(`[test:run] chat shard ${testShard.index + 1}/${testShard.count}: ${selected.tests.length}/${collected.length} tests, ${selected.lines.length} source lines; exact filter coverage verified`);
     args.push("--allowOnly=false");
   }
+  if (failureRecordsOutput !== null) {
+    args = [...args, "--reporter=default", `--reporter=${path.join(scriptsDir, "native-ui-failure-reporter.mjs")}`];
+  }
   const result = spawnSync("pnpm", ["exec", "vitest", "run", ...sourceOnlyVitestArgs, ...args], {
     cwd: repoRoot,
     env,
@@ -386,7 +415,7 @@ function runGeneralSuites(routeTests) {
   }
 }
 
-function runProjectGroup(projects, groupName, shardIndex = null, shardCount = null) {
+function runProjectGroup(projects, groupName, shardIndex = null, shardCount = null, failureRecordsOutput = null) {
   // With shard args, lean on Vitest's native --shard: each matrix job runs the
   // same per-project invocations but only its slice of each project's test
   // files. Vitest's sharding is deterministic for an identical file list, so
@@ -394,8 +423,15 @@ function runProjectGroup(projects, groupName, shardIndex = null, shardCount = nu
   const shardArgs =
     shardCount !== null && shardCount > 1 ? [`--shard=${shardIndex + 1}/${shardCount}`] : [];
   const shardSuffix = shardArgs.length > 0 ? ` shard ${shardIndex + 1}/${shardCount}` : "";
-  for (const project of projects) {
-    runVitest(["--project", project, ...shardArgs], `${groupName} project ${project}${shardSuffix}`);
+  for (let index = 0; index < projects.length; index += 1) {
+    const project = projects[index];
+    runVitest(
+      ["--project", project, ...shardArgs],
+      `${groupName} project ${project}${shardSuffix}`,
+      null,
+      failureRecordsOutput,
+      failureRecordsOutput !== null && index === projects.length - 1,
+    );
   }
 }
 
@@ -466,7 +502,14 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
     // 31371439296, 2026-08-10, where workspaces-a was the slowest PR check).
     // Its 439 test files shard cleanly with Vitest's native --shard, so the
     // lane splits across runners without a duration manifest.
-    runProjectGroup(generalWorkspacesAProjects, groupName, shardIndex, shardCount);
+    if (options.failureRecordsOutput === null) {
+      runProjectGroup(generalWorkspacesAProjects, groupName, shardIndex, shardCount);
+    } else {
+      const outputPath = path.resolve(repoRoot, options.failureRecordsOutput);
+      mkdirSync(path.dirname(outputPath), { recursive: true });
+      initializeNativeUiFailureRecords(outputPath);
+      runProjectGroup(generalWorkspacesAProjects, groupName, shardIndex, shardCount, outputPath);
+    }
     return;
   }
 
