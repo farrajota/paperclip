@@ -11,6 +11,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { createStoredZipArchive } from "./helpers/zip.js";
+import { PortabilityPhaseDiagnostics } from "./helpers/portability-phase-diagnostics.js";
+
+const portabilityPhaseDiagnostics = new PortabilityPhaseDiagnostics(
+  process.env.PAPERCLIP_TEST_COMPANY_PORTABILITY_PHASE_OUTPUT || undefined,
+);
 
 const execFileAsync = promisify(execFile);
 type ServerProcess = ReturnType<typeof spawn>;
@@ -35,7 +40,11 @@ async function getAvailablePort(): Promise<number> {
   });
 }
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const embeddedPostgresSupport = await portabilityPhaseDiagnostics.run(
+  "collection",
+  "support",
+  getEmbeddedPostgresTestSupport,
+);
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
@@ -284,16 +293,20 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
-    tempRoot = mkdtempSync(path.join(os.tmpdir(), "paperclip-company-cli-e2e-"));
-    configPath = path.join(tempRoot, "config", "config.json");
-    exportDir = path.join(tempRoot, "exported-company");
-    paperclipHome = path.join(tempRoot, "paperclip-home");
-    cliShellHome = path.join(tempRoot, "shell-home");
-    paperclipInstanceId = "company-cli-e2e";
-    mkdirSync(paperclipHome, { recursive: true });
-    mkdirSync(cliShellHome, { recursive: true });
+    portabilityPhaseDiagnostics.runSync("setup", "fixture-create", () => {
+      tempRoot = mkdtempSync(path.join(os.tmpdir(), "paperclip-company-cli-e2e-"));
+      configPath = path.join(tempRoot, "config", "config.json");
+      exportDir = path.join(tempRoot, "exported-company");
+      paperclipHome = path.join(tempRoot, "paperclip-home");
+      cliShellHome = path.join(tempRoot, "shell-home");
+      paperclipInstanceId = "company-cli-e2e";
+      mkdirSync(paperclipHome, { recursive: true });
+      mkdirSync(cliShellHome, { recursive: true });
+    });
 
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-company-cli-db-");
+    tempDb = await portabilityPhaseDiagnostics.run("setup", "db-start", () =>
+      startEmbeddedPostgresTestDatabase("paperclip-company-cli-db-"),
+    );
 
     const port = await getAvailablePort();
     writeTestConfig(configPath, tempRoot, port, tempDb.connectionString);
@@ -301,19 +314,20 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
 
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
     const output = { stdout: [] as string[], stderr: [] as string[] };
-    const child = spawn(
+    const connectionString = tempDb.connectionString;
+    const child = portabilityPhaseDiagnostics.runSync("setup", "server-spawn", () => spawn(
       "pnpm",
       ["paperclipai", "run", "--config", configPath],
       {
         cwd: repoRoot,
-        env: createServerEnv(configPath, port, tempDb.connectionString, {
+        env: createServerEnv(configPath, port, connectionString, {
           paperclipHome,
           instanceId: paperclipInstanceId,
           shellHome: cliShellHome,
         }),
         stdio: ["ignore", "pipe", "pipe"],
       },
-    );
+    ));
     serverProcess = child;
     child.stdout?.on("data", (chunk) => {
       output.stdout.push(String(chunk));
@@ -322,21 +336,27 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
       output.stderr.push(String(chunk));
     });
 
-    await waitForServer(apiBase, child, output);
+    await portabilityPhaseDiagnostics.run("setup", "health-wait", () =>
+      waitForServer(apiBase, child, output),
+    );
   }, 60_000);
 
   afterAll(async () => {
-    await stopServerProcess(serverProcess);
-    await tempDb?.cleanup();
-    if (tempRoot) {
-      rmSync(tempRoot, { recursive: true, force: true });
-    }
+    await portabilityPhaseDiagnostics.run("cleanup", "server-stop", () =>
+      stopServerProcess(serverProcess),
+    );
+    await portabilityPhaseDiagnostics.run("cleanup", "db-cleanup", async () => {
+      await tempDb?.cleanup();
+      if (tempRoot) {
+        rmSync(tempRoot, { recursive: true, force: true });
+      }
+    });
   });
 
   it("exports a company package and imports it into new and existing companies", async () => {
     expect(serverProcess).not.toBeNull();
 
-    const cliContext = await runCliJson<{
+    const cliContext = await portabilityPhaseDiagnostics.run("body", "context", () => runCliJson<{
       contextPath: string;
       profileName: string;
       profile: { apiBase?: string };
@@ -349,7 +369,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
         shellHome: cliShellHome,
         includeConfigArg: false,
       },
-    );
+    ));
 
     const expectedContextPath = path.join(paperclipHome, "context.json");
     const leakedContextPath = path.join(cliShellHome, ".paperclip", "context.json");
@@ -361,11 +381,13 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     rmSync(expectedContextPath, { force: true });
     expect(existsSync(expectedContextPath)).toBe(false);
 
-    const sourceCompany = await api<{ id: string; name: string; issuePrefix: string }>(apiBase, "/api/companies", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: `CLI Export Source ${Date.now()}` }),
-    });
+    const sourceCompany = await portabilityPhaseDiagnostics.run("body", "fixture-create", () =>
+      api<{ id: string; name: string; issuePrefix: string }>(apiBase, "/api/companies", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: `CLI Export Source ${Date.now()}` }),
+      }),
+    );
     await api(apiBase, `/api/companies/${sourceCompany.id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -423,7 +445,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
       },
     );
 
-    const exportResult = await runCliJson<{
+    const exportResult = await portabilityPhaseDiagnostics.run("body", "export", () => runCliJson<{
       ok: boolean;
       out: string;
       filesWritten: number;
@@ -444,14 +466,14 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
         instanceId: paperclipInstanceId,
         shellHome: cliShellHome,
       },
-    );
+    ));
 
     expect(exportResult.ok).toBe(true);
     expect(exportResult.filesWritten).toBeGreaterThan(0);
     expect(readFileSync(path.join(exportDir, "COMPANY.md"), "utf8")).toContain(sourceCompany.name);
     expect(readFileSync(path.join(exportDir, ".paperclip.yaml"), "utf8")).toContain('schema: "paperclip/v1"');
 
-    const importedNew = await runCliJson<{
+    const importedNew = await portabilityPhaseDiagnostics.run("body", "new-import", () => runCliJson<{
       company: { id: string; name: string; action: string };
       agents: Array<{ id: string | null; action: string; name: string }>;
     }>(
@@ -474,7 +496,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
         instanceId: paperclipInstanceId,
         shellHome: cliShellHome,
       },
-    );
+    ));
 
     expect(importedNew.company.action).toBe("created");
     expect(importedNew.agents).toHaveLength(1);
@@ -498,7 +520,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     expect(importedProjects.map((project) => project.name)).toContain(sourceProject.name);
     expect(importedMatchingIssues).toHaveLength(1);
 
-    const previewExisting = await runCliJson<{
+    const previewExisting = await portabilityPhaseDiagnostics.run("body", "existing-preview", () => runCliJson<{
       errors: string[];
       plan: {
         companyAction: string;
@@ -528,7 +550,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
         instanceId: paperclipInstanceId,
         shellHome: cliShellHome,
       },
-    );
+    ));
 
     expect(previewExisting.errors).toEqual([]);
     expect(previewExisting.plan.companyAction).toBe("none");
@@ -536,7 +558,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     expect(previewExisting.plan.projectPlans.some((plan) => plan.action === "create")).toBe(true);
     expect(previewExisting.plan.issuePlans.some((plan) => plan.action === "create")).toBe(true);
 
-    const importedExisting = await runCliJson<{
+    const importedExisting = await portabilityPhaseDiagnostics.run("body", "existing-apply", () => runCliJson<{
       company: { id: string; action: string };
       agents: Array<{ id: string | null; action: string; name: string }>;
     }>(
@@ -561,7 +583,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
         instanceId: paperclipInstanceId,
         shellHome: cliShellHome,
       },
-    );
+    ));
 
     expect(importedExisting.company.action).toBe("unchanged");
     expect(importedExisting.agents.some((agent) => agent.action === "created")).toBe(true);
@@ -592,7 +614,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     collectTextFiles(exportDir, exportDir, portableFiles);
     writeFileSync(zipPath, createStoredZipArchive(portableFiles, "paperclip-demo"));
 
-    const importedFromZip = await runCliJson<{
+    const importedFromZip = await portabilityPhaseDiagnostics.run("body", "zip-import", () => runCliJson<{
       company: { id: string; name: string; action: string };
       agents: Array<{ id: string | null; action: string; name: string }>;
     }>(
@@ -615,7 +637,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
         instanceId: paperclipInstanceId,
         shellHome: cliShellHome,
       },
-    );
+    ));
 
     expect(importedFromZip.company.action).toBe("created");
     expect(importedFromZip.agents.some((agent) => agent.action === "created")).toBe(true);

@@ -1,5 +1,11 @@
 # paperclipai
 
+## Unreleased
+
+### Patch Changes
+
+- Add opt-in bounded company portability test lifecycle diagnostics via `PAPERCLIP_TEST_COMPANY_PORTABILITY_PHASE_OUTPUT`.
+
 ## 0.3.1
 
 ### Patch Changes
