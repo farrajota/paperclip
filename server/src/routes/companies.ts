@@ -55,6 +55,7 @@ import {
   accessService,
   agentService,
   budgetService,
+  heartbeatService,
   buildExportFidelityReport,
   collectExportFidelityCounts,
   companyArtifactsService,
@@ -67,6 +68,7 @@ import {
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import type { StorageService } from "../storage/types.js";
+import type { AuthorizationActor } from "../services/authorization.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
 
@@ -278,7 +280,9 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
   const router = Router();
   const importTransferSpoolRoot =
     options?.importTransferSpoolRoot ?? resolveDefaultImportTransferSpoolRoot();
-  const svc = companyService(db);
+  const svc = companyService(db, {
+    cancelWorkForScope: (scope) => heartbeatService(db).cancelBudgetScopeWork(scope),
+  });
   const agents = agentService(db);
   const portability = companyPortabilityService(db, storage);
   const access = accessService(db);
@@ -528,7 +532,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
     const allowExternalInstructions = await assertExternalInstructionExportAllowed(req, companyId, body);
-    const result = await portability.exportBundle(companyId, body, { allowExternalInstructions });
+    const result = await portability.exportBundle(companyId, body, { allowExternalInstructions, actor: req.actor as AuthorizationActor });
     res.json(result);
   });
 
@@ -1123,7 +1127,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
     const allowExternalInstructions = await assertExternalInstructionExportAllowed(req, companyId, body);
-    const preview = await portability.previewExport(companyId, body, { allowExternalInstructions });
+    const preview = await portability.previewExport(companyId, body, { allowExternalInstructions, actor: req.actor as AuthorizationActor });
     res.json(preview);
   });
 
@@ -1132,7 +1136,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
     const allowExternalInstructions = await assertExternalInstructionExportAllowed(req, companyId, body);
-    const result = await portability.exportBundle(companyId, body, { allowExternalInstructions });
+    const result = await portability.exportBundle(companyId, body, { allowExternalInstructions, actor: req.actor as AuthorizationActor });
     res.json(result);
   });
 

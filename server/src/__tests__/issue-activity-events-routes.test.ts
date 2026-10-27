@@ -19,6 +19,9 @@ const mockIssueService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockAccessService = vi.hoisted(() => ({
+  decide: vi.fn(async ({ action }: { action: string }) => ({
+    action, allowed: action === "issue:read", reason: "allow_default", explanation: "Fixture task is readable",
+  })),
   canUser: vi.fn(async () => false),
   hasPermission: vi.fn(async () => false),
 }));
@@ -136,12 +139,22 @@ function registerModuleMocks() {
   }));
 }
 
+function createEmptyRelationReadDb() {
+  const query = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn(async () => []),
+  };
+  return {
+    select: vi.fn().mockReturnValue(query),
+  };
+}
+
 let preparedRouteModules: Promise<[
   typeof import("../routes/issues.js"),
   typeof import("../middleware/index.js"),
 ]>;
 
-async function createApp(db: unknown = {}) {
+async function createApp(db: unknown = createEmptyRelationReadDb()) {
   const [{ issueRoutes }, { errorHandler }] = await preparedRouteModules;
   const app = express();
   app.use(express.json());
@@ -184,6 +197,7 @@ function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Reco
     actorRunId: _actorRunId,
     actorRunStopId: _actorRunStopId,
     actorUserId: _actorUserId,
+    workspaceSelectionActor: _workspaceSelectionActor,
     blockedByIssueIds: _blockedByIssueIds,
     ...issuePatch
   } = patch;

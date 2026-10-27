@@ -2,6 +2,8 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageService } from "../storage/types.js";
+import type { errorHandler } from "../middleware/index.js";
+import type { issueRoutes } from "../routes/issues.js";
 
 const ISSUE_ID = "11111111-1111-4111-8111-111111111111";
 const WORK_PRODUCT_ID = "22222222-2222-4222-8222-222222222222";
@@ -136,10 +138,11 @@ function createStorageService(): StorageService {
   } as unknown as StorageService;
 }
 
-let preparedRouteModules: Promise<[
-  typeof import("../middleware/index.js"),
-  typeof import("../routes/issues.js"),
-]>;
+type PreparedRouteModules = readonly [
+  { errorHandler: typeof errorHandler },
+  { issueRoutes: typeof issueRoutes },
+];
+let preparedRouteModules: Promise<PreparedRouteModules>;
 
 async function createApp(options?: { companyIds?: string[] }) {
   const [{ errorHandler }, { issueRoutes }] = await preparedRouteModules;
@@ -218,10 +221,11 @@ describe("work product review-document route", () => {
     registerRouteMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockWorkProductService.getById.mockResolvedValue(makeWorkProduct());
-    preparedRouteModules = Promise.all([
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-      vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-    ]);
+    // Load after module reset and mock registration; import sequentially to avoid the cyclic graph deadlocking.
+    preparedRouteModules = import("../middleware/index.js").then(async ({ errorHandler }) => {
+      const { issueRoutes } = await import("../routes/issues.js");
+      return [{ errorHandler }, { issueRoutes }] as const;
+    });
     await preparedRouteModules;
   });
 

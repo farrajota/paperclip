@@ -1,3 +1,5 @@
+import { AGENT_OBSERVABILITY_ENV_KEYS } from "../drivers/agent-observability.js";
+import { configuredEnvironment } from "../configured-environment.js";
 import { spawn } from "node:child_process";
 import {
   createCipheriv,
@@ -21,15 +23,17 @@ import {
   renameSync,
   unlinkSync,
   writeFileSync,
-  type Stats,
 } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { dirname, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { withStagedPrivateWrite } from "./staged-private-write.js";
+import { verifyPrivateRegularFile } from "./private-state-file.js";
 
 import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
-import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES } from "../drivers/acpx/environment.js";
+import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES, CLAUDE_ROUTING_ENV_KEYS, createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
+import { piCredentialNames } from "../drivers/acpx/pi-provider-config.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
 import {
   validatePrpEvent,
@@ -43,8 +47,10 @@ import {
 } from "./prp-transport-types.js";
 
 const protocol = "paperclip.runner";
-const protocolMinVersion = 1;
-const protocolVersion = 2;
+export const RUNNER_PRP_PROTOCOL_MIN = 1;
+const protocolMinVersion = RUNNER_PRP_PROTOCOL_MIN;
+export const RUNNER_PRP_PROTOCOL_MAX = 3;
+const protocolVersion = RUNNER_PRP_PROTOCOL_MAX;
 const secureFrameSchema = "paperclip.runner.secure-frame.v1";
 const websocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const coreStateSchema = "paperclip.runner.durable.control-plane-state.v1";
@@ -78,6 +84,7 @@ const commandTypes = new Set([
   "request.resolve",
   "interaction.receipt",
   "semantic_tool.result",
+  "external_provider.operation",
   "session.snapshot",
   "session.goal.get",
   "session.goal.set",
@@ -286,11 +293,13 @@ export interface RunnerProcessHandle {
   completion: Promise<RunnerProcessResult>;
   processGroupId?: number | null;
   startedAt?: string;
+  isExitConfirmed?(): boolean;
   /** Relaunches the same immutable process specification with a fresh ticket. */
-  restart?(ticket: string): RunnerProcessHandle;
+  restart?: ((ticket: string) => RunnerProcessHandle) | null;
 }
 
 export type RunnerProcessConnection =
+  | { mode: "external" }
   | { mode: "connect"; connectUrl: string; caBundlePath?: string }
   | {
       mode: "listen";
@@ -300,6 +309,8 @@ export type RunnerProcessConnection =
     };
 
 export interface RunnerProcessLaunchSpec {
+  /** Structured data for process owners. Plugins never receive the shell specification. */
+  nativeRunner?: Omit<Parameters<typeof spawnRunner>[0], "processLauncher" | "runnerBinaryPath" | "environment" | "connectUrl">;
   command: string;
   args: readonly string[];
   cwd: string;
@@ -700,7 +711,7 @@ function isStoredCoreState(
       (command, index) =>
         isRecord(command) &&
         (command.schema === "paperclip.prp.command.v1" ||
-          command.schema === "paperclip.prp.command.v2") &&
+          command.schema === "paperclip.prp.command.v2" || command.schema === "paperclip.prp.command.v3") &&
         typeof command.commandId === "string" &&
         stableIdPattern.test(command.commandId) &&
         command.commandId.length <= 160 &&
@@ -1112,23 +1123,7 @@ function verifyPrivateDirectory(path: string): void {
   }
 }
 
-function verifyPrivateRegularFile(file: Stats, path: string): void {
-  if (!file.isFile()) {
-    throw new Error(`Private state path is not a regular file: ${path}`);
-  }
-  if (process.platform !== "win32") {
-    if ((file.mode & 0o777) !== 0o600) {
-      throw new Error(`Private state file does not use mode 0600: ${path}`);
-    }
-    if (process.geteuid !== undefined && file.uid !== process.geteuid()) {
-      throw new Error(
-        `Private state file is not owned by the daemon user: ${path}`,
-      );
-    }
-  }
-}
-
-function readPrivateFile(path: string): string | null {
+export function readPrivateFile(path: string): string | null {
   let descriptor: number;
   try {
     descriptor = openSync(
@@ -1166,7 +1161,7 @@ function syncParentDirectory(path: string): void {
   }
 }
 
-function atomicPrivateWrite(path: string, contents: string): void {
+export function atomicPrivateWrite(path: string, contents: string): void {
   const temporary = resolve(
     dirname(path),
     `.${path.split(/[\\/]/).at(-1)}.${randomUUID()}.tmp`,
@@ -1208,6 +1203,8 @@ class DurableCoreStore {
   readonly path: string;
   #state: StoredCoreState;
   #writeIndeterminate = false;
+  #revision = 0;
+  #savedRevision = 0;
 
   constructor(directory: string, identity: DurableRecoveryIdentity) {
     try {
@@ -1245,7 +1242,33 @@ class DurableCoreStore {
 
   save(): void {
     this.assertWritable();
-    atomicPrivateWrite(this.path, `${JSON.stringify(this.#state, null, 2)}\n`);
+    const revision = ++this.#revision;
+    try {
+      atomicPrivateWrite(this.path, `${JSON.stringify(this.#state)}\n`);
+      this.#savedRevision = revision;
+    } catch (error) {
+      this.#writeIndeterminate = true;
+      throw error;
+    }
+  }
+
+  async saveEvent(): Promise<void> {
+    this.assertWritable();
+    const revision = ++this.#revision;
+    try {
+      await withStagedPrivateWrite(this.path, `${JSON.stringify(this.#state)}\n`, (temporary) => {
+        this.assertWritable();
+        // A command or replacement connection can persist this event and newer
+        // authority while its file is staged. Never roll that state back.
+        if (this.#savedRevision >= revision) return;
+        renameSync(temporary, this.path);
+        syncParentDirectory(this.path);
+        this.#savedRevision = revision;
+      });
+    } catch (error) {
+      this.#writeIndeterminate = true;
+      throw error;
+    }
   }
 
   assertWritable(): void {
@@ -1258,9 +1281,11 @@ class DurableCoreStore {
   /** Persist a complete candidate before publishing any new authority in memory. */
   commit(candidate: StoredCoreState): void {
     this.assertWritable();
+    const revision = ++this.#revision;
     try {
-      atomicPrivateWrite(this.path, `${JSON.stringify(candidate, null, 2)}\n`);
+      atomicPrivateWrite(this.path, `${JSON.stringify(candidate)}\n`);
       this.#state = candidate;
+      this.#savedRevision = revision;
     } catch (error) {
       // Rename may already have succeeded before directory fsync failed.
       // Never overwrite that possibly durable receipt using stale memory.
@@ -1489,8 +1514,13 @@ export class DurablePrpControlPlane {
   #expectedRunnerDigest: string;
   #server: Server | null = null;
   #connections = new Set<AuthorityConnection>();
+  #eventOwner: AuthorityConnection | null = null;
+  // Set when the last authenticated Runner connection closes; cleared on the
+  // next authentication. Diagnostic only: it never gates authority.
+  #runnerDisconnectedAt: number | null = null;
   #connectionProcessing = new Map<AuthorityConnection, Promise<void>>();
   #pendingSemanticCalls = new Set<string>();
+  #semanticCallbacksRetired = false;
   #semanticResultPersistenceFailed = false;
   #semanticResultFailures: Array<{
     callId: string;
@@ -1627,6 +1657,16 @@ export class DurablePrpControlPlane {
     }
   }
 
+  /** Retire this journal writer after stopped ingress is fully joined. A late
+   * external effect keeps its committed input pending for reconciliation;
+   * it must never overwrite the successor controller's durable state. */
+  retireSemanticToolCallbacks(): void {
+    if (this.#server !== null || this.#connections.size !== 0 || this.#connectionProcessing.size !== 0) {
+      throw new Error("Semantic callback retirement requires drained, stopped ingress.");
+    }
+    this.#semanticCallbacksRetired = true;
+  }
+
   /** Forces a resumable re-authentication after an immutable run attachment rotates. */
   disconnectActiveRunner(): void {
     const connections = [...this.#connections];
@@ -1638,6 +1678,15 @@ export class DurablePrpControlPlane {
     return [...this.#connections].filter(
       (connection) => connection.secureChannel !== null,
     ).length;
+  }
+
+  /**
+   * Milliseconds since the last authenticated Runner connection closed, or
+   * null when a Runner is connected or has never authenticated.
+   */
+  runnerDisconnectedForMs(now = Date.now()): number | null {
+    if (this.#runnerDisconnectedAt === null || this.activeRunnerConnectionCount() > 0) return null;
+    return Math.max(0, now - this.#runnerDisconnectedAt);
   }
 
   /** A reusable close requires every admitted callback's exact durable result. */
@@ -1959,7 +2008,7 @@ export class DurablePrpControlPlane {
     }
     const controllerSeq = this.#store.state.commands.length + 1;
     const command: DurableRecoveryCoreCommand = {
-      schema: type.startsWith("session.goal.")
+      schema: type === "external_provider.operation" ? "paperclip.prp.command.v3" : type.startsWith("session.goal.")
         ? "paperclip.prp.command.v2"
         : "paperclip.prp.command.v1",
       commandId:
@@ -2070,7 +2119,11 @@ export class DurablePrpControlPlane {
         };
         void tail.then(release, release);
       },
-      onClose: () => this.#connections.delete(connection),
+      onClose: () => {
+        this.#connections.delete(connection);
+        if (connection.secureChannel !== null && this.activeRunnerConnectionCount() === 0)
+          this.#runnerDisconnectedAt ??= Date.now();
+      },
     });
     this.#connections.add(connection);
     return {
@@ -2703,7 +2756,8 @@ export class DurablePrpControlPlane {
           phase: "activated",
         };
         candidate.leases = { [lease.credentialId]: structuredClone(lease) };
-        candidate.runAttachTemplate = this.#store.state.runAttachTemplate;
+        const { paperclipNextAuthority: _authority, ...runAttachTemplate } = transition.command.payload;
+        candidate.runAttachTemplate = structuredClone(runAttachTemplate);
         this.#store.commit(candidate);
         this.#identity = structuredClone(candidate.identity);
         lease = this.#store.state.leases[lease.credentialId]!;
@@ -2732,6 +2786,8 @@ export class DurablePrpControlPlane {
       pending.serverProof,
       clientProof,
     );
+    this.#runnerDisconnectedAt = null;
+    this.#eventOwner = connection;
     for (const active of this.#connections) {
       if (active !== connection && active.secureChannel !== null)
         active.close();
@@ -3072,6 +3128,8 @@ export class DurablePrpControlPlane {
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): Promise<void> {
+    if (this.#eventOwner !== connection) return;
+    const identity = this.#identity;
     if (this.#protocolIntegrityError !== null) {
       connection.close();
       return;
@@ -3204,6 +3262,7 @@ export class DurablePrpControlPlane {
     try {
       await this.#onCommittedEvent?.(event);
     } catch (error) {
+      if (this.#eventOwner !== connection || this.#identity !== identity) return;
       if (error instanceof NativeSessionProtocolIntegrityError) {
         this.#failProtocolIntegrity(connection, error);
       } else {
@@ -3211,6 +3270,7 @@ export class DurablePrpControlPlane {
       }
       return;
     }
+    if (this.#eventOwner !== connection || this.#identity !== identity) return;
     // Another authenticated connection can replace this one while its commit
     // is in flight. Once that exact owner has faulted, even a prior successful
     // commit cannot reopen delivery or invoke a new business operation.
@@ -3247,7 +3307,14 @@ export class DurablePrpControlPlane {
       });
       this.#store.state.ackedSourceSeq = sourceSeq;
     }
-    this.#store.save();
+    // Output deltas have no lifecycle or control effects. Other events must
+    // become durable before transport readers can observe them in memory.
+    if (eventType === "item.delta") {
+      await this.#store.saveEvent();
+      if (this.#eventOwner !== connection || this.#identity !== identity || this.#protocolIntegrityError !== null) return;
+    } else {
+      this.#store.save();
+    }
 
     if (
       isSemanticInput &&
@@ -3298,6 +3365,7 @@ export class DurablePrpControlPlane {
           this.disconnectActiveRunner();
         };
         const queueResult = (result: unknown, isError: boolean): void => {
+          if (this.#semanticCallbacksRetired) return;
           try {
             // Retain the full input once in its canonical event. Copying a
             // large write into its result command can exceed the wire bound
@@ -3371,7 +3439,14 @@ const runnerPlatformEnvironmentKeys = [
 ] as const;
 
 const runnerExplicitProviderEnvironmentKeys = [
-  ...ACPX_CREDENTIAL_NAMES.pi,
+  ...ACPX_CREDENTIAL_NAMES.claude.filter(name => !name.startsWith("AWS_")),
+  ...CLAUDE_ROUTING_ENV_KEYS,
+  "PAPERCLIP_AI_PROVIDER_KEY",
+  "PAPERCLIP_AI_PROVIDER_URL",
+  "PAPERCLIP_AGENT_KEY_ID",
+  "PAPERCLIP_AGENT_PUBLIC_KEY",
+  "PAPERCLIP_AGENT_PRIVATE_KEY",
+  ...ACPX_CREDENTIAL_NAMES.pi.filter(name => !name.startsWith("AWS_")),
   ...ACPX_CREDENTIAL_NAMES.cursor,
   ...ACPX_CREDENTIAL_NAMES.copilot,
   ACPX_CREDENTIAL_BINDING_ENV,
@@ -3398,8 +3473,16 @@ const runnerExplicitProviderEnvironmentKeys = [
   "PAPERCLIP_NATIVE_MCP_NAME",
   "PAPERCLIP_NATIVE_MCP_URL",
   "PAPERCLIP_NATIVE_MCP_TOKEN",
+  "PAPERCLIP_NATIVE_MCP_STDIO",
+  "PAPERCLIP_NATIVE_MCP_PROXY",
   "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
   "PAPERCLIP_RUNNER_EXTERNAL_SANDBOX",
+  "PAPERCLIP_RUNNER_HOME_MODE",
+  "ACPX_CLAUDE_INCLUDE_USER_SETTINGS",
+  "CLAUDE_CONFIG_DIR",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
   "PAPERCLIP_ACPX_BUILTIN_ROOT",
   "PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT",
   "PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST",
@@ -3410,6 +3493,7 @@ const runnerExplicitProviderEnvironmentKeys = [
 
 function runnerEnvironment(
   ticket: string,
+  normalizedSessionId: string,
   explicitSource?: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const platformSource = explicitSource ?? process.env;
@@ -3424,11 +3508,32 @@ function runnerEnvironment(
   // already-sanitized environment for this run. Never inherit them implicitly
   // from the server process.
   if (explicitSource !== undefined) {
-    for (const key of runnerExplicitProviderEnvironmentKeys) {
+    for (const key of [...runnerExplicitProviderEnvironmentKeys, ...AGENT_OBSERVABILITY_ENV_KEYS]) {
       const value = explicitSource[key];
       if (value !== undefined) environment[key] = value;
     }
-    Object.assign(environment, githubCredentialEnvironment(explicitSource));
+    if (explicitSource.CLAUDE_CODE_USE_BEDROCK === "1") {
+      for (const key of ["AWS_BEARER_TOKEN_BEDROCK"] as const) {
+        if (explicitSource[key] !== undefined) environment[key] = explicitSource[key];
+      }
+    }
+    // Pi custom-provider references and direct cloud credentials cross only
+    // under the controller's exact run/session credential binding.
+    const marker = explicitSource[ACPX_CREDENTIAL_BINDING_ENV];
+    let binding: unknown;
+    if (marker !== undefined && Buffer.byteLength(marker) <= 4_096) {
+      try { binding = JSON.parse(marker); } catch { /* Sidecar admission rejects invalid markers. */ }
+    }
+    let taskEnvironmentSource = explicitSource;
+    if (binding !== null && typeof binding === "object" && !Array.isArray(binding)
+      && (binding as Record<string, unknown>).agent === "pi") {
+      const bound = createAcpxSidecarHostEnvironment(explicitSource, "pi", normalizedSessionId);
+      taskEnvironmentSource = bound;
+      for (const key of piCredentialNames(explicitSource)) {
+        if (bound[key] !== undefined) environment[key] = bound[key];
+      }
+    }
+    Object.assign(environment, githubCredentialEnvironment(explicitSource), configuredEnvironment(taskEnvironmentSource));
   }
   return environment;
 }
@@ -3476,8 +3581,9 @@ export function spawnRunner(options: {
       : null);
   if (connection === null)
     throw new Error("runner process connection is required");
+  if (connection.mode === "external" && !options.processLauncher) throw new Error("External Runner connection requires a process owner");
   const connectionArgs =
-    connection.mode === "connect"
+    connection.mode === "external" ? [] : connection.mode === "connect"
       ? [
           "--connect-url",
           connection.connectUrl,
@@ -3576,14 +3682,29 @@ export function spawnRunner(options: {
   }
 
   const command = options.runnerBinaryPath ?? runnerBinary;
-  const environment = runnerEnvironment(options.ticket, options.environment);
-  const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => ({
+  const environment = runnerEnvironment(options.ticket, options.identity.normalizedSessionId, options.environment);
+  const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => handle.restart === null ? handle : ({
     ...handle,
-    restart: (ticket) => spawnRunner({ ...options, ticket }),
+    restart: (ticket) => {
+      if (handle.isExitConfirmed?.() === false) {
+        throw new Error("runner_process_termination_unconfirmed");
+      }
+      return spawnRunner({ ...options, ticket });
+    },
   });
   if (options.processLauncher !== undefined) {
     return withRestart(
-      options.processLauncher({ command, args, cwd: packageRoot, environment }),
+      options.processLauncher({ command, args, cwd: packageRoot, environment,
+        nativeRunner: {
+          identity: options.identity, ticket: options.ticket, connection, stateDirectory: options.stateDirectory,
+          runnerVersion: options.runnerVersion, runnerDigest: options.runnerDigest,
+          maxOutboxBytes: options.maxOutboxBytes, p0ReserveBytes: options.p0ReserveBytes,
+          maxRuntimeMs: options.maxRuntimeMs, maxLifetimeMs: options.maxLifetimeMs,
+          reconnectGraceMs: options.reconnectGraceMs, lifecyclePolicy: options.lifecyclePolicy,
+          acpxLaunchProfile: options.acpxLaunchProfile, opencodeLaunchProfile: options.opencodeLaunchProfile,
+          diagnosticsDirectory: options.diagnosticsDirectory,
+        },
+      }),
     );
   }
 
@@ -3664,7 +3785,7 @@ export async function waitForProcess(
 ): Promise<RunnerProcessResult> {
   let timer: NodeJS.Timeout | undefined;
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       handle.completion,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
@@ -3685,6 +3806,10 @@ export async function waitForProcess(
         }, timeoutMs);
       }),
     ]);
+    if (handle.isExitConfirmed?.() === false) {
+      throw new Error("runner_process_termination_unconfirmed");
+    }
+    return result;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }

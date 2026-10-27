@@ -1,6 +1,8 @@
+import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -14,10 +16,14 @@ import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { companySecrets } from "./company_secrets.js";
 import { issues } from "./issues.js";
+import { cases } from "./cases.js";
 import { projects } from "./projects.js";
 import { goals } from "./goals.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { folders } from "./folders.js";
+import { documents } from "./documents.js";
+import { documentRevisions } from "./document_revisions.js";
+import { governanceMilestoneRevisions } from "./governance_milestones.js";
 import type { RoutineEnvConfig, RoutineRevisionSnapshotV1, RoutineVariable, RoutineWebhookDelivery } from "@paperclipai/shared";
 
 export const routines = pgTable(
@@ -42,6 +48,11 @@ export const routines = pgTable(
     originId: text("origin_id"),
     variables: jsonb("variables").$type<RoutineVariable[]>().notNull().default([]),
     env: jsonb("env").$type<RoutineEnvConfig>(),
+    approvedWorkflowDocumentId: uuid("approved_workflow_document_id").references(() => documents.id, { onDelete: "set null" }),
+    approvedWorkflowRevisionId: uuid("approved_workflow_revision_id").references(() => documentRevisions.id, { onDelete: "set null" }),
+    milestoneId: uuid("milestone_id"),
+    milestoneRevisionId: uuid("milestone_revision_id").references(() => governanceMilestoneRevisions.id, { onDelete: "restrict" }),
+    caseId: uuid("case_id").references(() => cases.id, { onDelete: "set null" }),
     latestRevisionId: uuid("latest_revision_id"),
     latestRevisionNumber: integer("latest_revision_number").notNull().default(1),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
@@ -61,6 +72,14 @@ export const routines = pgTable(
     companyFolderIdx: index("routines_company_folder_idx").on(table.companyId, table.folderId),
     companyResponsibleUserIdx: index("routines_company_responsible_user_idx").on(table.companyId, table.responsibleUserId),
     companyOriginIdx: index("routines_company_origin_idx").on(table.companyId, table.originKind, table.originId),
+    approvedWorkflowBindingCheck: check(
+      "routines_approved_workflow_binding_check",
+      sql`(${table.approvedWorkflowDocumentId} is null and ${table.approvedWorkflowRevisionId} is null) or (${table.approvedWorkflowDocumentId} is not null and ${table.approvedWorkflowRevisionId} is not null)`,
+    ),
+    milestoneBindingCheck: check(
+      "routines_milestone_binding_check",
+      sql`(${table.milestoneId} is null and ${table.milestoneRevisionId} is null) or (${table.milestoneId} is not null and ${table.milestoneRevisionId} is not null and ${table.caseId} is not null)`,
+    ),
   }),
 );
 
@@ -74,6 +93,7 @@ export const routineRevisions = pgTable(
     title: text("title").notNull(),
     description: text("description"),
     snapshot: jsonb("snapshot").$type<RoutineRevisionSnapshotV1>().notNull(),
+    dispatchActor: jsonb("dispatch_actor").$type<Record<string, unknown>>(),
     changeSummary: text("change_summary"),
     restoredFromRevisionId: uuid("restored_from_revision_id").references(
       (): AnyPgColumn => routineRevisions.id,
@@ -118,6 +138,10 @@ export const routineTriggers = pgTable(
     cronExpression: text("cron_expression"),
     timezone: text("timezone"),
     nextRunAt: timestamp("next_run_at", { withTimezone: true }),
+    catchUpCutoff: timestamp("catch_up_cutoff", { withTimezone: true }),
+    catchUpRevisionId: uuid("catch_up_revision_id").references(() => routineRevisions.id, { onDelete: "restrict" }),
+    catchUpExecutionsConsumed: integer("catch_up_executions_consumed").notNull().default(0),
+    catchUpLatestOnly: boolean("catch_up_latest_only").notNull().default(false),
     lastFiredAt: timestamp("last_fired_at", { withTimezone: true }),
     publicId: text("public_id"),
     secretId: uuid("secret_id").references(() => companySecrets.id, { onDelete: "set null" }),
@@ -138,6 +162,7 @@ export const routineTriggers = pgTable(
     nextRunIdx: index("routine_triggers_next_run_idx").on(table.nextRunAt),
     publicIdIdx: index("routine_triggers_public_id_idx").on(table.publicId),
     publicIdUq: uniqueIndex("routine_triggers_public_id_uq").on(table.publicId),
+    catchUpEpisodeCheck: check("routine_triggers_catch_up_episode_check", sql`(${table.catchUpCutoff} IS NULL AND ${table.catchUpRevisionId} IS NULL AND ${table.catchUpExecutionsConsumed} = 0 AND NOT ${table.catchUpLatestOnly}) OR (${table.catchUpCutoff} IS NOT NULL AND ${table.catchUpRevisionId} IS NOT NULL AND ${table.catchUpExecutionsConsumed} BETWEEN 0 AND 25)`),
   }),
 );
 
@@ -177,6 +202,72 @@ export const routineRuns = pgTable(
     idempotencyIdx: index("routine_runs_trigger_idempotency_idx").on(table.triggerId, table.idempotencyKey),
   }),
 );
+export const routineOccurrences = pgTable(
+  "routine_occurrences",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    routineId: uuid("routine_id").notNull().references(() => routines.id, { onDelete: "cascade" }),
+    triggerId: uuid("trigger_id").notNull(),
+    scheduledAt: timestamp("scheduled_at", { withTimezone: true }).notNull(),
+    revisionId: uuid("revision_id").references(() => routineRevisions.id, { onDelete: "set null" }),
+    revisionNumber: integer("revision_number").notNull(),
+    occurrenceKey: text("occurrence_key").notNull(),
+    disposition: text("disposition").notNull().default("obligation"),
+    executionState: text("execution_state").notNull().default("pending"),
+    decisionReason: text("decision_reason"),
+    ownerUserId: text("owner_user_id"),
+    taskId: uuid("task_id").references(() => issues.id, { onDelete: "set null" }),
+    runId: uuid("run_id").references(() => routineRuns.id, { onDelete: "set null" }),
+    approvedWorkflowDocumentId: uuid("approved_workflow_document_id").references(() => documents.id, { onDelete: "set null" }),
+    approvedWorkflowRevisionId: uuid("approved_workflow_revision_id").references(() => documentRevisions.id, { onDelete: "set null" }),
+    milestoneId: uuid("milestone_id"),
+    milestoneRevisionId: uuid("milestone_revision_id").references(() => governanceMilestoneRevisions.id, { onDelete: "restrict" }),
+    caseId: uuid("case_id").references(() => cases.id, { onDelete: "set null" }),
+    caseHandoffVersion: integer("case_handoff_version"),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    retryAt: timestamp("retry_at", { withTimezone: true }),
+    wakeRequestedAt: timestamp("wake_requested_at", { withTimezone: true }),
+    dispatchAttempts: integer("dispatch_attempts").notNull().default(0),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+    acceptedTaskStatusVersion: integer("accepted_task_status_version"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    stableIdentityUq: uniqueIndex("routine_occurrences_identity_uq").on(table.companyId, table.routineId, table.triggerId, table.scheduledAt),
+    dueIdx: index("routine_occurrences_dispatch_idx").on(table.executionState, table.retryAt, table.leaseExpiresAt),
+    routineHistoryIdx: index("routine_occurrences_history_idx").on(table.companyId, table.routineId, table.scheduledAt),
+    taskIdx: index("routine_occurrences_task_idx").on(table.companyId, table.taskId),
+    caseIdx: index("routine_occurrences_case_idx").on(table.companyId, table.caseId),
+    dispositionCheck: check(
+      "routine_occurrences_disposition_check",
+      sql`${table.disposition} in ('obligation', 'satisfied', 'skipped', 'waived', 'suppressed')`,
+    ),
+    decisionReasonCheck: check(
+      "routine_occurrences_decision_reason_check",
+      sql`${table.disposition} not in ('skipped', 'waived', 'suppressed') or (${table.decisionReason} is not null and length(trim(${table.decisionReason})) > 0)`,
+    ),
+    satisfiedCheck: check(
+      "routine_occurrences_satisfied_check",
+      sql`${table.disposition} <> 'satisfied' or ${table.executionState} = 'satisfied'`,
+    ),
+    executionStateCheck: check(
+      "routine_occurrences_execution_state_check",
+      sql`${table.executionState} in ('pending', 'dispatching', 'waiting', 'satisfied', 'failed', 'cancelled', 'unknown', 'skipped')`,
+    ),
+    approvedWorkflowBindingCheck: check(
+      "routine_occurrences_approved_workflow_binding_check",
+      sql`(${table.approvedWorkflowDocumentId} is null and ${table.approvedWorkflowRevisionId} is null) or (${table.approvedWorkflowDocumentId} is not null and ${table.approvedWorkflowRevisionId} is not null)`,
+    ),
+    milestoneBindingCheck: check(
+      "routine_occurrences_milestone_binding_check",
+      sql`(${table.milestoneId} is null and ${table.milestoneRevisionId} is null) or (${table.milestoneId} is not null and ${table.milestoneRevisionId} is not null and ${table.caseId} is not null)`,
+    ),
+  }),
+);
+
 
 // Content-free receipts prevent sender retries of setup tests from starting work after activation.
 export const routineWebhookTestReceipts = pgTable("routine_webhook_test_receipts", {

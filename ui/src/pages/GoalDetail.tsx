@@ -10,6 +10,7 @@ import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { GoalProperties } from "../components/GoalProperties";
+import { GoalOutcomes } from "../components/GoalOutcomes";
 import { GoalTree } from "../components/GoalTree";
 import { StatusBadge } from "../components/StatusBadge";
 import { InlineEditor } from "../components/InlineEditor";
@@ -175,6 +176,8 @@ export function GoalDetail() {
           }}
         />
       </div>
+
+      <GoalOutcomes goal={goal} />
 
       <Tabs defaultValue="children">
         <TabsList>

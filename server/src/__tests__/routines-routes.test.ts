@@ -166,10 +166,10 @@ function registerModuleMocks() {
 }
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ errorHandler }, { routineRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/routines.js")>("../routes/routines.js"),
-  ]);
+  // Load the route after its mocks are installed. Concurrent importActual
+  // calls through the middleware barrel can cache unmocked dependencies.
+  const { errorHandler } = await import("../middleware/error-handler.js");
+  const { routineRoutes } = await import("../routes/routines.js");
   const app = express();
   app.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
   app.use((req, _res, next) => {
@@ -206,7 +206,8 @@ describe("routine routes", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
-    vi.clearAllMocks();
+    // Hoisted mocks survive resetModules; clear queued one-shot implementations too.
+    vi.resetAllMocks();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockRoutineService.list.mockResolvedValue([routine]);
     mockRoutineService.create.mockResolvedValue(routine);
@@ -349,7 +350,13 @@ describe("routine routes", () => {
     const res = await request(app).get(`/api/routines/${routineId}/revisions`);
 
     expect(res.status).toBe(200);
-    expect(mockRoutineService.listRevisions).toHaveBeenCalledWith(routineId);
+    expect(mockRoutineService.listRevisions).toHaveBeenCalledWith(routineId, {
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
     expect(res.body[0]).toMatchObject({ id: revisionId, revisionNumber: 1 });
   });
 
@@ -434,18 +441,20 @@ describe("routine routes", () => {
   });
 
   it("blocks routine revision reads across company scope", async () => {
-    const app = await createApp({
+    const actor = {
       type: "board",
       userId: "board-user",
       source: "session",
       isInstanceAdmin: false,
       companyIds: ["99999999-9999-4999-8999-999999999999"],
-    });
+    };
+    const app = await createApp(actor);
 
     const res = await request(app).get(`/api/routines/${routineId}/revisions`);
 
     expect(res.status).toBe(404);
-    expect(mockRoutineService.listRevisions).not.toHaveBeenCalled();
+    expect(res.body).toEqual({ error: "Routine not found" });
+    expect(JSON.stringify(res.body)).not.toContain(revisionId);
   });
 
   it("returns an identical 404 body for missing and cross-tenant routine triggers", async () => {
@@ -471,26 +480,18 @@ describe("routine routes", () => {
     expect(mockRoutineService.updateTrigger).not.toHaveBeenCalled();
   });
 
-  it("requires an assigned agent for routine revision history access", async () => {
-    const app = await createApp({
-      type: "agent",
-      agentId: otherAgentId,
-      companyId,
-    });
+  it("passes the canonical actor to revision history authorization", async () => {
+    const actor = { type: "agent", agentId, companyId, source: "agent_key", keyId: "scoped-key-id" };
+    const app = await createApp(actor);
 
     const res = await request(app).get(`/api/routines/${routineId}/revisions`);
 
-    expect(res.status).toBe(403);
-    expect(mockRoutineService.listRevisions).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.listRevisions).toHaveBeenCalledWith(routineId, actor);
   });
-
   it("restores routine revisions with existing routine-management permissions", async () => {
-    const app = await createApp({
-      type: "agent",
-      agentId,
-      companyId,
-      runId: "88888888-8888-4888-8888-888888888888",
-    });
+    const actor = { type: "agent", agentId, companyId, runId: "88888888-8888-4888-8888-888888888888" };
+    const app = await createApp(actor);
 
     const res = await request(app).post(`/api/routines/${routineId}/revisions/${revisionId}/restore`).send({});
 
@@ -499,6 +500,7 @@ describe("routine routes", () => {
       agentId,
       userId: null,
       runId: "88888888-8888-4888-8888-888888888888",
+      authorizationActor: actor,
     });
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "routine.revision_restored",
@@ -650,6 +652,8 @@ describe("routine routes", () => {
     }, {
       agentId: null,
       userId: "board-user",
+      runId: null,
+      authorizationActor: { type: "board", userId: "board-user", source: "session", isInstanceAdmin: false, companyIds: [companyId] },
     });
   });
 
@@ -680,7 +684,29 @@ describe("routine routes", () => {
       agentId: null,
       userId: "board-user",
       runId: null,
+      authorizationActor: {
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      },
     });
-    expect(mockTrackRoutineCreated).toHaveBeenCalledWith(expect.anything());
+    try {
+      expect(mockTrackRoutineCreated).toHaveBeenCalledWith(expect.anything());
+    } catch (error) {
+      // Report mock wiring without importing modules again or changing timing.
+      console.error("Routine creation telemetry mock diagnostic", {
+        clientGetterCalls: mockGetTelemetryClient.mock.calls.length,
+        clientGetterResults: mockGetTelemetryClient.mock.results.slice(-4).map(result => ({
+          type: result.type,
+          truthy: Boolean(result.value),
+        })),
+        trackingCalls: mockTrackRoutineCreated.mock.calls.length,
+        createCalls: mockRoutineService.create.mock.calls.length,
+        activityCalls: mockLogActivity.mock.calls.length,
+      });
+      throw error;
+    }
   });
 });
