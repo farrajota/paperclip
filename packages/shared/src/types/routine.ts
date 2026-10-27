@@ -90,6 +90,11 @@ export interface Routine {
   variables: RoutineVariable[];
   env?: RoutineEnvConfig | null;
   latestRevisionId: string | null;
+  approvedWorkflowDocumentId?: string | null;
+  approvedWorkflowRevisionId?: string | null;
+  milestoneId?: string | null;
+  milestoneRevisionId?: string | null;
+  caseId?: string | null;
   latestRevisionNumber: number;
   createdByAgentId: string | null;
   createdByUserId: string | null;
@@ -135,6 +140,11 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
   responsibleUserId: string | null;
+  approvedWorkflowDocumentId?: string | null;
+  approvedWorkflowRevisionId?: string | null;
+  milestoneId?: string | null;
+  milestoneRevisionId?: string | null;
+  caseId?: string | null;
 }
 
 export interface RoutineRevisionSnapshotTriggerV1 {

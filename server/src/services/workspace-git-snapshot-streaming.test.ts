@@ -75,7 +75,10 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
 
 // macOS adds per-file process and filesystem overhead to the real deletion lane.
 const realGitTimeoutMs = process.platform === "darwin" ? 300_000 : 180_000;
-it("streams and stages all four real Git filename lanes above 32 MiB through the shared scheduler", async () => {
+it.each([
+  { label: "above 32 MiB", fileCount: 40_000, expectedBytes: 34_988_890, minimumBytes: 32 * 1024 * 1024, stageFiles: true },
+  { label: "with staging above argument limits", fileCount: 4_000, expectedBytes: 3_494_890, minimumBytes: 2 * 1024 * 1024, stageFiles: true },
+])("streams and stages all four real Git filename lanes $label through the shared scheduler", async ({ fileCount, expectedBytes, minimumBytes, stageFiles }) => {
   const diagnosticStartedAt = performance.now();
   const observePhase = (phase: StreamDiagnosticPhase) => {
     console.log(JSON.stringify({
@@ -122,8 +125,9 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
     // separate open/write/close promise sequence for each tiny payload.
     await fs.writeFile(contentSource, content);
     await withShortParent(async () => {
-      for (let start = 0; start < 40_000; start += 100) {
-        const results = await Promise.allSettled(Array.from({ length: 100 }, (_, offset) => fs.copyFile(contentSource, path.join(shortParent, fileName(start + offset)))));
+      for (let start = 0; start < fileCount; start += 100) {
+        const batchLength = Math.min(100, fileCount - start);
+        const results = await Promise.allSettled(Array.from({ length: batchLength }, (_, offset) => fs.copyFile(contentSource, path.join(shortParent, fileName(start + offset)))));
         const failure = results.find((result) => result.status === "rejected");
         if (failure) throw failure.reason;
       }
@@ -155,9 +159,9 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
       count++;
       bytes += Buffer.byteLength(relative) + 1;
     }
-    expect(count).toBe(40_000);
-    expect(bytes).toBe(34_988_890);
-    expect(bytes).toBeGreaterThan(32 * 1024 * 1024);
+    expect(count).toBe(fileCount);
+    expect(bytes).toBe(expectedBytes);
+    expect(bytes).toBeGreaterThan(minimumBytes);
   };
   // Standalone callers must use the same streaming semantics.
   setExpensiveWorkspaceGitExecutor(null);
@@ -180,8 +184,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
     runtimes.push(runtime);
     return runtime;
   };
-  const runtime = await stage(snapshot);
-  observePhase(StreamDiagnosticPhase.StageReady);
+
   const remoteParent = path.join(remote, path.relative(repo, parent));
   const shortRemoteParent = path.join(root, "staged-check");
   const checkStagedFiles = async () => {
@@ -204,7 +207,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
         if (stagedBatch.length === 100) await checkStagedBatch();
       }
       if (stagedBatch.length > 0) await checkStagedBatch();
-      expect(stagedCount).toBe(40_000);
+      expect(stagedCount).toBe(fileCount);
     } catch (error) {
       try {
         await fs.rename(shortRemoteParent, remoteParent);
@@ -215,6 +218,8 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
     }
     await fs.rename(shortRemoteParent, remoteParent);
   };
+  const runtime = await stage(snapshot);
+  observePhase(StreamDiagnosticPhase.StageReady);
   await checkStagedFiles();
   const unusualReadResults = await Promise.allSettled(unusual.map((name) => fs.readFile(path.join(remote, name), "utf8")));
   for (let index = 0; index < unusualReadResults.length; index++) {
@@ -247,8 +252,9 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   // The generated names are already known; avoid recursively rediscovering
   // and statting every file, or traversing the long parents for each unlink.
   await withShortParent(async () => {
-    for (let start = 0; start < 40_000; start += 100) {
-      const results = await Promise.allSettled(Array.from({ length: 100 }, (_, offset) => fs.unlink(path.join(shortParent, fileName(start + offset)))));
+    for (let start = 0; start < fileCount; start += 100) {
+      const batchLength = Math.min(100, fileCount - start);
+      const results = await Promise.allSettled(Array.from({ length: batchLength }, (_, offset) => fs.unlink(path.join(shortParent, fileName(start + offset)))));
       const failure = results.find((result) => result.status === "rejected");
       if (failure) throw failure.reason;
     }
@@ -257,10 +263,13 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   observePhase(StreamDiagnosticPhase.FixtureDeletionComplete);
   const deleted = await scan();
   checkLargeLane(deleted.deletedPaths);
-  await stage(deleted);
-  let remaining = 0;
-  for await (const _entry of await fs.opendir(remoteParent)) remaining++;
-  expect(remaining).toBe(0);
+  if (stageFiles) {
+    await stage(deleted);
+    let remaining = 0;
+    for await (const _entry of await fs.opendir(remoteParent)) remaining++;
+    expect(remaining).toBe(0);
+    expect(commands.length).toBeGreaterThan(0);
+  }
   expect(commands.every((command) => command.length < 16 * 1024)).toBe(true);
   expect(scheduler.snapshot()).toMatchObject({ activeCount: 0, queuedCount: 0, inFlightCount: 0, cacheBytes: 0 });
   observePhase(StreamDiagnosticPhase.DeletionScanComplete);

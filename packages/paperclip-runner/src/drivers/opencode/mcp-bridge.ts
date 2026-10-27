@@ -108,7 +108,7 @@ function normalizeTools(
   const tools: OpenCodeMcpToolDefinition[] = [];
   const seen = new Set<string>();
   for (const raw of input) {
-    const name = typeof raw.name === "string" ? canonicalOpenCodeMcpToolName(raw.name) : "";
+    const name = typeof raw.name === "string" ? raw.name.trim() : "";
     if (!name || seen.has(name)) continue;
     const inputSchema = isRecord(raw.inputSchema) ? structuredClone(raw.inputSchema) : { type: "object" };
     tools.push({
@@ -218,7 +218,12 @@ async function handleRequest(
   }
   const params = isRecord(message.params) ? message.params : {};
   const rawName = typeof params.name === "string" ? params.name : "";
-  const tool = canonicalOpenCodeMcpToolName(rawName);
+  // A declared operation may itself start with paperclip_. Preserve that
+  // authority identity before accepting an OpenCode transport prefix alias.
+  const exactName = rawName.trim();
+  const tool = context.admittedTools.some(entry => entry.name === exactName)
+    ? exactName
+    : canonicalOpenCodeMcpToolName(exactName);
   if (!context.admittedTools.some((entry) => entry.name === tool)) {
     writeRpc(response, id, { isError: true, content: [{ type: "text", text: "Unsupported tool." }] });
     return;

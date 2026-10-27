@@ -94,6 +94,33 @@ describe("OpenCode MCP bridge", () => {
     expect(await conflict.json()).toMatchObject({ result: { isError: true, content: [{ text: "Duplicate call identity conflict." }] } });
   });
 
+  it("preserves declared prefixed operation IDs through HTTP MCP and rejects undeclared aliases", async () => {
+    const names = ["paperclip_search_assigned_tools", "paperclip_call_assigned_tool", "search_assigned_tools"];
+    const handler = vi.fn(async call => ({ operation: call.tool }));
+    const bridge = await startOpenCodeMcpBridge({ tools: names.map(name => ({ name, inputSchema: { type: "object" } })), handler });
+    bridges.push(bridge);
+    const listed = await (await rpc(bridge, { id: "list", method: "tools/list" })).json() as { result: { tools: Array<{ name: string }> } };
+    expect(listed.result.tools.map(tool => tool.name)).toEqual([...names, "paperclip_finish", "paperclip_block"]);
+    for (const [i, name] of names.entries()) {
+      for (const [j, prefix] of ["", "paperclip_", "paperclip__", "paperclip."].entries()) {
+        const called = prefix === "paperclip_" && name === "search_assigned_tools" ? name : prefix + name;
+        const result = await (await rpc(bridge, { id: `call-${i}-${j}`, method: "tools/call", params: { name: called, arguments: {} } })).json();
+        expect(result).toMatchObject({ result: { content: [{ text: JSON.stringify({ operation: name }) }] } });
+      }
+    }
+    const before = handler.mock.calls.length;
+    expect(await (await rpc(bridge, { id: "unknown", method: "tools/call", params: { name: "paperclip_unassigned_tool", arguments: {} } })).json()).toMatchObject({ result: { isError: true } });
+    expect(handler).toHaveBeenCalledTimes(before);
+  });
+
+  it("does not authorize a shortened operation when only its prefixed name is declared", async () => {
+    const handler = vi.fn(async () => ({ ok: true }));
+    const bridge = await startOpenCodeMcpBridge({ tools: [{ name: "paperclip_search_assigned_tools", inputSchema: { type: "object" } }], handler });
+    bridges.push(bridge);
+    expect(await (await rpc(bridge, { id: "short", method: "tools/call", params: { name: "search_assigned_tools", arguments: {} } })).json()).toMatchObject({ result: { isError: true } });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it("normalizes all supported OpenCode MCP prefixes", () => {
     expect(canonicalOpenCodeMcpToolName("paperclip_documents.read")).toBe("documents.read");
     expect(canonicalOpenCodeMcpToolName("paperclip__documents.read")).toBe("documents.read");

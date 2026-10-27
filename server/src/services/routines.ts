@@ -1,13 +1,18 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { verifyAppWebhook } from "./app-webhook.js";
-import crypto from "node:crypto";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import crypto from "node:crypto";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  agentWakeupRequests,
   activityLog,
   companies,
   companyMemberships,
+  authSessions,
+  boardApiKeys,
+  agentApiKeys,
   companySecretBindings,
   companySecretVersions,
   companySecrets,
@@ -17,18 +22,21 @@ import {
   folders,
   goals,
   heartbeatRuns,
-  issueInboxArchives,
   issues,
+  cases,
   pluginManagedResources,
   plugins,
   projects,
   routineRevisions,
   routineRuns,
+  routineOccurrences,
   routineDocuments,
   routines,
   routineTriggers,
   routineWebhookTestReceipts,
+  caseHandoffs,
 } from "@paperclipai/db";
+import { governanceMilestoneRevisions, governanceMilestones } from "@paperclipai/db/schema/governance_milestones";
 import type {
   CreateRoutine,
   CreateRoutineTrigger,
@@ -59,13 +67,24 @@ import {
   stringifyRoutineVariableValue,
   syncRoutineVariablesWithTemplate,
 } from "@paperclipai/shared";
+import { ROUTINE_OCCURRENCE_CATCHUP_BATCH_LIMIT, ROUTINE_OCCURRENCE_CATCHUP_EXECUTION_LIMIT, routineOccurrenceIdentity } from "@paperclipai/shared/governance-occurrences";
 import { trackRoutineRun } from "@paperclipai/shared/telemetry";
 import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
+import { caseHandoffService } from "./case-handoffs.js";
+import { governanceMilestoneService } from "./governance-milestones.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { documentService } from "./documents.js";
+import { authorizationService, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
+import { assertActorCanWriteCase, assertCaseTrustedForExecution, canActorReadCase } from "./case-access.js";
+import { canActorReadRoutineWorkflow } from "./governance-occurrences.js";
+import { boardAuthService } from "./board-auth.js";
+import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { loadCurrentCloudOwnerAuthority, isCurrentCloudTenantAuthority, isCurrentCloudOwnerInstanceAdmin, type CurrentCloudOwnerAuthority } from "./cloud-tenant-authority.js";
+import { isLowTrustQuarantined } from "./source-trust.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
@@ -85,7 +104,7 @@ import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
-const MAX_CATCH_UP_RUNS = 25;
+const MAX_CATCH_UP_RUNS = ROUTINE_OCCURRENCE_CATCHUP_EXECUTION_LIMIT;
 const MAX_ROUTINE_REVISIONS = 100;
 const EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE = "execution_issue_status";
 const EXECUTION_ISSUE_TRANSIENT_FAILURE_STATUSES = ["blocked", "cancelled"] as const;
@@ -182,7 +201,7 @@ async function resolveRoutineResponsibleUserId(db: Db, companyId: string, actorU
   return resolveCompanyDefaultResponsibleUserId(db, companyId);
 }
 
-type Actor = { agentId?: string | null; userId?: string | null; runId?: string | null };
+type Actor = { agentId?: string | null; userId?: string | null; runId?: string | null; authorizationActor?: AuthorizationActor };
 type RoutineRow = typeof routines.$inferSelect;
 type RoutineTriggerRow = typeof routineTriggers.$inferSelect;
 
@@ -253,8 +272,13 @@ function getZonedMinuteParts(date: Date, timeZone: string) {
   };
 }
 
-function matchesCronMinute(expression: string, timeZone: string, date: Date) {
-  const cron = parseCron(expression);
+function matchesCronMinute(cron: ReturnType<typeof parseCron>, timeZone: string, date: Date) {
+  if (timeZone === "UTC" && Number.isFinite(date.getTime()) && (
+    !cron.minutes.includes(date.getUTCMinutes())
+    || !cron.daysOfMonth.includes(date.getUTCDate())
+    || !cron.months.includes(date.getUTCMonth() + 1)
+    || !cron.daysOfWeek.includes(date.getUTCDay())
+  )) return false;
   const parts = getZonedMinuteParts(date, timeZone);
   return (
     cron.minutes.includes(parts.minute) &&
@@ -265,19 +289,39 @@ function matchesCronMinute(expression: string, timeZone: string, date: Date) {
   );
 }
 
-export function nextCronTickInTimeZone(expression: string, timeZone: string, after: Date) {
+export function nextCronTickInTimeZone(
+  expression: string,
+  timeZone: string,
+  after: Date,
+  search?: { before: Date; budget: { remainingMinutes: number } },
+) {
+  if (search && (!(search.before instanceof Date) || !Number.isFinite(search.before.getTime()) ||
+    !Number.isInteger(search.budget?.remainingMinutes) || search.budget.remainingMinutes < 0)) {
+    throw unprocessable("Bounded cron search requires a finite exclusive end and a non-negative integer minute budget");
+  }
   const trimmed = expression.trim();
   assertTimeZone(timeZone);
-  const error = validateCron(trimmed);
-  if (error) {
-    throw unprocessable(error);
+  let cron: ReturnType<typeof parseCron>;
+  try {
+    cron = parseCron(trimmed);
+  } catch (error) {
+    throw unprocessable(error instanceof Error ? error.message : String(error));
   }
 
   const cursor = floorToMinute(after);
   cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
+  if (search) {
+    while (cursor.getTime() < search.before.getTime() && search.budget.remainingMinutes > 0) {
+      search.budget.remainingMinutes -= 1;
+      if (matchesCronMinute(cron, timeZone, cursor)) return new Date(cursor.getTime());
+      cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
+    }
+    return null;
+  }
+
   const limit = 366 * 24 * 60 * 5;
   for (let i = 0; i < limit; i += 1) {
-    if (matchesCronMinute(trimmed, timeZone, cursor)) {
+    if (matchesCronMinute(cron, timeZone, cursor)) {
       return new Date(cursor.getTime());
     }
     cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
@@ -572,6 +616,11 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
+    approvedWorkflowDocumentId: routine.approvedWorkflowDocumentId ?? null,
+    approvedWorkflowRevisionId: routine.approvedWorkflowRevisionId ?? null,
+    milestoneId: routine.milestoneId ?? null,
+    milestoneRevisionId: routine.milestoneRevisionId ?? null,
+    caseId: routine.caseId ?? null,
   };
 }
 
@@ -623,8 +672,9 @@ function routineCurrentFieldsMatch(left: RoutineRow, right: RoutineRow) {
 }
 
 function mapRoutineRevision(row: typeof routineRevisions.$inferSelect): RoutineRevision {
+  const { dispatchActor: _dispatchActor, ...publicRevision } = row;
   return {
-    ...row,
+    ...publicRevision,
     snapshot: row.snapshot as RoutineRevisionSnapshotV1,
   };
 }
@@ -972,6 +1022,7 @@ export function routineService(
         createdByAgentId: actor.agentId ?? null,
         createdByUserId: actor.userId ?? null,
         createdByRunId: actor.runId ?? null,
+        dispatchActor: actor.authorizationActor ?? null,
         responsibleUserId: snapshot.routine.responsibleUserId ?? null,
         createdAt: now,
       })
@@ -1062,6 +1113,75 @@ export function routineService(
     if (!folder) throw notFound("Folder not found");
     if (folder.kind !== "routine") throw unprocessable("Folder kind must match routine");
   }
+  async function validateRoutineBindings(companyId: string, input: {
+    approvedWorkflowDocumentId: string | null;
+    approvedWorkflowRevisionId: string | null;
+    milestoneId: string | null;
+    milestoneRevisionId?: string | null;
+    caseId: string | null;
+  }, actor: Actor, bindingChanged: boolean, existingMilestone?: { milestoneId: string | null; milestoneRevisionId: string | null }) {
+    if (bindingChanged) {
+      if (!actor.userId) throw forbidden("Only a board user may bind or remove an approved playbook, milestone, or case from a routine");
+      const [membership] = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, actor.userId),
+        eq(companyMemberships.status, "active"),
+      )).limit(1);
+      if (!membership) throw forbidden("Routine governance bindings require active same-company board membership");
+    }
+    if ((input.approvedWorkflowDocumentId === null) !== (input.approvedWorkflowRevisionId === null)) {
+      throw unprocessable("An approved playbook binding requires both a document and an immutable revision");
+    }
+    if (input.approvedWorkflowDocumentId && input.approvedWorkflowRevisionId) {
+      const bindingActor = actor.authorizationActor ?? (actor.userId ? (await routineOwnerAuthorizationActor(companyId, actor.userId))?.actor : null);
+      if (!bindingActor || !(await canActorReadRoutineWorkflow(db, bindingActor, companyId, input.approvedWorkflowDocumentId))) throw notFound("Approved workflow document revision not found");
+      const [workflow] = await db.select({ sourceTrust: documents.sourceTrust }).from(documents)
+        .innerJoin(documentRevisions, and(
+          eq(documentRevisions.documentId, documents.id),
+          eq(documentRevisions.companyId, companyId),
+          eq(documentRevisions.id, input.approvedWorkflowRevisionId),
+        )).where(and(eq(documents.id, input.approvedWorkflowDocumentId), eq(documents.companyId, companyId))).limit(1);
+      if (!workflow) throw notFound("Approved workflow document revision not found");
+      if (isLowTrustQuarantined(workflow.sourceTrust)) {
+        throw forbidden("A quarantined workflow document cannot be promoted as a routine playbook");
+      }
+    }
+    if (input.caseId) {
+      const [boundCase] = await db.select({ id: cases.id }).from(cases).where(and(
+        eq(cases.id, input.caseId),
+        eq(cases.companyId, companyId),
+      )).limit(1);
+      if (!boundCase) throw notFound("Bound case not found");
+      const bindingActor = actor.authorizationActor ?? (actor.userId ? (await routineOwnerAuthorizationActor(companyId, actor.userId))?.actor : null);
+      if (!bindingActor || !(await canActorReadCase(db, bindingActor, { id: input.caseId, companyId }))) throw notFound("Bound case not found");
+    }
+
+    let milestoneRevisionId: string | null = null;
+    if (input.milestoneId) {
+      if (!input.caseId) throw unprocessable("A routine milestone binding requires its native case binding");
+      const [milestone] = await db.select({ caseId: governanceMilestones.caseId }).from(governanceMilestones).where(and(
+        eq(governanceMilestones.id, input.milestoneId),
+        eq(governanceMilestones.companyId, companyId),
+      )).limit(1);
+      if (!milestone) throw notFound("Bound milestone not found");
+      if (milestone.caseId !== input.caseId) throw unprocessable("The bound milestone must belong to the routine's bound case");
+      const requestedRevisionId = input.milestoneRevisionId ?? (existingMilestone?.milestoneId === input.milestoneId
+        ? existingMilestone.milestoneRevisionId
+        : null);
+      const [revision] = await db.select({ id: governanceMilestoneRevisions.id }).from(governanceMilestoneRevisions).where(and(
+        eq(governanceMilestoneRevisions.companyId, companyId),
+        eq(governanceMilestoneRevisions.milestoneId, input.milestoneId),
+        requestedRevisionId
+          ? eq(governanceMilestoneRevisions.id, requestedRevisionId)
+          : inArray(governanceMilestoneRevisions.state, ["active", "accepted"]),
+      )).orderBy(desc(governanceMilestoneRevisions.revision)).limit(1);
+      if (!revision) throw unprocessable("The bound milestone must have an available immutable contract revision");
+      milestoneRevisionId = revision.id;
+    }
+    return { ...input, milestoneRevisionId };
+  }
+
 
   async function listTriggersForRoutineIds(companyId: string, routineIds: string[]) {
     if (routineIds.length === 0) return new Map<string, RoutineTrigger[]>();
@@ -1252,7 +1372,6 @@ export function routineService(
     triggeredAt: Date;
     status: string;
     issueId?: string | null;
-    nextRunAt?: Date | null;
   }, executor: Db = db) {
     await executor
       .update(routines)
@@ -1269,11 +1388,142 @@ export function routineService(
         .set({
           lastFiredAt: input.triggeredAt,
           lastResult: nextResultText(input.status, input.issueId),
-          nextRunAt: input.nextRunAt === undefined ? undefined : input.nextRunAt,
           updatedAt: new Date(),
         })
         .where(eq(routineTriggers.id, input.triggerId));
     }
+  }
+
+  async function occurrenceAcknowledgement(run: typeof routineRuns.$inferSelect | null, occurrence: typeof routineOccurrences.$inferSelect, executor: Db = db) {
+    const companyId = occurrence.companyId;
+    if (!run) return {
+      disposition: "obligation",
+      executionState: "unknown",
+      decisionReason: "Dispatch lease expired without a durable native run receipt; outcome requires review",
+      acceptedAt: null,
+      acceptedTaskStatusVersion: null,
+      taskId: occurrence.taskId,
+      runId: occurrence.runId,
+    };
+    const task = run.linkedIssueId
+      ? await executor.select({ id: issues.id, status: issues.status, statusVersion: issues.statusVersion,
+        updatedAt: issues.updatedAt, originRunId: issues.originRunId, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues).where(and(eq(issues.id, run.linkedIssueId), eq(issues.companyId, companyId))).then((rows) => rows[0] ?? null)
+      : null;
+    const base = { disposition: "obligation", taskId: run.linkedIssueId, runId: run.id, acceptedAt: null, acceptedTaskStatusVersion: null };
+    if (run.status === "skipped") return {
+      ...base,
+      disposition: "suppressed",
+      executionState: "skipped",
+      decisionReason: run.failureReason ?? "Native skip-if-active policy did not execute this occurrence",
+    };
+    if (run.status === "failed" && !task) return {
+      ...base,
+      executionState: "failed",
+      decisionReason: run.failureReason ?? "Native routine dispatch failed before task acceptance",
+    };
+    let currentCaseHandoff = false;
+    if (occurrence.caseId && task) {
+      const [handoff] = await executor.select({ state: caseHandoffs.state, version: caseHandoffs.version }).from(caseHandoffs).where(and(
+        eq(caseHandoffs.companyId, companyId), eq(caseHandoffs.caseId, occurrence.caseId), eq(caseHandoffs.issueId, task.id),
+        eq(caseHandoffs.idempotencyKey, `routine-occurrence:${occurrence.id}:case-handoff`),
+      )).limit(1);
+      if (!handoff) return { ...base, executionState: task.status === "done" ? "unknown" : "pending", decisionReason: "Committed task awaits authoritative native case attachment" };
+      if (handoff.state === "cancelled" && task.status !== "done") return { ...base, executionState: "cancelled", decisionReason: "Native case handoff was cancelled; obligation remains unsatisfied" };
+      const [caseRow] = await executor.select({ version: cases.handoffVersion, workIssueId: cases.workIssueId }).from(cases).where(and(eq(cases.id, occurrence.caseId), eq(cases.companyId, companyId)));
+      if (!caseRow || caseRow.workIssueId !== task.id || caseRow.version !== handoff.version || handoff.version !== (occurrence.caseHandoffVersion ?? -1) + 1) return {
+        ...base, executionState: "failed", decisionReason: "A newer native case handoff superseded this occurrence's execution; shared task completion is not fulfillment",
+      };
+      currentCaseHandoff = true;
+    }
+    const independentCaseCompletion = currentCaseHandoff && run.status === "coalesced" && !!occurrence.milestoneId && task?.status === "done";
+    if (run.status === "coalesced" && !independentCaseCompletion) {
+      if (task && ["done", "cancelled", "blocked"].includes(task.status)) return {
+        ...base,
+        executionState: task.status === "cancelled" ? "cancelled" : "failed",
+        decisionReason: `Coalesced native task ended ${task.status}; this schedule obligation remains unsatisfied`,
+      };
+      return {
+        ...base,
+        executionState: "waiting",
+        decisionReason: "Coalesced into a shared native task; completion of that task alone does not satisfy this occurrence",
+      };
+    }
+    if (["issue_created", "completed", "failed"].includes(run.status) || independentCaseCompletion) {
+      if (!task) return {
+        ...base,
+        executionState: "unknown",
+        decisionReason: "Native run receipt references a task that is no longer available",
+      };
+      if (task.status === "done" && (task.originRunId === run.id || independentCaseCompletion)) {
+        if (occurrence.milestoneId) {
+          const readiness = await governanceMilestoneService(executor).getMilestoneReadiness(companyId, occurrence.milestoneId, { agentId: task.assigneeAgentId ?? undefined, taskId: task.id });
+          if (!readiness.accepted || readiness.revisionId !== occurrence.milestoneRevisionId) return {
+            ...base, executionState: "waiting", decisionReason: "Native task completed; waiting for current accepted evidence for the exact pinned milestone revision",
+          };
+        }
+        return { ...base, disposition: "satisfied", executionState: "satisfied", decisionReason: "Accepted native task completion and exact pinned evidence",
+          acceptedAt: task.updatedAt, acceptedTaskStatusVersion: task.statusVersion };
+      }
+      if (task.status === "cancelled") return {
+        ...base,
+        executionState: "cancelled",
+        decisionReason: "Native task was cancelled; the schedule obligation remains unsatisfied",
+      };
+      if (task.status === "blocked") return {
+        ...base,
+        executionState: "failed",
+        decisionReason: "Native task was blocked; the schedule obligation remains unsatisfied",
+      };
+      if (task.originRunId !== run.id) return {
+        ...base,
+        executionState: "failed",
+        decisionReason: "A shared native task cannot satisfy this distinct schedule occurrence",
+      };
+      if (currentCaseHandoff) return { ...base, executionState: "waiting", decisionReason: "Waiting for native case task acceptance; native handoff owns assignment delivery" };
+      const wake = await findWakeReceipt(companyId, `routine-run:${run.id}:assignment-wake`, executor);
+      if (!wake) return { ...base, executionState: "pending", decisionReason: "Committed task is awaiting durable native assignment delivery" };
+      if (["failed", "cancelled", "skipped"].includes(wake.status)) return { ...base, executionState: wake.status === "cancelled" ? "cancelled" : "failed", decisionReason: `Native assignment receipt is ${wake.status}; obligation remains unsatisfied` };
+      return { ...base, executionState: "waiting", decisionReason: null };
+    }
+    return {
+      ...base,
+      executionState: "unknown",
+      decisionReason: `Native run receipt is in unexpected state ${run.status}`,
+    };
+  }
+
+  async function acknowledgeRoutineOccurrence(occurrence: typeof routineOccurrences.$inferSelect, leaseOwner: string, run: typeof routineRuns.$inferSelect | null) {
+    const acknowledgement = await occurrenceAcknowledgement(run, occurrence, db);
+    const [updated] = await db.update(routineOccurrences).set({
+      disposition: acknowledgement.disposition,
+      executionState: acknowledgement.executionState,
+      decisionReason: acknowledgement.decisionReason,
+      taskId: acknowledgement.taskId,
+      runId: acknowledgement.runId,
+      acceptedAt: acknowledgement.acceptedAt,
+      acceptedTaskStatusVersion: acknowledgement.acceptedTaskStatusVersion,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      retryAt: null,
+      updatedAt: new Date(),
+    }).where(and(
+      eq(routineOccurrences.id, occurrence.id),
+      eq(routineOccurrences.disposition, "obligation"),
+      eq(routineOccurrences.executionState, "dispatching"),
+      eq(routineOccurrences.leaseOwner, leaseOwner),
+      eq(routineOccurrences.dispatchAttempts, occurrence.dispatchAttempts),
+    )).returning();
+    return updated ?? null;
+  }
+
+  async function findWakeReceipt(companyId: string, idempotencyKey: string, executor: Db = db) {
+    const [receipt] = await executor.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+      )).limit(1);
+    return receipt ?? null;
   }
 
   async function getAutomaticRoutineDispatchEligibility(
@@ -1293,8 +1543,8 @@ export function routineService(
     return { eligible: true };
   }
 
-  async function evaluateActivityGate(routine: typeof routines.$inferSelect, now: Date) {
-    const lastDispatchedRun = await db
+  async function evaluateActivityGate(routine: typeof routines.$inferSelect, now: Date, executor: Db = db) {
+    const lastDispatchedRun = await executor
       .select({ triggeredAt: routineRuns.triggeredAt })
       .from(routineRuns)
       .where(
@@ -1358,7 +1608,7 @@ export function routineService(
         : sql`false`
       : undefined;
 
-    const matchedActivity = await db
+    const matchedActivity = await executor
       .select({
         id: activityLog.id,
         action: activityLog.action,
@@ -1411,7 +1661,6 @@ export function routineService(
     trigger: typeof routineTriggers.$inferSelect;
     source: "schedule" | "webhook";
     reason: string;
-    nextRunAt?: Date | null;
     details?: Record<string, unknown> | null;
     idempotencyKey?: string | null;
     rejectIdempotencyReplay?: boolean;
@@ -1482,7 +1731,6 @@ export function routineService(
           : input.reason === "no_external_activity"
             ? "skipped_no_activity"
             : "skipped_worktree_execution_cutoff",
-        nextRunAt: input.nextRunAt,
       }, txDb);
       return createdRun;
     });
@@ -1554,6 +1802,38 @@ export function routineService(
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
     if (executionBoundIssue) return executionBoundIssue;
+
+    // Creation commits before the assignment wake. Only the creator's still-pending
+    // native run/task pair can bridge that gap; an arbitrary open idle task cannot.
+    const pendingDispatchIssue = await executor
+      .select()
+      .from(issues)
+      .innerJoin(routineRuns, and(
+        sql`${issues.originRunId} = ${routineRuns.id}::text`,
+        eq(routineRuns.companyId, issues.companyId),
+        eq(routineRuns.routineId, routine.id),
+        eq(routineRuns.linkedIssueId, issues.id),
+        eq(routineRuns.dispatchFingerprint, issues.originFingerprint),
+        eq(routineRuns.status, "issue_created"),
+        isNull(routineRuns.completedAt),
+      ))
+      .leftJoin(agentWakeupRequests, and(
+        eq(agentWakeupRequests.companyId, routineRuns.companyId),
+        eq(agentWakeupRequests.idempotencyKey, sql`'routine-run:' || ${routineRuns.id}::text || ':assignment-wake'`),
+      ))
+      .where(and(
+        eq(issues.companyId, routine.companyId),
+        eq(issues.originKind, originKind),
+        eq(issues.originId, originId),
+        inArray(issues.status, OPEN_ISSUE_STATUSES),
+        visibleIssueCondition(),
+        isNull(agentWakeupRequests.id),
+        ...(dispatchFingerprint ? [eq(routineRuns.dispatchFingerprint, dispatchFingerprint)] : []),
+      ))
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0]?.issues ?? null);
+    if (pendingDispatchIssue) return pendingDispatchIssue;
 
     return executor
       .select()
@@ -1687,36 +1967,137 @@ export function routineService(
     return value;
   }
 
-  async function touchIssueForUserInbox(
-    executor: Db,
-    input: {
-      companyId: string;
-      issueId: string;
-      userId: string;
-      touchedAt: Date;
-    },
-  ) {
-    await executor.insert(activityLog).values({
-      companyId: input.companyId,
-      actorType: "user",
-      actorId: input.userId,
-      action: "issue.inbox_touched",
-      entityType: "issue",
-      entityId: input.issueId,
-      responsibleUserId: input.userId,
-      details: { source: "manual_routine_run" },
-      createdAt: input.touchedAt,
-    });
+  async function routineOwnerAuthorizationActor(companyId: string, userId: string | null, executor: Db = db) {
+    if (!userId) return null;
+    const [membership] = await executor.select({ membershipRole: companyMemberships.membershipRole }).from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, userId),
+      eq(companyMemberships.status, "active"),
+    )).limit(1).for("share");
+    if (!membership) return null;
+    return {
+      actor: {
+        type: "board" as const,
+        source: "none" as const,
+        userId,
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: membership.membershipRole, status: "active" }],
+        onBehalfOfUserId: userId,
+      },
+    };
+  }
 
-    await executor
-      .delete(issueInboxArchives)
-      .where(
-        and(
-          eq(issueInboxArchives.companyId, input.companyId),
-          eq(issueInboxArchives.issueId, input.issueId),
-          eq(issueInboxArchives.userId, input.userId),
-        ),
-      );
+  async function currentDispatchActor(routine: RoutineRow, captured: AuthorizationActor | undefined, executor: Db = db, cloudAuthority?: CurrentCloudOwnerAuthority | null): Promise<AuthorizationActor> {
+    const [current] = await executor.select({ responsibleUserId: routines.responsibleUserId }).from(routines).where(and(eq(routines.id, routine.id), eq(routines.companyId, routine.companyId)));
+    const owner = await routineOwnerAuthorizationActor(routine.companyId, current?.responsibleUserId ?? null, executor);
+    if (!owner) throw forbidden("Routine accountable owner no longer has active company membership");
+    if (!captured) return owner.actor;
+    if (captured.type === "none") throw forbidden("Routine dispatch requires an authorized intent");
+    let actor = captured;
+    if (captured.type === "board" && captured.userId && captured.source !== "none" && captured.source !== "local_implicit") {
+      const access = await boardAuthService(executor).resolveBoardAccess(captured.userId);
+      if (captured.source === "cloud_tenant" && (!isCurrentCloudTenantAuthority(captured.userId, cloudAuthority) || cloudAuthority.role === "viewer")) throw forbidden("Current Cloud tenant authority cannot authorize routine execution");
+      actor = { ...captured, companyIds: access.companyIds, isInstanceAdmin: captured.source === "cloud_tenant" ? await isCurrentCloudOwnerInstanceAdmin(executor, captured.userId, cloudAuthority) : captured.source !== "mcp_oauth" && access.isInstanceAdmin, memberships: undefined };
+      if (captured.source === "session") {
+        if (!captured.sessionId) throw forbidden("Approved routine actor has no native session context");
+        const [session] = await executor.select({ expiresAt: authSessions.expiresAt }).from(authSessions).where(and(eq(authSessions.id, captured.sessionId), eq(authSessions.userId, captured.userId)));
+        if (!session || session.expiresAt <= new Date()) throw forbidden("Approved routine actor session is no longer active");
+      }
+      if (captured.source === "board_key") {
+        if (!captured.keyId) throw forbidden("Approved routine actor has no native key context");
+        const [key] = await executor.select().from(boardApiKeys).where(and(eq(boardApiKeys.id, captured.keyId), eq(boardApiKeys.userId, captured.userId), isNull(boardApiKeys.revokedAt)));
+        if (!key || (key.expiresAt && key.expiresAt <= new Date())) throw forbidden("Approved routine key is no longer active");
+      }
+    }
+    if (captured.type === "agent") {
+      if (captured.companyId !== routine.companyId || !captured.agentId) throw forbidden("Routine actor company binding changed");
+      if (captured.source === "agent_key") {
+        if (!captured.keyId) throw forbidden("Routine actor key context is unavailable");
+        const [key] = await executor.select().from(agentApiKeys).where(and(eq(agentApiKeys.id, captured.keyId), eq(agentApiKeys.companyId, routine.companyId), eq(agentApiKeys.agentId, captured.agentId), isNull(agentApiKeys.revokedAt)));
+        if (!key || JSON.stringify(key.scopeConfig ?? { kind: "standard" }) !== JSON.stringify(captured.keyScope ?? { kind: "standard" })) throw forbidden("Routine actor key was revoked or its scope changed");
+      }
+      if (captured.runId) await assertAgentRunWriteAllowed(executor, routine.companyId, { agentId: captured.agentId, runId: captured.runId });
+    }
+    const companyRead = await authorizationService(executor).decide({ actor, action: "company_scope:read", resource: { type: "company", companyId: routine.companyId } });
+    if (!companyRead.allowed) throw forbidden(companyRead.explanation);
+    return actor;
+  }
+
+  async function attachRoutineOccurrenceToCase(input: {
+    companyId: string;
+    routine: typeof routines.$inferSelect;
+    occurrence: { id: string; leaseOwner: string; dispatchAttempts: number; caseHandoffVersion: number | null };
+    task: typeof issues.$inferSelect;
+    authorizationActor?: AuthorizationActor;
+    instructions: string;
+  }) {
+    const caseId = input.routine.caseId;
+    if (!caseId) return;
+    const owner = await routineOwnerAuthorizationActor(input.companyId, input.routine.responsibleUserId);
+    if (!owner) throw forbidden("The routine owner no longer has active membership for its bound case");
+    if (input.occurrence.caseHandoffVersion === null) throw unprocessable("Routine occurrence did not capture the native case handoff version");
+    const existing = await db.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, input.companyId), eq(caseHandoffs.idempotencyKey, `routine-occurrence:${input.occurrence.id}:case-handoff`), eq(caseHandoffs.caseId, caseId), eq(caseHandoffs.issueId, input.task.id))).then(rows => rows[0]);
+    if (existing) {
+      if (existing.state === "cancelled") throw conflict("Native routine case handoff was cancelled");
+      return;
+    }
+    const [caseRow] = await db.select({ id: cases.id, companyId: cases.companyId, workIssueId: cases.workIssueId })
+      .from(cases).where(and(eq(cases.id, caseId), eq(cases.companyId, input.companyId))).limit(1);
+    if (!caseRow) throw notFound("Bound routine case is no longer available");
+    if (caseRow.workIssueId && caseRow.workIssueId !== input.task.id) {
+      throw conflict("Bound case already has a different native primary task; this occurrence remains unsatisfied");
+    }
+    const actor = input.authorizationActor ?? owner.actor;
+    const handoffInput = {
+      idempotencyKey: `routine-occurrence:${input.occurrence.id}:case-handoff`,
+      case: { id: caseId },
+      toAgentId: input.routine.assigneeAgentId!,
+      phase: "routine-execution",
+      instructions: input.instructions,
+      expectedHandoffVersion: input.occurrence.caseHandoffVersion,
+      expectedIssueStatusVersion: input.task.statusVersion,
+      ...(caseRow.workIssueId ? {} : { bindIssueId: input.task.id }),
+    };
+    try {
+      await caseHandoffService(db).handoff(input.companyId, actor, handoffInput, { beforeAccept: async tx => {
+        const [claimed] = await tx.select({ id: routineOccurrences.id }).from(routineOccurrences).where(and(
+          eq(routineOccurrences.id, input.occurrence.id), eq(routineOccurrences.disposition, "obligation"), eq(routineOccurrences.executionState, "dispatching"),
+          eq(routineOccurrences.leaseOwner, input.occurrence.leaseOwner), eq(routineOccurrences.dispatchAttempts, input.occurrence.dispatchAttempts),
+        )).for("update");
+        if (!claimed) throw conflict("Routine case attachment attempt is no longer authoritative");
+      } });
+    } catch (error) {
+      const [receipt] = await db.select({ id: caseHandoffs.id }).from(caseHandoffs).where(and(
+        eq(caseHandoffs.companyId, input.companyId),
+        eq(caseHandoffs.actorType, actor.type === "agent" ? "agent" : "user"),
+        eq(caseHandoffs.actorId, actor.type === "agent" ? actor.agentId! : actor.userId!),
+        eq(caseHandoffs.idempotencyKey, handoffInput.idempotencyKey),
+      )).limit(1);
+      if (!receipt) throw error;
+    }
+  }
+
+  async function assertRoutineTaskAuthority(routine: typeof routines.$inferSelect, task: typeof issues.$inferSelect, executor: Db = db, suppliedActor?: AuthorizationActor) {
+    const owner = suppliedActor ? { actor: suppliedActor } : await routineOwnerAuthorizationActor(routine.companyId, routine.responsibleUserId, executor);
+    if (!owner) throw forbidden("The routine owner no longer has active membership to authorize scheduled task access");
+    const resource = {
+      type: "issue" as const,
+      companyId: routine.companyId,
+      issueId: task.id,
+      projectId: task.projectId,
+      parentIssueId: task.parentId,
+      assigneeAgentId: task.assigneeAgentId,
+      assigneeUserId: task.assigneeUserId,
+      originKind: task.originKind,
+      originId: task.originId,
+      status: task.status,
+    };
+    const authorization = authorizationService(executor);
+    const assignment = await authorization.decide({ actor: owner.actor, action: "tasks:assign", resource });
+    if (!assignment.allowed) throw forbidden(assignment.explanation);
+    const visibility = await authorization.decide({ actor: owner.actor, action: "issue:read", resource });
+    if (!visibility.allowed) throw notFound("Scheduled task is no longer visible to the routine owner");
   }
 
   async function dispatchRoutineRun(input: {
@@ -1734,8 +2115,9 @@ export function routineService(
     executionWorkspacePreference?: string | null;
     executionWorkspaceSettings?: Record<string, unknown> | null;
     descriptionAppendix?: string | null;
-    nextRunAtOverride?: Date | null;
     actor?: Actor;
+    persistedScheduleOccurrence?: boolean;
+    occurrenceClaim?: { id: string; leaseOwner: string; dispatchAttempts: number; caseHandoffVersion: number | null };
   }) {
     const projectId = input.projectId ?? input.routine.projectId ?? null;
     const projectWorkspaceId = input.projectWorkspaceId ?? null;
@@ -1744,6 +2126,23 @@ export function routineService(
       throw unprocessable("Default agent required");
     }
     await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
+    const cloudAuthority = input.actor?.authorizationActor?.source === "cloud_tenant" && input.actor.authorizationActor.userId ? await loadCurrentCloudOwnerAuthority(input.actor.authorizationActor.userId) : null;
+    let dispatchActor = await currentDispatchActor(input.routine, input.actor?.authorizationActor, db, cloudAuthority);
+    let approvedWorkflowBody: string | null = null;
+    const approvedWorkflowRevisionId = input.routine.approvedWorkflowRevisionId ?? null;
+    if (input.routine.approvedWorkflowDocumentId && approvedWorkflowRevisionId) {
+      if (!(await canActorReadRoutineWorkflow(db, dispatchActor, input.routine.companyId, input.routine.approvedWorkflowDocumentId))) throw notFound("Pinned approved workflow revision not found");
+      const [approvedWorkflow] = await db.select({ body: documentRevisions.body, sourceTrust: documents.sourceTrust })
+        .from(documentRevisions).innerJoin(documents, eq(documents.id, documentRevisions.documentId)).where(and(
+          eq(documentRevisions.id, approvedWorkflowRevisionId),
+          eq(documentRevisions.documentId, input.routine.approvedWorkflowDocumentId),
+          eq(documentRevisions.companyId, input.routine.companyId),
+          eq(documents.companyId, input.routine.companyId),
+        )).limit(1);
+      if (!approvedWorkflow) throw notFound("Pinned approved workflow revision not found");
+      if (isLowTrustQuarantined(approvedWorkflow.sourceTrust)) throw forbidden("Pinned workflow revision is quarantined and cannot authorize routine execution");
+      approvedWorkflowBody = approvedWorkflow.body;
+    }
     const automaticVariables: Record<string, string | number | boolean> = {};
     if (input.executionWorkspaceId && routineUsesWorkspaceBranch(input.routine)) {
       const workspace = await db
@@ -1771,9 +2170,6 @@ export function routineService(
     const allVariables = { ...getBuiltinRoutineVariableValues(), ...automaticVariables, ...resolvedVariables };
     const title = interpolateRoutineTemplate(input.routine.title, allVariables) ?? input.routine.title;
     const baseDescription = interpolateRoutineTemplate(input.routine.description, allVariables);
-    const description = [baseDescription, input.descriptionAppendix]
-      .filter((part): part is string => Boolean(part && part.trim()))
-      .join("\n\n");
     const triggerPayload = mergeRoutineRunPayload(input.payload, { ...automaticVariables, ...resolvedVariables });
     const managedRoutineBinding = await getManagedRoutineBinding(input.routine);
     const managedIssueTemplate = readManagedRoutineIssueTemplate(managedRoutineBinding?.defaultsJson);
@@ -1782,32 +2178,103 @@ export function routineService(
       : "routine_execution";
     const issueOriginId = managedIssueTemplate?.originId ?? input.routine.id;
     const issueBillingCode = managedIssueTemplate?.billingCode ?? null;
-    const dispatchFingerprint = createRoutineDispatchFingerprint({
-      payload: triggerPayload,
-      projectId,
-      projectWorkspaceId,
-      assigneeAgentId,
-      routineRevisionId: input.routine.latestRevisionId,
-      routineEnvFingerprint: createRoutineEnvFingerprint(input.routine.env),
-      executionWorkspaceId: input.executionWorkspaceId ?? null,
-      executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-      executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
-      title,
-      description,
-    });
     let reusedExistingRun = false;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      // Native task numbering precedes graph/privacy locks in every creator path.
+      await tx.execute(sql`select id from ${companies} where ${companies.id} = ${input.routine.companyId} for no key update`);
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${input.routine.companyId}`}, 0))`);
+      const linkOccurrence = async (runId: string, taskId: string | null) => {
+        if (!input.occurrenceClaim) return;
+        const [linked] = await txDb.update(routineOccurrences).set({ runId, taskId, updatedAt: new Date() }).where(and(
+          eq(routineOccurrences.id, input.occurrenceClaim.id),
+          eq(routineOccurrences.disposition, "obligation"),
+          eq(routineOccurrences.executionState, "dispatching"),
+          eq(routineOccurrences.leaseOwner, input.occurrenceClaim.leaseOwner),
+          eq(routineOccurrences.dispatchAttempts, input.occurrenceClaim.dispatchAttempts),
+        )).returning({ id: routineOccurrences.id });
+        if (!linked) throw conflict("Routine occurrence lease changed before its native receipt was committed");
+      };
       await tx.execute(
         sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
       );
+      dispatchActor = await currentDispatchActor(input.routine, dispatchActor, txDb, cloudAuthority);
+      const authorization = authorizationService(txDb);
+      if (projectId && !(await authorization.decide({ actor: dispatchActor, action: "project:read", resource: { type: "project", companyId: input.routine.companyId, projectId } })).allowed) throw notFound("Routine project is unavailable");
+      if (input.routine.parentIssueId && !(await authorization.decide({ actor: dispatchActor, action: "issue:read", resource: { type: "issue", companyId: input.routine.companyId, issueId: input.routine.parentIssueId } })).allowed) throw notFound("Routine parent task is unavailable");
+      const scope = { projectId, parentIssueId: input.routine.parentIssueId, assigneeAgentId, assigneeUserId: null };
+      const assignment = await authorization.decide({ actor: dispatchActor, action: "tasks:assign", resource: { type: "issue", companyId: input.routine.companyId, ...scope }, scope });
+      if (!assignment.allowed) throw forbidden(assignment.explanation);
+      if (input.routine.approvedWorkflowDocumentId) {
+        const recipient: AuthorizationActor = { type: "agent", agentId: assigneeAgentId, companyId: input.routine.companyId };
+        if (!(await canActorReadRoutineWorkflow(txDb, dispatchActor, input.routine.companyId, input.routine.approvedWorkflowDocumentId)) || !(await canActorReadRoutineWorkflow(txDb, recipient, input.routine.companyId, input.routine.approvedWorkflowDocumentId))) throw notFound("Pinned approved workflow is not available to this native execution");
+        const [approvedWorkflow] = await txDb.select({ body: documentRevisions.body, sourceTrust: documents.sourceTrust })
+          .from(documentRevisions).innerJoin(documents, eq(documents.id, documentRevisions.documentId)).where(and(
+            eq(documentRevisions.id, approvedWorkflowRevisionId!),
+            eq(documentRevisions.documentId, input.routine.approvedWorkflowDocumentId),
+            eq(documentRevisions.companyId, input.routine.companyId), eq(documents.companyId, input.routine.companyId),
+          )).for("share");
+        if (!approvedWorkflow) throw notFound("Pinned approved workflow revision not found");
+        if (isLowTrustQuarantined(approvedWorkflow.sourceTrust)) throw forbidden("Pinned workflow revision is quarantined and cannot authorize routine execution");
+        approvedWorkflowBody = approvedWorkflow.body;
+      }
+      const description = [
+        baseDescription,
+        approvedWorkflowBody ? `Board-approved procedure (revision ${approvedWorkflowRevisionId}):\n\n${approvedWorkflowBody}` : null,
+        input.descriptionAppendix,
+      ].filter((part): part is string => Boolean(part && part.trim())).join("\n\n");
+      const dispatchFingerprint = createRoutineDispatchFingerprint({
+        payload: triggerPayload,
+        projectId,
+        projectWorkspaceId,
+        assigneeAgentId,
+        routineRevisionId: input.routine.latestRevisionId,
+        routineEnvFingerprint: createRoutineEnvFingerprint(input.routine.env),
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+        executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        title,
+        description,
+      });
 
+      if (input.occurrenceClaim) {
+        const [claimedOccurrence] = await txDb.select({ id: routineOccurrences.id }).from(routineOccurrences).where(and(
+          eq(routineOccurrences.id, input.occurrenceClaim.id),
+          eq(routineOccurrences.disposition, "obligation"),
+          eq(routineOccurrences.executionState, "dispatching"),
+          eq(routineOccurrences.leaseOwner, input.occurrenceClaim.leaseOwner),
+          eq(routineOccurrences.dispatchAttempts, input.occurrenceClaim.dispatchAttempts),
+        )).for("update");
+        if (!claimedOccurrence) throw conflict("Routine occurrence dispatch lease is no longer authoritative");
+      }
       if (input.trigger && (input.source === "webhook" || input.source === "schedule")) {
-        const currentTrigger = await txDb.select().from(routineTriggers).where(eq(routineTriggers.id, input.trigger.id)).then((rows) => rows[0]);
-        const currentRoutine = await txDb.select({ status: routines.status }).from(routines).where(eq(routines.id, input.routine.id)).then((rows) => rows[0]);
-        if (!currentTrigger || currentTrigger.archived || !currentTrigger.enabled || currentTrigger.setupPending || currentRoutine?.status !== "active") {
+        const currentTrigger = await txDb.select().from(routineTriggers).where(and(
+          eq(routineTriggers.id, input.trigger.id), eq(routineTriggers.companyId, input.routine.companyId),
+        )).then((rows) => rows[0] ?? null);
+        const currentRoutine = await txDb.select().from(routines).where(and(
+          eq(routines.id, input.routine.id), eq(routines.companyId, input.routine.companyId),
+        )).then((rows) => rows[0] ?? null);
+        if (!currentTrigger || currentTrigger.kind !== input.trigger.kind || currentTrigger.archived || !currentTrigger.enabled || currentTrigger.setupPending || currentRoutine?.status !== "active") {
           throw conflict("Routine trigger is not active");
         }
+        if (input.source === "schedule") {
+          const suppression = await scheduledSuppression(currentRoutine!, currentTrigger, new Date(), txDb);
+          if (suppression) throw conflict(`Current native schedule authority is suppressed: ${suppression}`);
+        }
+      }
+      let caseTask: typeof issues.$inferSelect | undefined;
+      if (input.routine.caseId) {
+        const identity = { id: input.routine.caseId, companyId: input.routine.companyId };
+        const [observedCase] = await txDb.select().from(cases).where(and(eq(cases.id, identity.id), eq(cases.companyId, identity.companyId)));
+        if (!observedCase) throw notFound("Bound Case not found");
+        // Preserve the native task-before-Case lock order. The privacy authority
+        // is already held, and no task/run/document mutation precedes these gates.
+        if (observedCase.workIssueId) [caseTask] = await txDb.select().from(issues).where(and(eq(issues.id, observedCase.workIssueId), eq(issues.companyId, identity.companyId))).for("update");
+        const [boundCase] = await txDb.select().from(cases).where(and(eq(cases.id, identity.id), eq(cases.companyId, identity.companyId))).for("share");
+        if (!boundCase || boundCase.workIssueId !== observedCase.workIssueId) throw conflict("Bound Case routing changed before admission");
+        if (!(await canActorReadCase(txDb, dispatchActor, identity))) throw notFound("Bound Case is unavailable");
+        await assertActorCanWriteCase(txDb, dispatchActor, boundCase);
+        await assertCaseTrustedForExecution(txDb, identity);
       }
 
       if (input.idempotencyKey) {
@@ -1831,6 +2298,7 @@ export function routineService(
             throw conflict("Webhook replay detected");
           }
           reusedExistingRun = true;
+          await linkOccurrence(existing.id, existing.linkedIssueId);
           return existing;
         }
       }
@@ -1874,26 +2342,29 @@ export function routineService(
         })
         .returning();
 
-      const nextRunAt = input.nextRunAtOverride !== undefined
-        ? input.nextRunAtOverride
-        : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
-          ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
-          : undefined;
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-          kind: issueOriginKind,
-          id: issueOriginId,
-        });
-        if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
+        if (caseTask && !["todo", "in_progress"].includes(caseTask.status)) throw conflict("The native case primary task is not runnable; an occurrence cannot silently reopen it");
+        if (caseTask && input.routine.milestoneId) {
+          const readiness = await governanceMilestoneService(txDb).getMilestoneReadiness(input.routine.companyId, input.routine.milestoneId, { agentId: assigneeAgentId, taskId: caseTask.id });
+          if (!readiness.executionAllowed || readiness.revisionId !== input.routine.milestoneRevisionId) throw forbidden("Pinned milestone does not currently authorize this native producer");
+        }
+        const activeIssue = caseTask ?? await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, { kind: issueOriginKind, id: issueOriginId });
+        if (activeIssue && (caseTask || input.routine.concurrencyPolicy !== "always_enqueue")) {
+          await assertRoutineTaskAuthority(input.routine, activeIssue, txDb, dispatchActor);
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: activeIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
+          if (caseTask && status === "coalesced" && input.occurrenceClaim) {
+            await documentService(txDb).upsertIssueDocument({
+              issueId: caseTask.id,
+              key: `routine-occurrence-${input.occurrenceClaim.id}`,
+              title: `Scheduled routine: ${title}`,
+              format: "markdown",
+              body: `${title}\n\n${description}`,
+              changeSummary: `Pinned routine revision ${input.routine.latestRevisionId}`,
+              createdByUserId: responsibleUserId,
+              sourceTrust: caseTask.sourceTrust,
+              lockedDocumentStrategy: "conflict",
             });
           }
           const updated = await finalizeRun(createdRun.id, {
@@ -1908,8 +2379,8 @@ export function routineService(
             triggeredAt,
             status,
             issueId: activeIssue.id,
-            nextRunAt,
           }, txDb);
+          await linkOccurrence((updated ?? createdRun).id, activeIssue.id);
           return updated ?? createdRun;
         }
 
@@ -1928,6 +2399,8 @@ export function routineService(
             createdByUserId: manualRunnerUserId,
             responsibleUserId,
             trustExplicitResponsibleUserId: true,
+            actorRunId: input.actor?.runId ?? null,
+            workspaceSelectionActor: dispatchActor,
             originKind: issueOriginKind,
             originId: issueOriginId,
             originRunId: createdRun.id,
@@ -1936,7 +2409,25 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
-          });
+          }, txDb);
+          await assertRoutineTaskAuthority(input.routine, createdIssue, txDb, dispatchActor);
+          if (input.routine.milestoneId) {
+            const readiness = await governanceMilestoneService(txDb).getMilestoneReadiness(input.routine.companyId, input.routine.milestoneId, { agentId: assigneeAgentId, taskId: createdIssue.id });
+            if (!readiness.executionAllowed || readiness.revisionId !== input.routine.milestoneRevisionId) throw forbidden("The pinned milestone does not currently authorize this producer execution");
+          }
+          if (approvedWorkflowBody) {
+            await documentService(txDb).upsertIssueDocument({
+              issueId: createdIssue.id,
+              key: "workflow",
+              title: "Board-approved routine procedure",
+              format: "markdown",
+              body: approvedWorkflowBody,
+              changeSummary: `Pinned from approved document revision ${approvedWorkflowRevisionId}`,
+              createdByUserId: responsibleUserId,
+              sourceTrust: createdIssue.sourceTrust,
+              lockedDocumentStrategy: "conflict",
+            });
+          }
         } catch (error) {
           const isOpenExecutionConflict =
             !!error &&
@@ -1955,14 +2446,6 @@ export function routineService(
           });
           if (!existingIssue) throw error;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: existingIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
-          }
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: existingIssue.id,
@@ -1975,21 +2458,11 @@ export function routineService(
             triggeredAt,
             status,
             issueId: existingIssue.id,
-            nextRunAt,
           }, txDb);
+          await linkOccurrence((updated ?? createdRun).id, existingIssue.id);
           return updated ?? createdRun;
         }
 
-        // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
-        await queueIssueAssignmentWakeup({
-          heartbeat,
-          issue: createdIssue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "routine.dispatch",
-          requestedByActorType: input.source === "schedule" ? "system" : undefined,
-          rethrowOnError: true,
-        });
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,
@@ -2000,8 +2473,8 @@ export function routineService(
           triggeredAt,
           status: "issue_created",
           issueId: createdIssue.id,
-          nextRunAt,
         }, txDb);
+        await linkOccurrence((updated ?? createdRun).id, createdIssue.id);
         return updated ?? createdRun;
       } catch (error) {
         if (createdIssue) {
@@ -2018,11 +2491,63 @@ export function routineService(
           triggerId: input.trigger?.id ?? null,
           triggeredAt,
           status: "failed",
-          nextRunAt,
         }, txDb);
+        await linkOccurrence((failed ?? createdRun).id, null);
         return failed ?? createdRun;
       }
     });
+    if ((run.status === "issue_created" || (run.status === "coalesced" && input.routine.caseId)) && run.linkedIssueId) {
+      const [savedTask] = await db.select().from(issues).where(and(
+        eq(issues.id, run.linkedIssueId), eq(issues.companyId, input.routine.companyId),
+      )).limit(1);
+      if (!savedTask) throw notFound("Committed routine task receipt no longer has its native task");
+      dispatchActor = await currentDispatchActor(input.routine, dispatchActor, db, cloudAuthority);
+      await assertRoutineTaskAuthority(input.routine, savedTask, db, dispatchActor);
+      if (input.persistedScheduleOccurrence && input.occurrenceClaim && input.routine.caseId) {
+        await attachRoutineOccurrenceToCase({
+          companyId: input.routine.companyId,
+          routine: input.routine,
+          occurrence: input.occurrenceClaim,
+          task: savedTask,
+          authorizationActor: dispatchActor,
+          instructions: run.status === "coalesced"
+            ? `Execute the pinned scheduled routine revision ${input.routine.latestRevisionId} in native task document routine-occurrence-${input.occurrenceClaim.id}. Its full effective procedure and approved workflow revision are immutable for this occurrence.`
+            : "Execute the scheduled routine using this task's description and pinned approved workflow document.",
+        });
+      }
+      const [task] = await db.select().from(issues).where(and(
+        eq(issues.id, savedTask.id), eq(issues.companyId, input.routine.companyId),
+      )).limit(1);
+      if (!task) throw notFound("Committed routine task receipt no longer has its native task");
+      if (!input.routine.caseId && !["done", "cancelled", "blocked"].includes(task.status) && !(await findWakeReceipt(input.routine.companyId, `routine-run:${run.id}:assignment-wake`))) {
+        const wakeIdempotencyKey = `routine-run:${run.id}:assignment-wake`;
+        if (input.occurrenceClaim) {
+          const [fenced] = await db.update(routineOccurrences).set({ wakeRequestedAt: new Date(), updatedAt: new Date() }).where(and(
+            eq(routineOccurrences.id, input.occurrenceClaim.id), eq(routineOccurrences.disposition, "obligation"), eq(routineOccurrences.executionState, "dispatching"),
+            eq(routineOccurrences.leaseOwner, input.occurrenceClaim.leaseOwner), isNull(routineOccurrences.wakeRequestedAt),
+            eq(routineOccurrences.dispatchAttempts, input.occurrenceClaim.dispatchAttempts),
+          )).returning({ id: routineOccurrences.id });
+          if (!fenced) throw conflict("Native wake attempt has already started or its occurrence fence changed; receipt reconciliation is required");
+        }
+        try {
+          await queueIssueAssignmentWakeup({
+            heartbeat,
+            issue: task,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "routine.dispatch",
+            requestedByActorType: input.source === "schedule" ? "system" : undefined,
+            idempotencyKey: wakeIdempotencyKey,
+            rethrowOnError: true,
+          });
+        } catch (error) {
+          if (!(await findWakeReceipt(input.routine.companyId, wakeIdempotencyKey))) throw error;
+        }
+        if (!(await findWakeReceipt(input.routine.companyId, wakeIdempotencyKey))) {
+          throw new Error("Native routine wake returned without a durable wake receipt");
+        }
+      }
+    }
 
     if (!reusedExistingRun && (input.source === "schedule" || input.source === "webhook")) {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
@@ -2055,6 +2580,179 @@ export function routineService(
     }
 
     return run;
+  }
+
+  let statusReconcileCursor: string | null = null;
+
+  async function syncRunStatusForIssue(issueId: string, executor: Db = db) {
+    const issue = await executor
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        status: issues.status,
+        originKind: issues.originKind,
+        originRunId: issues.originRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return null;
+    await reconcileOccurrenceReceipts(issueId, executor);
+    if (issue.originKind !== "routine_execution" || !issue.originRunId) return null;
+    const run = await executor
+      .select({
+        id: routineRuns.id,
+        status: routineRuns.status,
+        failureReason: routineRuns.failureReason,
+        triggerPayload: routineRuns.triggerPayload,
+      })
+      .from(routineRuns)
+      .innerJoin(routines, and(eq(routines.id, routineRuns.routineId), eq(routines.companyId, issue.companyId)))
+      .where(and(eq(routineRuns.id, issue.originRunId), eq(routineRuns.companyId, issue.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!run) return null;
+    if (issue.status === "done") {
+      const transientFailureStatus = executionIssueTransientFailureStatusFromPayload(run.triggerPayload)
+        ?? legacyExecutionIssueTransientFailureStatus(run.failureReason);
+      const transientFailureClearedAt = executionIssueTransientFailureClearedAtFromPayload(run.triggerPayload);
+      const finalized = await finalizeRun(issue.originRunId, {
+        status: "completed",
+        failureReason: null,
+        completedAt: new Date(),
+        ...(transientFailureStatus
+          ? {
+            triggerPayload: {
+              ...(run.triggerPayload ?? {}),
+              transientFailure: {
+                code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
+                status: transientFailureStatus,
+                reason: executionIssueTransientFailureReason(transientFailureStatus),
+                clearedAt: transientFailureClearedAt ?? new Date().toISOString(),
+              },
+            },
+          }
+          : {}),
+      }, executor);
+      return finalized;
+    }
+    if (issue.status === "blocked" || issue.status === "cancelled") {
+      const failureReason = executionIssueTransientFailureReason(issue.status);
+      const finalized = await finalizeRun(issue.originRunId, {
+        status: "failed",
+        failureReason,
+        completedAt: new Date(),
+        triggerPayload: {
+          ...(run.triggerPayload ?? {}),
+          transientFailure: {
+            code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
+            status: issue.status,
+            reason: failureReason,
+            recordedAt: new Date().toISOString(),
+          },
+        },
+      }, executor);
+      return finalized;
+    }
+    const transientFailureStatus = executionIssueTransientFailureStatusFromPayload(run.triggerPayload)
+      ?? legacyExecutionIssueTransientFailureStatus(run.failureReason);
+    if (run.status === "failed" && transientFailureStatus) {
+      return finalizeRun(issue.originRunId, {
+        status: "issue_created",
+        failureReason: null,
+        completedAt: null,
+        triggerPayload: {
+          ...(run.triggerPayload ?? {}),
+          transientFailure: {
+            code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
+            status: transientFailureStatus,
+            reason: executionIssueTransientFailureReason(transientFailureStatus),
+            clearedAt: new Date().toISOString(),
+          },
+        },
+      }, executor);
+    }
+    return null;
+  }
+
+
+  async function scheduledSuppression(routine: RoutineRow, trigger: RoutineTriggerRow | null, now: Date, executor: Db = db): Promise<string | null> {
+    if (routine.status !== "active" || !trigger || trigger.archived || !trigger.enabled || trigger.setupPending) return "routine_or_trigger_inactive";
+    if (routine.projectId) {
+      const [project] = await executor.select({ pausedAt: projects.pausedAt }).from(projects).where(and(eq(projects.id, routine.projectId), eq(projects.companyId, routine.companyId))).for("share");
+      if (!project || project.pausedAt) return "paused";
+    }
+    if (!(await getAutomaticRoutineDispatchEligibility(routine)).eligible) return "worktree_execution_cutoff";
+    if (!(await routineOwnerAuthorizationActor(routine.companyId, routine.responsibleUserId, executor))) return "accountable_owner_inactive";
+    if (routine.activityGatePolicy === "require_external_activity" && !(await evaluateActivityGate(routine, now, executor)).fire) return "no_external_activity";
+    return null;
+  }
+
+  let occurrenceReconcileCursor: string | null = null;
+  async function reconcileOccurrenceReceipts(taskId?: string, executor: Db = db) {
+    const candidates = await executor.select({ occurrence: routineOccurrences, run: routineRuns }).from(routineOccurrences)
+      .innerJoin(routineRuns, and(eq(routineRuns.companyId, routineOccurrences.companyId), eq(routineRuns.routineId, routineOccurrences.routineId),
+        or(eq(routineRuns.id, routineOccurrences.runId), and(isNull(routineOccurrences.runId), eq(routineRuns.triggerId, routineOccurrences.triggerId),
+          sql`${routineRuns.idempotencyKey} = 'routine-occurrence:' || ${routineOccurrences.id}::text`))))
+      .where(and(inArray(routineOccurrences.disposition, ["obligation", "satisfied"]),
+        inArray(routineOccurrences.executionState, ["waiting", "satisfied", "failed", "cancelled", "unknown"]),
+        taskId ? or(eq(routineOccurrences.taskId, taskId), eq(routineRuns.linkedIssueId, taskId)) : occurrenceReconcileCursor ? gt(routineOccurrences.id, occurrenceReconcileCursor) : undefined))
+      .orderBy(asc(routineOccurrences.id)).limit(taskId ? 200 : 50);
+    if (!taskId) occurrenceReconcileCursor = candidates.length === 50 ? candidates.at(-1)!.occurrence.id : null;
+    for (const { occurrence, run } of candidates) {
+      const result = await occurrenceAcknowledgement(run, occurrence, executor);
+      // A missing wake receipt cannot prove no effect. Still persist this check so
+      // the native deadline query schedules a future poll rather than a hot loop.
+      const patch = occurrence.executionState === "unknown" && result.executionState === "pending" ? {} : result;
+      await executor.update(routineOccurrences).set({ ...patch, updatedAt: new Date() }).where(and(
+        eq(routineOccurrences.id, occurrence.id), eq(routineOccurrences.disposition, occurrence.disposition),
+        eq(routineOccurrences.executionState, occurrence.executionState), eq(routineOccurrences.dispatchAttempts, occurrence.dispatchAttempts),
+        eq(routineOccurrences.updatedAt, occurrence.updatedAt), isNull(routineOccurrences.leaseOwner),
+      ));
+    }
+  }
+
+  async function canReadRoutineDefinition(row: Pick<RoutineRow, "companyId" | "projectId" | "parentIssueId" | "caseId" | "approvedWorkflowDocumentId">, actor: AuthorizationActor) {
+    const access = authorizationService(db);
+    if (!(await access.decide({ actor, action: "company_scope:read", resource: { type: "company", companyId: row.companyId } })).allowed) return false;
+    if (row.projectId && !(await access.decide({ actor, action: "project:read", resource: { type: "project", companyId: row.companyId, projectId: row.projectId } })).allowed) return false;
+    if (row.parentIssueId && !(await access.decide({ actor, action: "issue:read", resource: { type: "issue", companyId: row.companyId, issueId: row.parentIssueId } })).allowed) return false;
+    if (row.caseId && !(await canActorReadCase(db, actor, { id: row.caseId, companyId: row.companyId }))) return false;
+    return !row.approvedWorkflowDocumentId || canActorReadRoutineWorkflow(db, actor, row.companyId, row.approvedWorkflowDocumentId);
+  }
+
+  async function listRuns(routineId: string, actor: AuthorizationActor, limit = 50): Promise<RoutineRunSummary[]> {
+    const routine = await getRoutineById(routineId);
+    if (!routine || !(await canReadRoutineDefinition(routine, actor))) throw notFound("Routine not found");
+    const cappedLimit = Math.max(1, Math.min(limit, 200));
+    const readableIssue = await issueReadSqlCondition(db, actor);
+    const access = authorizationService(db);
+    const visible: RoutineRunSummary[] = [];
+    let cursor: { createdAt: Date; id: string } | undefined;
+    while (visible.length < cappedLimit) {
+      const rows = await db.select({ run: routineRuns, issue: issues, trigger: routineTriggers, snapshot: routineRevisions.snapshot })
+        .from(routineRuns)
+        .leftJoin(issues, and(eq(issues.id, routineRuns.linkedIssueId), eq(issues.companyId, routineRuns.companyId)))
+        .leftJoin(routineTriggers, eq(routineTriggers.id, routineRuns.triggerId))
+        .leftJoin(routineRevisions, and(eq(routineRevisions.id, routineRuns.routineRevisionId), eq(routineRevisions.companyId, routineRuns.companyId)))
+        .where(and(eq(routineRuns.routineId, routineId), eq(routineRuns.companyId, routine.companyId),
+          or(isNull(routineRuns.linkedIssueId), readableIssue),
+          cursor ? or(lt(routineRuns.createdAt, cursor.createdAt), and(eq(routineRuns.createdAt, cursor.createdAt), lt(routineRuns.id, cursor.id))) : undefined,
+        )).orderBy(desc(routineRuns.createdAt), desc(routineRuns.id)).limit(cappedLimit);
+      if (!rows.length) break;
+      for (const { run, issue, trigger, snapshot } of rows) {
+        if (run.linkedIssueId && (!issue || !(await access.decide({ actor, action: "issue:read", resource: { type: "issue", companyId: routine.companyId, issueId: run.linkedIssueId } })).allowed)) continue;
+        if (snapshot && !(await canReadRoutineDefinition({ ...routine, ...routineRevisionSnapshotSchema.parse(snapshot).routine }, actor))) continue;
+        visible.push({ ...run, source: run.source as RoutineRunSummary["source"], status: run.status as RoutineRunSummary["status"],
+          triggerPayload: run.triggerPayload as Record<string, unknown> | null,
+          linkedIssue: issue ? { id: issue.id, identifier: issue.identifier, title: issue.title, status: issue.status, priority: issue.priority, updatedAt: issue.updatedAt } : null,
+          trigger: trigger ? { id: trigger.id, kind: trigger.kind as NonNullable<RoutineRunSummary["trigger"]>["kind"], label: trigger.label } : null,
+        });
+        if (visible.length === cappedLimit) break;
+      }
+      cursor = rows.at(-1)!.run;
+      if (rows.length < cappedLimit) break;
+    }
+    return visible;
   }
 
   return {
@@ -2100,9 +2798,10 @@ export function routineService(
       }));
     },
 
-    getDetail: async (id: string): Promise<RoutineDetail | null> => {
+    getDetail: async (id: string, actor: AuthorizationActor): Promise<RoutineDetail | null> => {
       const row = await getRoutineById(id);
       if (!row) return null;
+      if (!(await canReadRoutineDefinition(row, actor))) throw notFound("Routine not found");
       const [project, assignee, parentIssue, descriptionDocument, triggers, recentRuns, activeIssue, managedByRoutine] = await Promise.all([
         row.projectId
           ? db.select().from(projects).where(eq(projects.id, row.projectId)).then((rows) => rows[0] ?? null)
@@ -2113,78 +2812,8 @@ export function routineService(
         row.parentIssueId ? issueSvc.getById(row.parentIssueId) : null,
         getRoutineDescriptionDocument(row.id),
         db.select().from(routineTriggers).where(and(eq(routineTriggers.routineId, row.id), eq(routineTriggers.archived, false))).orderBy(asc(routineTriggers.createdAt)),
-        db
-          .select({
-            id: routineRuns.id,
-            companyId: routineRuns.companyId,
-            routineId: routineRuns.routineId,
-            triggerId: routineRuns.triggerId,
-            source: routineRuns.source,
-            status: routineRuns.status,
-            triggeredAt: routineRuns.triggeredAt,
-            idempotencyKey: routineRuns.idempotencyKey,
-            triggerPayload: routineRuns.triggerPayload,
-            dispatchFingerprint: routineRuns.dispatchFingerprint,
-            routineRevisionId: routineRuns.routineRevisionId,
-            linkedIssueId: routineRuns.linkedIssueId,
-            coalescedIntoRunId: routineRuns.coalescedIntoRunId,
-            failureReason: routineRuns.failureReason,
-            completedAt: routineRuns.completedAt,
-            createdAt: routineRuns.createdAt,
-            updatedAt: routineRuns.updatedAt,
-            triggerKind: routineTriggers.kind,
-            triggerLabel: routineTriggers.label,
-            issueIdentifier: issues.identifier,
-            issueTitle: issues.title,
-            issueStatus: issues.status,
-            issuePriority: issues.priority,
-            issueUpdatedAt: issues.updatedAt,
-          })
-          .from(routineRuns)
-          .leftJoin(routineTriggers, eq(routineRuns.triggerId, routineTriggers.id))
-          .leftJoin(issues, eq(routineRuns.linkedIssueId, issues.id))
-          .where(eq(routineRuns.routineId, row.id))
-          .orderBy(desc(routineRuns.createdAt))
-          .limit(25)
-          .then((runs) =>
-            runs.map((run) => ({
-              id: run.id,
-              companyId: run.companyId,
-              routineId: run.routineId,
-              triggerId: run.triggerId,
-              source: run.source as RoutineRunSummary["source"],
-              status: run.status as RoutineRunSummary["status"],
-              triggeredAt: run.triggeredAt,
-              idempotencyKey: run.idempotencyKey,
-              triggerPayload: run.triggerPayload as Record<string, unknown> | null,
-              dispatchFingerprint: run.dispatchFingerprint,
-              routineRevisionId: run.routineRevisionId,
-              linkedIssueId: run.linkedIssueId,
-              coalescedIntoRunId: run.coalescedIntoRunId,
-              failureReason: run.failureReason,
-              completedAt: run.completedAt,
-              createdAt: run.createdAt,
-              updatedAt: run.updatedAt,
-              linkedIssue: run.linkedIssueId
-                ? {
-                  id: run.linkedIssueId,
-                  identifier: run.issueIdentifier,
-                  title: run.issueTitle ?? "Routine execution",
-                  status: run.issueStatus ?? "todo",
-                  priority: run.issuePriority ?? "medium",
-                  updatedAt: run.issueUpdatedAt ?? run.updatedAt,
-                }
-                : null,
-              trigger: run.triggerId
-                ? {
-                  id: run.triggerId,
-                  kind: run.triggerKind as NonNullable<RoutineRunSummary["trigger"]>["kind"],
-                  label: run.triggerLabel,
-                }
-                : null,
-            })),
-          ),
-        findLiveExecutionIssue(row),
+        listRuns(row.id, actor, 25),
+        findLiveExecutionIssue(row).then(async issue => issue && (await authorizationService(db).decide({ actor, action: "issue:read", resource: { type: "issue", companyId: row.companyId, issueId: issue.id } })).allowed ? issue : null),
         listManagedRoutineMetadata([row.id]),
       ]);
 
@@ -2225,11 +2854,18 @@ export function routineService(
       assertRoutineVariableDefinitions(variables);
       const status = normalizeDraftRoutineStatus(input.status, input.assigneeAgentId);
       const responsibleUserId = await resolveRoutineResponsibleUserId(db, companyId, actor.userId, input.parentIssueId ?? null);
+      const bindings = await validateRoutineBindings(companyId, {
+        approvedWorkflowDocumentId: input.approvedWorkflowDocumentId ?? null,
+        approvedWorkflowRevisionId: input.approvedWorkflowRevisionId ?? null,
+        milestoneId: input.milestoneId ?? null,
+        caseId: input.caseId ?? null,
+      }, actor, Boolean(input.approvedWorkflowDocumentId || input.approvedWorkflowRevisionId || input.milestoneId || input.caseId));
       if (!responsibleUserId) {
         throw unprocessable("Routine requires a responsible user");
       }
       const createdRoutine = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await notifyDeliveryWork(txDb, DELIVERY_QUEUES.routineSchedules);
         const [created] = await txDb
           .insert(routines)
           .values({
@@ -2249,6 +2885,11 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            approvedWorkflowDocumentId: bindings.approvedWorkflowDocumentId,
+            approvedWorkflowRevisionId: bindings.approvedWorkflowRevisionId,
+            milestoneId: bindings.milestoneId,
+            milestoneRevisionId: bindings.milestoneRevisionId,
+            caseId: bindings.caseId,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2329,11 +2970,20 @@ export function routineService(
         actor.userId,
         patch.parentIssueId === undefined ? existing.parentIssueId : patch.parentIssueId,
       );
+      const bindingChanged = patch.approvedWorkflowDocumentId !== undefined || patch.approvedWorkflowRevisionId !== undefined ||
+        patch.milestoneId !== undefined || patch.caseId !== undefined;
+      const bindings = await validateRoutineBindings(existing.companyId, {
+        approvedWorkflowDocumentId: patch.approvedWorkflowDocumentId === undefined ? existing.approvedWorkflowDocumentId : patch.approvedWorkflowDocumentId,
+        approvedWorkflowRevisionId: patch.approvedWorkflowRevisionId === undefined ? existing.approvedWorkflowRevisionId : patch.approvedWorkflowRevisionId,
+        milestoneId: patch.milestoneId === undefined ? existing.milestoneId : patch.milestoneId,
+        caseId: patch.caseId === undefined ? existing.caseId : patch.caseId,
+      }, actor, bindingChanged, { milestoneId: existing.milestoneId, milestoneRevisionId: existing.milestoneRevisionId });
       if (!responsibleUserId) {
         throw unprocessable("Routine requires a responsible user");
       }
       const updatedRoutine = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await notifyDeliveryWork(txDb, DELIVERY_QUEUES.routineSchedules);
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${id} for update`);
         const locked = await txDb
           .select()
@@ -2368,6 +3018,11 @@ export function routineService(
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
+          approvedWorkflowDocumentId: bindings.approvedWorkflowDocumentId,
+          approvedWorkflowRevisionId: bindings.approvedWorkflowRevisionId,
+          milestoneId: bindings.milestoneId,
+          milestoneRevisionId: bindings.milestoneRevisionId,
+          caseId: bindings.caseId,
         };
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
@@ -2430,6 +3085,11 @@ export function routineService(
             activityGateScope: candidate.activityGateScope,
             variables: candidate.variables,
             env: candidate.env,
+            approvedWorkflowDocumentId: candidate.approvedWorkflowDocumentId,
+            approvedWorkflowRevisionId: candidate.approvedWorkflowRevisionId,
+            milestoneId: candidate.milestoneId,
+            milestoneRevisionId: candidate.milestoneRevisionId,
+            caseId: candidate.caseId,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -2488,6 +3148,7 @@ export function routineService(
 
       const { trigger, revision } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await notifyDeliveryWork(txDb, DELIVERY_QUEUES.routineSchedules);
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routine.id} for update`);
         const [createdTrigger] = await txDb
           .insert(routineTriggers)
@@ -2562,6 +3223,7 @@ export function routineService(
 
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await notifyDeliveryWork(txDb, DELIVERY_QUEUES.routineSchedules);
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} for update`);
         const [updated] = await txDb
           .update(routineTriggers)
@@ -2572,7 +3234,7 @@ export function routineService(
             ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
             cronExpression,
             timezone,
-            nextRunAt,
+            nextRunAt: sql`case when ${routineTriggers.catchUpCutoff} is not null then ${routineTriggers.nextRunAt} else ${nextRunAt?.toISOString() ?? null}::timestamptz end`,
             signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
             replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
             updatedByAgentId: actor.agentId ?? null,
@@ -2601,6 +3263,7 @@ export function routineService(
       if (!existing) return { deleted: false, revision: null };
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await notifyDeliveryWork(txDb, DELIVERY_QUEUES.routineSchedules);
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} for update`);
         await txDb.delete(routineTriggers).where(eq(routineTriggers.id, id));
         const routine = await txDb
@@ -2675,22 +3338,36 @@ export function routineService(
       };
     },
 
-    listRevisions: async (routineId: string): Promise<RoutineRevision[]> => {
+    listRevisions: async (routineId: string, actor: AuthorizationActor): Promise<RoutineRevision[]> => {
       const routine = await getRoutineById(routineId);
-      if (!routine) throw notFound("Routine not found");
-      const rows = await db
-        .select()
-        .from(routineRevisions)
-        .where(and(eq(routineRevisions.companyId, routine.companyId), eq(routineRevisions.routineId, routine.id)))
-        .orderBy(desc(routineRevisions.revisionNumber), desc(routineRevisions.createdAt))
-        .limit(MAX_ROUTINE_REVISIONS);
-      return rows.map(mapRoutineRevision);
+      if (!routine || !(await canReadRoutineDefinition(routine, actor))) throw notFound("Routine not found");
+      const visible: RoutineRevision[] = [];
+      const pageSize = 200;
+      let offset = 0;
+      while (visible.length < MAX_ROUTINE_REVISIONS) {
+        const rows = await db
+          .select()
+          .from(routineRevisions)
+          .where(and(eq(routineRevisions.companyId, routine.companyId), eq(routineRevisions.routineId, routine.id)))
+          .orderBy(desc(routineRevisions.revisionNumber), desc(routineRevisions.createdAt))
+          .limit(pageSize)
+          .offset(offset);
+        for (const row of rows) {
+          const snapshot = routineRevisionSnapshotSchema.parse(row.snapshot);
+          if (!(await canReadRoutineDefinition({ ...routine, ...snapshot.routine }, actor))) continue;
+          visible.push(mapRoutineRevision(row));
+          if (visible.length === MAX_ROUTINE_REVISIONS) break;
+        }
+        if (rows.length < pageSize) break;
+        offset += rows.length;
+      }
+      return visible;
     },
 
     restoreRevision: async (
       routineId: string,
       revisionId: string,
-      actor: Actor,
+      actor: Actor & { authorizationActor: AuthorizationActor },
     ): Promise<{
       routine: Routine;
       revision: RoutineRevision;
@@ -2700,6 +3377,7 @@ export function routineService(
     }> => {
       const existingRoutine = await getRoutineById(routineId);
       if (!existingRoutine) throw notFound("Routine not found");
+      if (!(await canReadRoutineDefinition(existingRoutine, actor.authorizationActor))) throw notFound("Routine not found");
       const targetRevision = await db
         .select()
         .from(routineRevisions)
@@ -2715,10 +3393,26 @@ export function routineService(
 
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
+      if (!(await canReadRoutineDefinition({ ...existingRoutine, ...routineSnapshot }, actor.authorizationActor))) throw notFound("Routine revision not found");
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      const bindingValues = {
+        approvedWorkflowDocumentId: routineSnapshot.approvedWorkflowDocumentId ?? null,
+        approvedWorkflowRevisionId: routineSnapshot.approvedWorkflowRevisionId ?? null,
+        milestoneId: routineSnapshot.milestoneId ?? null,
+        caseId: routineSnapshot.caseId ?? null,
+        milestoneRevisionId: routineSnapshot.milestoneRevisionId ?? null,
+      };
+      const bindings = await validateRoutineBindings(existingRoutine.companyId, bindingValues, actor,
+        bindingValues.approvedWorkflowDocumentId !== existingRoutine.approvedWorkflowDocumentId ||
+        bindingValues.approvedWorkflowRevisionId !== existingRoutine.approvedWorkflowRevisionId ||
+        bindingValues.milestoneId !== existingRoutine.milestoneId ||
+        bindingValues.caseId !== existingRoutine.caseId ||
+        bindingValues.milestoneRevisionId !== existingRoutine.milestoneRevisionId,
+        { milestoneId: existingRoutine.milestoneId, milestoneRevisionId: existingRoutine.milestoneRevisionId });
 
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
+        await notifyDeliveryWork(txDb, DELIVERY_QUEUES.routineSchedules);
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existingRoutine.id} for update`);
         const locked = await txDb
           .select()
@@ -2772,6 +3466,11 @@ export function routineService(
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
+            approvedWorkflowDocumentId: bindings.approvedWorkflowDocumentId,
+            approvedWorkflowRevisionId: bindings.approvedWorkflowRevisionId,
+            milestoneId: bindings.milestoneId,
+            milestoneRevisionId: bindings.milestoneRevisionId,
+            caseId: bindings.caseId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,
@@ -2821,7 +3520,7 @@ export function routineService(
             secretId: triggerSnapshot.kind === "webhook" ? (current?.secretId ?? webhookSecret?.secretId ?? null) : null,
             signingMode: triggerSnapshot.kind === "webhook" ? triggerSnapshot.signingMode : null,
             replayWindowSec: triggerSnapshot.kind === "webhook" ? triggerSnapshot.replayWindowSec : null,
-            nextRunAt: restoredNextRunAt,
+            nextRunAt: current?.catchUpCutoff ? current.nextRunAt : restoredNextRunAt,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,
@@ -2884,32 +3583,6 @@ export function routineService(
         executionWorkspacePreference: input.executionWorkspacePreference ?? null,
         executionWorkspaceSettings:
           (input.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null,
-        actor,
-      });
-    },
-
-    runPipelineStageEntryRoutine: async (id: string, input: RunRoutine & { descriptionAppendix?: string | null }, actor?: Actor) => {
-      const routine = await getRoutineById(id);
-      if (!routine) throw notFound("Routine not found");
-      if (routine.status === "archived") throw conflict("Routine is archived");
-      await assertProject(routine.companyId, input.projectId ?? null);
-      const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
-      await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
-      return dispatchRoutineRun({
-        routine,
-        trigger: null,
-        source: "api",
-        payload: input.payload as Record<string, unknown> | null | undefined,
-        variables: input.variables as Record<string, unknown> | null | undefined,
-        projectId: input.projectId ?? null,
-        projectWorkspaceId: input.projectWorkspaceId ?? null,
-        assigneeAgentId: input.assigneeAgentId ?? null,
-        idempotencyKey: input.idempotencyKey,
-        executionWorkspaceId: input.executionWorkspaceId ?? null,
-        executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-        executionWorkspaceSettings:
-          (input.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null,
-        descriptionAppendix: input.descriptionAppendix ?? null,
         actor,
       });
     },
@@ -3108,283 +3781,195 @@ export function routineService(
       });
     },
 
-    listRuns: async (routineId: string, limit = 50): Promise<RoutineRunSummary[]> => {
-      const cappedLimit = Math.max(1, Math.min(limit, 200));
-      const rows = await db
-        .select({
-          id: routineRuns.id,
-          companyId: routineRuns.companyId,
-          routineId: routineRuns.routineId,
-          triggerId: routineRuns.triggerId,
-          source: routineRuns.source,
-          status: routineRuns.status,
-          triggeredAt: routineRuns.triggeredAt,
-          idempotencyKey: routineRuns.idempotencyKey,
-          triggerPayload: routineRuns.triggerPayload,
-          dispatchFingerprint: routineRuns.dispatchFingerprint,
-          routineRevisionId: routineRuns.routineRevisionId,
-          linkedIssueId: routineRuns.linkedIssueId,
-          coalescedIntoRunId: routineRuns.coalescedIntoRunId,
-          failureReason: routineRuns.failureReason,
-          completedAt: routineRuns.completedAt,
-          createdAt: routineRuns.createdAt,
-          updatedAt: routineRuns.updatedAt,
-          triggerKind: routineTriggers.kind,
-          triggerLabel: routineTriggers.label,
-          issueIdentifier: issues.identifier,
-          issueTitle: issues.title,
-          issueStatus: issues.status,
-          issuePriority: issues.priority,
-          issueUpdatedAt: issues.updatedAt,
-        })
-        .from(routineRuns)
-        .leftJoin(routineTriggers, eq(routineRuns.triggerId, routineTriggers.id))
-        .leftJoin(issues, eq(routineRuns.linkedIssueId, issues.id))
-        .where(eq(routineRuns.routineId, routineId))
-        .orderBy(desc(routineRuns.createdAt))
-        .limit(cappedLimit);
-
-      return rows.map((row) => ({
-        id: row.id,
-        companyId: row.companyId,
-        routineId: row.routineId,
-        triggerId: row.triggerId,
-        source: row.source as RoutineRunSummary["source"],
-        status: row.status as RoutineRunSummary["status"],
-        triggeredAt: row.triggeredAt,
-        idempotencyKey: row.idempotencyKey,
-        triggerPayload: row.triggerPayload as Record<string, unknown> | null,
-        dispatchFingerprint: row.dispatchFingerprint,
-        routineRevisionId: row.routineRevisionId,
-        linkedIssueId: row.linkedIssueId,
-        coalescedIntoRunId: row.coalescedIntoRunId,
-        failureReason: row.failureReason,
-        completedAt: row.completedAt,
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt,
-        linkedIssue: row.linkedIssueId
-          ? {
-            id: row.linkedIssueId,
-            identifier: row.issueIdentifier,
-            title: row.issueTitle ?? "Routine execution",
-            status: row.issueStatus ?? "todo",
-            priority: row.issuePriority ?? "medium",
-            updatedAt: row.issueUpdatedAt ?? row.updatedAt,
-          }
-          : null,
-        trigger: row.triggerId
-          ? {
-            id: row.triggerId,
-            kind: row.triggerKind as NonNullable<RoutineRunSummary["trigger"]>["kind"],
-            label: row.triggerLabel,
-          }
-          : null,
-      }));
-    },
+    listRuns,
 
     tickScheduledTriggers: async (now: Date = new Date()) => {
-      const worktreeActivation = isTruthyRuntimeEnvValue(runtimeEnv.PAPERCLIP_IN_WORKTREE)
-        ? await resolveWorktreeRunExecutionActivationState({
-          getExperimental: instanceSettings.getExperimental,
-          runtimeEnv,
-        })
-        : undefined;
-      const due = await db
-        .select({
-          trigger: routineTriggers,
-          routine: routines,
-          projectPausedAt: projects.pausedAt,
-        })
-        .from(routineTriggers)
-        .innerJoin(routines, eq(routineTriggers.routineId, routines.id))
-        .leftJoin(projects, eq(routines.projectId, projects.id))
-        .where(
-          and(
-            eq(routineTriggers.kind, "schedule"),
-            eq(routineTriggers.enabled, true),
-            eq(routineTriggers.archived, false),
-            eq(routines.status, "active"),
-            isNotNull(routineTriggers.nextRunAt),
-            lte(routineTriggers.nextRunAt, now),
-          ),
-        )
-        .orderBy(asc(routineTriggers.nextRunAt), asc(routineTriggers.createdAt));
-
-      let triggered = 0;
-      for (const row of due) {
-        if (!row.trigger.nextRunAt || !row.trigger.cronExpression || !row.trigger.timezone) continue;
-
-        // Suppress scheduled firings while the routine's project is paused. The tick is still
-        // claimed and advanced to the next single cron tick (no backfill), so resume continues
-        // at the next cron boundary instead of replaying missed firings. Routines with no
-        // project are never suppressed here.
-        const projectPaused = !!(row.routine.projectId && row.projectPausedAt);
-        const automaticEligibility = await getAutomaticRoutineDispatchEligibility(row.routine, worktreeActivation);
-        const worktreeSuppressed = !automaticEligibility.eligible;
-
-        let runCount = 1;
-        let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
-
-        if (!projectPaused && !worktreeSuppressed && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
-          if (isSubHourlyCronExpression(row.trigger.cronExpression, row.trigger.timezone, now)) {
-            claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
-          } else {
-            let cursor: Date | null = row.trigger.nextRunAt;
-            runCount = 0;
-            while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
-              runCount += 1;
-              claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
-              cursor = claimedNextRunAt;
-            }
+      const due = await db.select({ id: routineTriggers.id, routineId: routineTriggers.routineId, nextRunAt: routineTriggers.nextRunAt })
+        .from(routineTriggers).innerJoin(routines, eq(routines.id, routineTriggers.routineId))
+        .where(and(eq(routineTriggers.kind, "schedule"), eq(routineTriggers.enabled, true), eq(routineTriggers.archived, false), eq(routines.status, "active"), lte(routineTriggers.nextRunAt, now)))
+        .orderBy(asc(routineTriggers.nextRunAt));
+      for (const candidate of due) {
+        await db.transaction(async transaction => {
+          const tx = transaction as unknown as Db;
+          const [routine] = await tx.select().from(routines).where(eq(routines.id, candidate.routineId)).for("update");
+          const [trigger] = await tx.select().from(routineTriggers).where(eq(routineTriggers.id, candidate.id)).for("update");
+          if (!routine || !trigger || !trigger.nextRunAt || trigger.nextRunAt.getTime() !== candidate.nextRunAt?.getTime() ||
+            routine.status !== "active" || !trigger.enabled || trigger.archived || trigger.setupPending || !trigger.cronExpression || !trigger.timezone) return;
+          const suppression = await scheduledSuppression(routine, trigger, now, tx);
+          const revisionId = trigger.catchUpRevisionId ?? routine.latestRevisionId;
+          const [revision] = revisionId ? await tx.select().from(routineRevisions).where(and(eq(routineRevisions.id, revisionId), eq(routineRevisions.routineId, routine.id), eq(routineRevisions.companyId, routine.companyId))) : [];
+          if (!revision) return;
+          const snapshot = routineRevisionSnapshotSchema.parse(revision.snapshot);
+          const definition = snapshot.routine;
+          const episodeTrigger = snapshot.triggers.find(item => item.id === trigger.id);
+          if (!episodeTrigger?.cronExpression || !episodeTrigger.timezone) throw unprocessable("Pinned catch-up schedule is unavailable");
+          const cutoff = trigger.catchUpCutoff ?? now;
+          const latestOnly = trigger.catchUpCutoff ? trigger.catchUpLatestOnly : routine.catchUpPolicy === "skip_missed" || isSubHourlyCronExpression(episodeTrigger.cronExpression, episodeTrigger.timezone, cutoff);
+          let executionsConsumed = trigger.catchUpExecutionsConsumed;
+          const [boundCase] = definition.caseId ? await tx.select({ handoffVersion: cases.handoffVersion }).from(cases).where(and(eq(cases.id, definition.caseId), eq(cases.companyId, routine.companyId))).for("share") : [];
+          const instants: Array<{ at: Date; next: Date | null }> = [];
+          let cursor: Date | null = trigger.nextRunAt;
+          while (cursor && cursor <= cutoff && instants.length < ROUTINE_OCCURRENCE_CATCHUP_BATCH_LIMIT) {
+            const next = nextCronTickInTimeZone(episodeTrigger.cronExpression, episodeTrigger.timezone, cursor);
+            instants.push({ at: cursor, next });
+            cursor = next;
           }
-        }
-
-        const claimed = await db
-          .update(routineTriggers)
-          .set({
-            nextRunAt: claimedNextRunAt,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(routineTriggers.id, row.trigger.id),
-              eq(routineTriggers.enabled, true),
-              eq(routineTriggers.archived, false),
-              eq(routineTriggers.nextRunAt, row.trigger.nextRunAt),
-            ),
-          )
-          .returning({ id: routineTriggers.id })
-          .then((rows) => rows[0] ?? null);
-        if (!claimed) continue;
-
-        if (projectPaused || worktreeSuppressed) {
-          await recordSuppressedAutomaticRun({
-            routine: row.routine,
-            trigger: row.trigger,
-            source: "schedule",
-            reason: worktreeSuppressed ? "worktree_execution_cutoff" : "paused",
-            nextRunAt: claimedNextRunAt,
-          });
-          continue;
-        }
-
-        const activityGate = row.routine.activityGatePolicy === "require_external_activity"
-          ? await evaluateActivityGate(row.routine, now)
-          : null;
-        if (activityGate && !activityGate.fire) {
-          await recordSuppressedAutomaticRun({
-            routine: row.routine,
-            trigger: row.trigger,
-            source: "schedule",
-            reason: "no_external_activity",
-            nextRunAt: claimedNextRunAt,
-            details: {
-              activityGate: {
-                verdict: "quiet",
-                windowStart: activityGate.windowStart?.toISOString() ?? null,
-                matchedActivityId: null,
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.routineSchedules);
+          const captured = await tx.insert(routineOccurrences).values(instants.map(({ at, next }) => {
+            const older = latestOnly && !!next && next <= cutoff;
+            const capped = !older && executionsConsumed >= MAX_CATCH_UP_RUNS;
+            const skipped = !suppression && (older || capped);
+            if (!suppression && !skipped) executionsConsumed++;
+            return {
+              companyId: routine.companyId, routineId: routine.id, triggerId: trigger.id, scheduledAt: at,
+              revisionId: revision.id, revisionNumber: revision.revisionNumber,
+              occurrenceKey: routineOccurrenceIdentity({ companyId: routine.companyId, routineId: routine.id, triggerId: trigger.id, scheduledAt: at }),
+              disposition: suppression ? "suppressed" : skipped ? "skipped" : "obligation",
+              executionState: suppression || skipped ? "skipped" : "pending",
+              decisionReason: suppression ?? (skipped ? capped ? "Native catch-up execution cap exhausted for this persisted episode" : "Native latest-only catch-up policy skipped this older scheduled instant" : null),
+              ownerUserId: routine.responsibleUserId,
+              approvedWorkflowDocumentId: definition.approvedWorkflowDocumentId ?? null,
+              approvedWorkflowRevisionId: definition.approvedWorkflowRevisionId ?? null,
+              milestoneId: definition.milestoneId ?? null, milestoneRevisionId: definition.milestoneRevisionId ?? null,
+              caseId: definition.caseId ?? null, caseHandoffVersion: boundCase?.handoffVersion ?? null,
+            };
+          })).onConflictDoNothing().returning();
+          for (const occurrence of captured.filter(item => item.disposition === "suppressed" || item.disposition === "skipped")) {
+            const [receipt] = await tx.insert(routineRuns).values({ companyId: routine.companyId, routineId: routine.id, triggerId: trigger.id,
+              routineRevisionId: revision.id, responsibleUserId: routine.responsibleUserId, source: "schedule", status: "skipped",
+              triggeredAt: now, completedAt: now, failureReason: occurrence.decisionReason, idempotencyKey: `routine-occurrence:${occurrence.id}`,
+              triggerPayload: { scheduledAt: occurrence.scheduledAt.toISOString(), suppressionReason: occurrence.decisionReason,
+                ...(suppression === "no_external_activity" ? { activityGate: {
+                  source: "native_activity_gate",
+                  verdict: "quiet", policy: definition.activityGatePolicy, scope: definition.activityGateScope,
+                  windowStart: routine.lastTriggeredAt?.toISOString() ?? null, matchedActivityId: null,
+                } } : {}),
               },
-            },
-          });
-          continue;
-        }
-
-        for (let i = 0; i < runCount; i += 1) {
-          await dispatchRoutineRun({
-            routine: row.routine,
-            trigger: row.trigger,
-            source: "schedule",
-            nextRunAtOverride: claimedNextRunAt,
-          });
-          triggered += 1;
-        }
+            }).returning();
+            await tx.update(routineOccurrences).set({ runId: receipt!.id }).where(eq(routineOccurrences.id, occurrence.id));
+          }
+          if (suppression) await updateRoutineTouchedState({ routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "skipped" }, tx);
+          const continuing = !!cursor && cursor <= cutoff;
+          // Definition edits take effect only after accounting for the frozen
+          // episode; neither an edit nor a new controller replenishes its cap.
+          const nextRunAt = continuing ? cursor : nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, cutoff);
+          await tx.update(routineTriggers).set({ nextRunAt, updatedAt: now,
+            catchUpCutoff: continuing ? cutoff : null,
+            catchUpRevisionId: continuing ? revision.id : null,
+            catchUpExecutionsConsumed: continuing ? executionsConsumed : 0,
+            catchUpLatestOnly: continuing && latestOnly,
+            ...(suppression ? { lastFiredAt: now, lastResult: `suppressed: ${suppression}` } : {}),
+          }).where(eq(routineTriggers.id, trigger.id));
+        });
       }
 
+      const candidates = await db.select().from(routineOccurrences).where(and(eq(routineOccurrences.disposition, "obligation"), or(
+        and(eq(routineOccurrences.executionState, "pending"), or(isNull(routineOccurrences.retryAt), lte(routineOccurrences.retryAt, now))),
+        and(eq(routineOccurrences.executionState, "dispatching"), lte(routineOccurrences.leaseExpiresAt, now)),
+      ))).orderBy(asc(routineOccurrences.scheduledAt)).limit(50);
+      let triggered = 0;
+      for (const observed of candidates) {
+        const attempt = crypto.randomUUID();
+        const [occurrence] = await db.update(routineOccurrences).set({ executionState: "dispatching", leaseOwner: attempt,
+          leaseExpiresAt: new Date(Date.now() + 60_000), dispatchAttempts: observed.dispatchAttempts + 1, updatedAt: new Date() })
+          .where(and(eq(routineOccurrences.id, observed.id), eq(routineOccurrences.disposition, "obligation"),
+            eq(routineOccurrences.executionState, observed.executionState), eq(routineOccurrences.dispatchAttempts, observed.dispatchAttempts),
+            observed.leaseOwner ? eq(routineOccurrences.leaseOwner, observed.leaseOwner) : isNull(routineOccurrences.leaseOwner),
+            observed.leaseExpiresAt ? eq(routineOccurrences.leaseExpiresAt, observed.leaseExpiresAt) : isNull(routineOccurrences.leaseExpiresAt),
+          )).returning();
+        if (!occurrence) continue;
+        try {
+          const [receipt] = await db.select().from(routineRuns).where(and(eq(routineRuns.companyId, occurrence.companyId), eq(routineRuns.routineId, occurrence.routineId), eq(routineRuns.triggerId, occurrence.triggerId), eq(routineRuns.idempotencyKey, `routine-occurrence:${occurrence.id}`))).limit(1);
+          if (observed.executionState === "dispatching" && !receipt) {
+            await acknowledgeRoutineOccurrence(occurrence, attempt, null);
+            continue;
+          }
+          if (observed.wakeRequestedAt && !observed.caseId && receipt && !(await findWakeReceipt(occurrence.companyId, `routine-run:${receipt.id}:assignment-wake`))) {
+            await acknowledgeRoutineOccurrence(occurrence, attempt, null);
+            continue;
+          }
+          const [routine] = await db.select().from(routines).where(and(eq(routines.id, occurrence.routineId), eq(routines.companyId, occurrence.companyId)));
+          const [trigger] = await db.select().from(routineTriggers).where(and(eq(routineTriggers.id, occurrence.triggerId), eq(routineTriggers.routineId, occurrence.routineId), eq(routineTriggers.companyId, occurrence.companyId)));
+          const [revision] = occurrence.revisionId ? await db.select().from(routineRevisions).where(and(eq(routineRevisions.id, occurrence.revisionId), eq(routineRevisions.routineId, occurrence.routineId), eq(routineRevisions.companyId, occurrence.companyId))) : [];
+          if (!routine || !revision) throw unprocessable("Pinned routine revision is unavailable; current template will not be substituted");
+          const snapshot = routineRevisionSnapshotSchema.parse(revision.snapshot);
+          const pinnedTrigger = snapshot.triggers.find(item => item.id === occurrence.triggerId);
+          if (!pinnedTrigger) throw unprocessable("Pinned routine revision has no matching trigger snapshot");
+          const suppression = await scheduledSuppression(routine, trigger ?? null, now);
+          if (suppression) {
+            await db.update(routineOccurrences).set({ disposition: receipt ? "obligation" : "suppressed", executionState: receipt ? "unknown" : "skipped", decisionReason: receipt ? `Committed native dispatch requires reconciliation while ${suppression}` : suppression, leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date() })
+              .where(and(eq(routineOccurrences.id, occurrence.id), eq(routineOccurrences.disposition, "obligation"), eq(routineOccurrences.executionState, "dispatching"), eq(routineOccurrences.leaseOwner, attempt), eq(routineOccurrences.dispatchAttempts, occurrence.dispatchAttempts)));
+            continue;
+          }
+          const run = await dispatchRoutineRun({ routine: { ...routine, ...snapshot.routine, latestRevisionId: revision.id, latestRevisionNumber: revision.revisionNumber } as RoutineRow,
+            trigger: { ...trigger, ...pinnedTrigger } as RoutineTriggerRow, source: "schedule", idempotencyKey: `routine-occurrence:${occurrence.id}`,
+            actor: { authorizationActor: revision.dispatchActor as AuthorizationActor | undefined, runId: typeof revision.dispatchActor?.runId === "string" ? revision.dispatchActor.runId : null },
+            persistedScheduleOccurrence: true, occurrenceClaim: { id: occurrence.id, leaseOwner: attempt, dispatchAttempts: occurrence.dispatchAttempts, caseHandoffVersion: occurrence.caseHandoffVersion } });
+          await acknowledgeRoutineOccurrence(occurrence, attempt, run);
+          triggered++;
+        } catch (error) {
+          await db.update(routineOccurrences).set({ executionState: "unknown", decisionReason: error instanceof Error ? error.message : String(error), retryAt: null, leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date() })
+            .where(and(eq(routineOccurrences.id, occurrence.id), eq(routineOccurrences.disposition, "obligation"), eq(routineOccurrences.executionState, "dispatching"), eq(routineOccurrences.leaseOwner, attempt), eq(routineOccurrences.dispatchAttempts, occurrence.dispatchAttempts)));
+          logger.warn({ err: error, occurrenceId: occurrence.id }, "routine occurrence requires authoritative reconciliation");
+        }
+      }
+      await reconcileOccurrenceReceipts();
       return { triggered };
     },
 
-    syncRunStatusForIssue: async (issueId: string) => {
-      const issue = await db
-        .select({
-          id: issues.id,
-          status: issues.status,
-          originKind: issues.originKind,
-          originRunId: issues.originRunId,
-        })
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      if (!issue || issue.originKind !== "routine_execution" || !issue.originRunId) return null;
-      const run = await db
-        .select({
-          id: routineRuns.id,
-          status: routineRuns.status,
-          failureReason: routineRuns.failureReason,
-          triggerPayload: routineRuns.triggerPayload,
-        })
-        .from(routineRuns)
-        .where(eq(routineRuns.id, issue.originRunId))
-        .then((rows) => rows[0] ?? null);
-      if (!run) return null;
-      if (issue.status === "done") {
-        const transientFailureStatus = executionIssueTransientFailureStatusFromPayload(run.triggerPayload)
-          ?? legacyExecutionIssueTransientFailureStatus(run.failureReason);
-        const transientFailureClearedAt = executionIssueTransientFailureClearedAtFromPayload(run.triggerPayload);
-        return finalizeRun(issue.originRunId, {
-          status: "completed",
-          failureReason: null,
-          completedAt: new Date(),
-          ...(transientFailureStatus
-            ? {
-              triggerPayload: {
-                ...(run.triggerPayload ?? {}),
-                transientFailure: {
-                  code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
-                  status: transientFailureStatus,
-                  reason: executionIssueTransientFailureReason(transientFailureStatus),
-                  clearedAt: transientFailureClearedAt ?? new Date().toISOString(),
-                },
-              },
-            }
-            : {}),
-        });
+    // Repair a missed issue-status hook through the same status transition as
+    // normal issue writes. Never discard queued input or infer run completion
+    // from age. Lock both owners and re-read the issue before applying repair.
+    reconcileExecutionRunStatuses: async (): Promise<{ scanned: number; settled: number; deferred: number }> => {
+      const candidates = await db.select({ id: routineRuns.id, companyId: routineRuns.companyId,
+        issueId: issues.id, routineId: routineRuns.routineId })
+        .from(routineRuns).innerJoin(routines, and(eq(routines.id, routineRuns.routineId), eq(routines.companyId, routineRuns.companyId)))
+        .innerJoin(issues, and(eq(issues.id, routineRuns.linkedIssueId),
+          eq(issues.companyId, routineRuns.companyId), eq(issues.originKind, "routine_execution"),
+          sql`${issues.originRunId} = ${routineRuns.id}::text`, sql`${issues.originId} = ${routineRuns.routineId}::text`))
+        .where(and(eq(routineRuns.status, "issue_created"), inArray(issues.status, ["done", "cancelled", "blocked"]),
+          ...(statusReconcileCursor ? [sql`${routineRuns.id}::text > ${statusReconcileCursor}`] : [])))
+        .orderBy(asc(routineRuns.id)).limit(50);
+      statusReconcileCursor = candidates.length === 50 ? candidates.at(-1)!.id : null;
+      let settled = 0;
+      let deferred = 0;
+      for (const candidate of candidates) {
+        try {
+          const repaired = await db.transaction(async tx => {
+            await tx.execute(sql`SET LOCAL lock_timeout = '500ms'`);
+            await tx.execute(sql`SET LOCAL statement_timeout = '5s'`);
+            const [routine] = await tx.select({ id: routines.id }).from(routines).where(and(
+              eq(routines.id, candidate.routineId), eq(routines.companyId, candidate.companyId))).for("share");
+            if (!routine) return false;
+            const [issue] = await tx.select().from(issues).where(and(eq(issues.id, candidate.issueId),
+              eq(issues.companyId, candidate.companyId), eq(issues.originKind, "routine_execution"),
+              eq(issues.originRunId, candidate.id), eq(issues.originId, candidate.routineId))).for("update");
+            if (!issue || !["done", "cancelled", "blocked"].includes(issue.status)) return false;
+            const [run] = await tx.select().from(routineRuns).where(and(eq(routineRuns.id, candidate.id),
+              eq(routineRuns.companyId, candidate.companyId), eq(routineRuns.routineId, candidate.routineId),
+              eq(routineRuns.linkedIssueId, issue.id), eq(routineRuns.status, "issue_created"))).for("update");
+            if (!run) return false;
+            const synchronized = await syncRunStatusForIssue(issue.id, tx as unknown as Db);
+            if (!synchronized) return false;
+            return true;
+          });
+          if (repaired) settled += 1;
+        } catch (error) {
+          let current: unknown = error;
+          let retryable = false;
+          for (let depth = 0; depth < 5 && current && typeof current === "object"; depth++) {
+            const cause = current as { code?: string; cause?: unknown };
+            if (["55P03", "57014", "40P01", "40001"].includes(cause.code ?? "")) { retryable = true; break; }
+            current = cause.cause;
+          }
+          if (!retryable) throw error;
+          deferred += 1;
+        }
       }
-      if (issue.status === "blocked" || issue.status === "cancelled") {
-        const failureReason = executionIssueTransientFailureReason(issue.status);
-        return finalizeRun(issue.originRunId, {
-          status: "failed",
-          failureReason,
-          completedAt: new Date(),
-          triggerPayload: {
-            ...(run.triggerPayload ?? {}),
-            transientFailure: {
-              code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
-              status: issue.status,
-              reason: failureReason,
-              recordedAt: new Date().toISOString(),
-            },
-          },
-        });
-      }
-      const transientFailureStatus = executionIssueTransientFailureStatusFromPayload(run.triggerPayload)
-        ?? legacyExecutionIssueTransientFailureStatus(run.failureReason);
-      if (run.status === "failed" && transientFailureStatus) {
-        return finalizeRun(issue.originRunId, {
-          status: "issue_created",
-          failureReason: null,
-          completedAt: null,
-          triggerPayload: {
-            ...(run.triggerPayload ?? {}),
-            transientFailure: {
-              code: EXECUTION_ISSUE_TRANSIENT_FAILURE_CODE,
-              status: transientFailureStatus,
-              reason: executionIssueTransientFailureReason(transientFailureStatus),
-              clearedAt: new Date().toISOString(),
-            },
-          },
-        });
-      }
-      return null;
+      await reconcileOccurrenceReceipts();
+      return { scanned: candidates.length, settled, deferred };
     },
+
+    syncRunStatusForIssue,
   };
 }

@@ -5,6 +5,7 @@ import {
   text,
   timestamp,
   index,
+  unique,
 } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
@@ -24,6 +25,7 @@ export const goals = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    companyIdUq: unique("goals_company_id_uq").on(table.companyId, table.id),
     companyIdx: index("goals_company_idx").on(table.companyId),
   }),
 );

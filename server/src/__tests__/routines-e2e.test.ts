@@ -7,6 +7,8 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  authSessions,
+  authUsers,
   companies,
   companyMemberships,
   companySecrets,
@@ -78,6 +80,19 @@ function registerRoutineServiceMock() {
                   executionLockedAt: new Date(),
                 })
                 .where(eq(issues.id, issueId));
+              await db.insert(agentWakeupRequests).values({
+                companyId: issue.companyId,
+                agentId,
+                source: wakeupOpts?.source ?? "assignment",
+                triggerDetail: wakeupOpts?.triggerDetail ?? null,
+                reason: wakeupOpts?.reason ?? null,
+                payload: wakeupOpts?.payload ?? null,
+                status: "queued",
+                runId: queuedRunId,
+                requestedByActorType: wakeupOpts?.requestedByActorType ?? null,
+                requestedByActorId: wakeupOpts?.requestedByActorId ?? null,
+                idempotencyKey: wakeupOpts?.idempotencyKey ?? null,
+              });
               return { id: queuedRunId };
             },
           },
@@ -136,6 +151,8 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     await db.delete(agents);
     await db.delete(companies);
     await db.delete(instanceSettings);
+    await db.delete(authSessions);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -205,7 +222,25 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const agentId = randomUUID();
     const projectId = randomUUID();
     const userId = randomUUID();
+    const sessionId = randomUUID();
+    const now = new Date();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(authUsers).values({
+      id: userId,
+      name: "Routine owner",
+      email: `${userId}@routines.test`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(authSessions).values({
+      id: sessionId,
+      userId,
+      token: randomUUID(),
+      expiresAt: new Date(now.getTime() + 60 * 60 * 1000),
+      createdAt: now,
+      updatedAt: now,
+    });
 
     await db.insert(companies).values({
       id: companyId,
@@ -242,7 +277,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       userId,
     );
 
-    return { companyId, agentId, projectId, userId };
+    return { companyId, agentId, projectId, userId, sessionId };
   }
 
   function routineResourceRequests(app: express.Express, routineId: string, triggerId = routineId) {
@@ -275,9 +310,9 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   }
 
   it("returns not found without queries for malformed routine and trigger IDs on every resource route", async () => {
-    const { companyId, agentId, userId } = await seedFixture();
+    const { companyId, agentId, userId, sessionId } = await seedFixture();
     const actors = [
-      { type: "board", userId, source: "session", companyIds: [companyId] },
+      { type: "board", userId, source: "session", sessionId, companyIds: [companyId] },
       { type: "agent", agentId, companyId },
       { type: "none" },
     ];
@@ -307,13 +342,13 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   }, 20_000);
 
   it("keeps missing and cross-company routine resources indistinguishable", async () => {
-    const { companyId, agentId, userId } = await seedFixture();
+    const { companyId, agentId, userId, sessionId } = await seedFixture();
     const routineId = randomUUID();
     const triggerId = randomUUID();
     await db.insert(routines).values({ id: routineId, companyId, assigneeAgentId: agentId, title: "Private routine" });
     await db.insert(routineTriggers).values({ id: triggerId, companyId, routineId, kind: "api" });
     for (const actor of [
-      { type: "board", userId, source: "session", isInstanceAdmin: true, companyIds: [randomUUID()] },
+      { type: "board", userId, source: "session", sessionId, isInstanceAdmin: true, companyIds: [randomUUID()] },
       { type: "agent", agentId: randomUUID(), companyId: randomUUID() },
       { type: "none" },
     ]) {
@@ -333,14 +368,26 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   }, 20_000);
 
   it("preserves UUID routine reads and assignee-only mutations", async () => {
-    const { companyId, agentId, userId } = await seedFixture();
+    const { companyId, agentId, userId, sessionId } = await seedFixture();
     const routineId = randomUUID();
     const triggerId = randomUUID();
     await db.insert(routines).values({ id: routineId, companyId, assigneeAgentId: agentId, title: "Private routine" });
     await db.insert(routineTriggers).values({ id: triggerId, companyId, routineId, kind: "api" });
+    const peerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: peerAgentId,
+      companyId,
+      name: "Routine peer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
     const owner = await createApp({ type: "agent", agentId, companyId });
-    const otherAgent = await createApp({ type: "agent", agentId: randomUUID(), companyId });
-    const board = await createApp({ type: "board", userId, source: "session", companyIds: [companyId] });
+    const otherAgent = await createApp({ type: "agent", agentId: peerAgentId, companyId });
+    const board = await createApp({ type: "board", userId, source: "session", sessionId, companyIds: [companyId] });
     for (const app of [owner, otherAgent, board]) {
       const response = await request(app).get(`/api/routines/${routineId.toUpperCase()}`);
       expect(response.status).toBe(200);
@@ -507,11 +554,12 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   });
 
   it("supports creating, scheduling, and manually running a routine through the API", async () => {
-    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const { companyId, agentId, projectId, userId, sessionId } = await seedFixture();
     const app = await createApp({
       type: "board",
       userId,
       source: "session",
+      sessionId,
       isInstanceAdmin: false,
       companyIds: [companyId],
     });
@@ -636,11 +684,12 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   }, 15_000);
 
   it("runs routines with variable inputs and interpolates the execution issue description", async () => {
-    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const { companyId, agentId, projectId, userId, sessionId } = await seedFixture();
     const app = await createApp({
       type: "board",
       userId,
       source: "session",
+      sessionId,
       isInstanceAdmin: false,
       companyIds: [companyId],
     });
@@ -682,11 +731,12 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   });
 
   it("defaults activity gates and rejects invalid activity gate values", async () => {
-    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const { companyId, agentId, projectId, userId, sessionId } = await seedFixture();
     const app = await createApp({
       type: "board",
       userId,
       source: "session",
+      sessionId,
       isInstanceAdmin: false,
       companyIds: [companyId],
     });
@@ -722,11 +772,12 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   });
 
   it("allows drafting a routine without defaults and running it with one-off overrides", async () => {
-    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const { companyId, agentId, projectId, userId, sessionId } = await seedFixture();
     const app = await createApp({
       type: "board",
       userId,
       source: "session",
+      sessionId,
       isInstanceAdmin: false,
       companyIds: [companyId],
     });
@@ -767,13 +818,14 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   });
 
   it("persists execution workspace selections from manual routine runs", async () => {
-    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const { companyId, agentId, projectId, userId, sessionId } = await seedFixture();
     const projectWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
     const app = await createApp({
       type: "board",
       userId,
       source: "session",
+      sessionId,
       isInstanceAdmin: false,
       companyIds: [companyId],
     });
