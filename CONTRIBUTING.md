@@ -113,6 +113,19 @@ Every PR must include a **Model Used** section specifying which AI model produce
 
 All tests must pass before a PR can be merged. Run them locally first and verify CI is green after pushing.
 
+The maintained fork's UI/CLI native selections can opt into bounded failure
+diagnosis with `node scripts/run-vitest-stable.mjs --mode general --group
+general-workspaces-a --failure-records-output /path/to/report.json`, retaining
+the usual shard arguments when present. The option is invalid for other groups.
+Normal console reporting, warnings, test selection and failure exits remain
+enabled. The artifact contains only source-verified test relative paths, existing
+source locations when available, fixed categories and numeric counts, with at
+most 64 records and 32,768 UTF-8 bytes including its newline. It must not contain
+test titles, raw errors/stacks, environment or credentials. Incomplete/truncated
+or absent output is not successful diagnosis, complete log retention or a CI
+pass. The producer's deterministic contract tests use
+`node --test scripts/native-ui-failure-reporter.test.mjs`.
+
 ### Telemetry Changes
 
 This repo has three separate data paths: Telemetry, Observability, and the run log. See rule 7 in `AGENTS.md` for the full definitions and the review level each path needs.

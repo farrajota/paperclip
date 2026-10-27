@@ -26,3 +26,10 @@ The admission interface is `getIssuePlanningGate(db, companyId, issueId, now, ex
 - `PUT /api/issues/:id/planning`: supported board-only explicit planning edit. Distinct date fields are `earliestStart`, `plannedStart`, `plannedFinish`, `hardDeadline`, `forecastStart`, `forecastFinish`, `actualStart`, and `actualFinish`. All-day interval finishes are inclusive calendar dates; timed interval finishes are exclusive instants for calendar overlap. The UI preserves, but does not edit, recorded actual dates.
 
 All reads and navigation remain non-mutating: no dispatch, provider writes, drag-to-reschedule, or implicit first-plan creation.
+
+## Interface example
+
+![Plan calendar displaying distinct task dates and routine projections](../pr-screenshots/governance-20261027-plan.png)
+
+Synthetic demonstration data.
+

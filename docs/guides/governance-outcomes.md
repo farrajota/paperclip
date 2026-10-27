@@ -47,3 +47,10 @@ Target and period definitions are immutable; target history includes approval, t
 Company agreement is enforced in PostgreSQL, not just by API preflight: periods reference native `(goals.company_id, goals.id)`, target owners reference `(agents.company_id, agents.id)`, and check-in corrective issues reference `(issues.company_id, issues.id)`. The target/period, observation/target, correction/observation and check-in/target chains also have compound same-company/goal foreign keys. A nullable owner or corrective issue may be omitted when the historical row is created; a non-null reference must belong to that company.
 
 Owner-agent and corrective-issue references use `ON DELETE NO ACTION`, not `SET NULL`: deleting a referenced native row is rejected while its immutable outcome history exists. Deletion cannot silently rewrite an approved owner or check-in, or trip an attempted nulling update against the history triggers. Goal periods and direct goal/company references retain native cascading goal/company cleanup; the internal outcome-chain foreign keys still enforce referential integrity at statement completion. All four outcome history tables reject updates via `reject_goal_outcome_update()` and their immutable triggers. Visibility revocation redacts corrective references in API responses without altering stored history.
+
+## Interface example
+
+![Goal outcomes showing measured health separately from linked work delivery](../pr-screenshots/governance-20261027-outcomes.png)
+
+Synthetic demonstration data.
+

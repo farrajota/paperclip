@@ -184,6 +184,7 @@ it.each([
     runtimes.push(runtime);
     return runtime;
   };
+
   const remoteParent = path.join(remote, path.relative(repo, parent));
   const shortRemoteParent = path.join(root, "staged-check");
   const checkStagedFiles = async () => {

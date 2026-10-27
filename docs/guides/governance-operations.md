@@ -106,4 +106,11 @@ registerScheduledWork(coordinator, db, {
 
 The option adds the SLA callback and its actual next deadline to the existing `issueMonitors` queue. Producer intents are registered transactionally before clock writes. Paused/resolved/delivered history does not create a timer. The existing coordinator owns coalescing, retry, startup reconstruction, drain/resume, and shutdown; no feature interval or second controller is introduced.
 
-Schema and SQL are in `packages/db/src/schema/governance_operations.ts` and `0383_governance_operations.sql`. Production migration SQL adds no custom functions or triggers. The three schema exports, migration journal/snapshots, API mount, callback mount, and top-level navigation are integration-owned.
+Schema is in `packages/db/src/schema/governance_operations.ts`; its SQL is included in the canonical `packages/db/src/migrations/0379_autonomous_governance.sql`. The operations-specific DDL adds no custom functions or triggers; the shared migration also includes the outcome history guards. Schema exports, migration journal/snapshot, API mount, callback mount, and top-level navigation are registered as part of the governance integration.
+
+## Interface example
+
+![Operations queue showing an owned overdue exception and its escalation history](../pr-screenshots/governance-20261027-overdue.png)
+
+Synthetic demonstration data.
+

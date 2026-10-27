@@ -33,3 +33,10 @@ Authorized board users can skip or waive with a reason and an active accountable
 The API returns `RoutineOccurrencePage` from `GET /routines/:id/occurrences?limit=50&cursor=...`: `items` (including `decisionHistory`), `nextCursor`, `canDecide`, and `catchup` (`batchLimit`, `hasMoreDue`, `nextScheduledAt`, `executionLimit`, and `episodes` with `triggerId`, `cutoff`, `revisionId`, `executionsConsumed`, `latestOnly`). `POST /routines/:id/occurrences/:occurrenceId/disposition` accepts `{ "disposition": "skipped" | "waived", "reason": "...", "ownerUserId": "..." }`. Route authorization passes the real native actor/run/key/source context; pagination/options are validated. There is no separate occurrence-item GET route.
 
 These records are a durable accounting and reconciliation layer around native routines, tasks, case handoffs, and wake delivery, not a second scheduler or direct provider dispatcher. The dedicated PostgreSQL behavior suite covers transaction rollback, competing controllers, crash/replay and stale attempts, explicit catch-up/suppression, native receipts, case delivery deduplication, current eligibility, accepted pinned milestone evidence, private resources, native source restrictions, and accountable route decisions. Test execution belongs to integration; no runtime result is implied by this guide.
+
+## Interface example
+
+![Routine occurrence retaining its pinned revision and linked native work after a controller restart](../pr-screenshots/governance-20261027-restart.png)
+
+Synthetic demonstration data.
+

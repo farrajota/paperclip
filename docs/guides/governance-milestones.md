@@ -56,3 +56,10 @@ The Case detail panel loads the stored current/draft contract into its JSON edit
 - `POST /api/milestones/:milestoneId/followups`: `{ eventId }`, an authorized idempotent replay surface.
 
 The reusable service is `governanceMilestoneService(db).getMilestoneReadiness(companyId: string, milestoneId: string, executor?: MilestoneExecutor, currentActor?: AuthorizationActor): Promise<MilestoneReadiness>`, with `MilestoneExecutor = { agentId?: string; taskId?: string }`, from `@paperclipai/shared/governance-milestones`. Existing three-argument consumers are unchanged. The optional fourth argument is server-only canonical current-request authority, never client payload or saved credentials; the owned route supplies it for fresh matching cloud attestation. Background consumers without such attestation fail closed on exceptional-only historical access.
+
+## Interface example
+
+![Case milestone showing its evidence, review decision, and retained acceptance history](../pr-screenshots/governance-20261027-milestone.png)
+
+Synthetic demonstration data.
+
