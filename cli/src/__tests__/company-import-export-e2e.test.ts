@@ -11,11 +11,14 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { createStoredZipArchive } from "./helpers/zip.js";
-import { PortabilityPhaseDiagnostics } from "./helpers/portability-phase-diagnostics.js";
+import {
+  PortabilityPhaseDiagnostics,
+  StartupTimingFrameDecoder,
+} from "./helpers/portability-phase-diagnostics.js";
 
-const portabilityPhaseDiagnostics = new PortabilityPhaseDiagnostics(
-  process.env.PAPERCLIP_TEST_COMPANY_PORTABILITY_PHASE_OUTPUT || undefined,
-);
+const portabilityPhaseOutputPath = process.env.PAPERCLIP_TEST_COMPANY_PORTABILITY_PHASE_OUTPUT || undefined;
+const portabilityPhaseDiagnostics = new PortabilityPhaseDiagnostics(portabilityPhaseOutputPath);
+const startupTimingDecoder = portabilityPhaseOutputPath ? new StartupTimingFrameDecoder() : undefined;
 
 const execFileAsync = promisify(execFile);
 type ServerProcess = ReturnType<typeof spawn>;
@@ -167,6 +170,9 @@ function createServerEnv(
   env.PAPERCLIP_MIGRATION_AUTO_APPLY = "true";
   env.PAPERCLIP_UI_DEV_MIDDLEWARE = "false";
 
+  if (portabilityPhaseOutputPath) {
+    env.PAPERCLIP_TEST_CLI_STARTUP_TIMINGS = "1";
+  }
   return env;
 }
 
@@ -259,8 +265,10 @@ async function waitForServer(
   output: { stdout: string[]; stderr: string[] },
 ) {
   const startedAt = Date.now();
+  const observeHealthWait = portabilityPhaseDiagnostics.createHealthWaitObserver(startedAt);
   while (Date.now() - startedAt < 30_000) {
     if (child.exitCode !== null) {
+      observeHealthWait?.("health-child-exit-observed");
       throw new Error(
         `paperclipai run exited before healthcheck succeeded.\nstdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}`,
       );
@@ -269,13 +277,16 @@ async function waitForServer(
     try {
       const res = await fetch(`${apiBase}/api/health`);
       if (res.ok) return;
+      observeHealthWait?.("health-response-non-ok");
     } catch {
+      observeHealthWait?.("health-fetch-rejected");
       // Server is still starting.
     }
 
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
+  observeHealthWait?.("health-deadline-branch");
   throw new Error(
     `Timed out waiting for ${apiBase}/api/health.\nstdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}`,
   );
@@ -330,7 +341,13 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     ));
     serverProcess = child;
     child.stdout?.on("data", (chunk) => {
-      output.stdout.push(String(chunk));
+      const text = String(chunk);
+      output.stdout.push(text);
+      if (startupTimingDecoder) {
+        for (const observation of startupTimingDecoder.push(text)) {
+          portabilityPhaseDiagnostics.recordStartupTiming(observation);
+        }
+      }
     });
     child.stderr?.on("data", (chunk) => {
       output.stderr.push(String(chunk));

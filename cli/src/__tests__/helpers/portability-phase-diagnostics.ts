@@ -14,7 +14,19 @@ export type PortabilityCheckpoint =
   | "existing-apply"
   | "zip-import"
   | "server-stop"
-  | "db-cleanup";
+  | "db-cleanup"
+  | "health-child-exit-observed"
+  | "health-deadline-branch"
+  | "health-response-non-ok"
+  | "health-fetch-rejected"
+  | "startup-workspace-prerequisites"
+  | "startup-server-import"
+  | "startup-server-start";
+export type HealthWaitCheckpoint =
+  | "health-child-exit-observed"
+  | "health-deadline-branch"
+  | "health-response-non-ok"
+  | "health-fetch-rejected";
 export type PortabilityOutcome = "enter" | "pass" | "throw" | "unknown";
 
 export interface PortabilityObservation {
@@ -30,12 +42,100 @@ interface PortabilityArtifact {
   observations: PortabilityObservation[];
 }
 
-const MAX_OBSERVATIONS = 32;
+const MAX_OBSERVATIONS = 38;
 const MAX_OBSERVATION_BYTES = 256;
 const MAX_ARTIFACT_BYTES = 8192;
 const MAX_ELAPSED_MS = 3_600_000;
+const STARTUP_TIMING_PREFIX = "PAPERCLIP_TEST_CLI_STARTUP ";
+const STARTUP_TIMING_CHECKPOINTS = [
+  "startup-workspace-prerequisites",
+  "startup-server-import",
+  "startup-server-start",
+] as const;
+const MAX_STARTUP_TIMING_FRAMES = 6;
+
+export class StartupTimingFrameDecoder {
+  private line = "";
+  private overflow = false;
+  private nextCheckpointIndex = 0;
+  private activeCheckpointIndex = -1;
+  private expectingTerminal = false;
+  private acceptedFrames = 0;
+
+  push(chunk: string): PortabilityObservation[] {
+    const observations: PortabilityObservation[] = [];
+    for (let index = 0; index < chunk.length; index += 1) {
+      const character = chunk[index]!;
+      if (character === "\n") {
+        if (!this.overflow) {
+          const observation = this.decodeLine(this.line);
+          if (observation) observations.push(observation);
+        }
+        this.line = "";
+        this.overflow = false;
+        continue;
+      }
+      if (!this.overflow) {
+        this.line += character;
+        if (this.line.length > MAX_OBSERVATION_BYTES || utf8Bytes(this.line) > MAX_OBSERVATION_BYTES) {
+          this.line = "";
+          this.overflow = true;
+        }
+      }
+    }
+    return observations;
+  }
+
+  private decodeLine(line: string): PortabilityObservation | undefined {
+    if (!line.startsWith(STARTUP_TIMING_PREFIX) || this.acceptedFrames >= MAX_STARTUP_TIMING_FRAMES) return;
+    const json = line.slice(STARTUP_TIMING_PREFIX.length);
+    let value: unknown;
+    try {
+      value = JSON.parse(json);
+    } catch {
+      return;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+    const record = value as Record<string, unknown>;
+    if (Object.keys(record).sort().join(",") !== "checkpoint,elapsedMs,outcome") return;
+    const checkpointIndex = STARTUP_TIMING_CHECKPOINTS.indexOf(record.checkpoint as (typeof STARTUP_TIMING_CHECKPOINTS)[number]);
+    if (checkpointIndex < this.nextCheckpointIndex || checkpointIndex >= STARTUP_TIMING_CHECKPOINTS.length) return;
+    if (this.expectingTerminal && checkpointIndex !== this.activeCheckpointIndex) return;
+    if (this.expectingTerminal
+      ? record.outcome !== "pass" && record.outcome !== "throw"
+      : record.outcome !== "enter") return;
+    const checkpoint = STARTUP_TIMING_CHECKPOINTS[checkpointIndex] as (typeof STARTUP_TIMING_CHECKPOINTS)[number];
+    if (!Number.isInteger(record.elapsedMs) || (record.elapsedMs as number) < 0 ||
+      (record.elapsedMs as number) > MAX_ELAPSED_MS ||
+      (record.outcome === "enter" && record.elapsedMs !== 0)) return;
+    if (json !== JSON.stringify({
+      checkpoint: record.checkpoint,
+      outcome: record.outcome,
+      elapsedMs: record.elapsedMs,
+    })) return;
+
+    this.acceptedFrames += 1;
+    if (this.expectingTerminal) {
+      this.nextCheckpointIndex = checkpointIndex + 1;
+      this.activeCheckpointIndex = -1;
+      this.expectingTerminal = false;
+    } else {
+      this.activeCheckpointIndex = checkpointIndex;
+      this.expectingTerminal = true;
+    }
+    return {
+      phase: "setup",
+      checkpoint,
+      outcome: record.outcome as "enter" | "pass" | "throw",
+      elapsedMs: record.elapsedMs as number,
+    };
+  }
+
+}
+
 
 type WriteArtifact = (path: string, contents: string, encoding: "utf8") => void;
+
 
 function utf8Bytes(value: string): number {
   return Buffer.byteLength(value, "utf8");
@@ -59,6 +159,54 @@ export class PortabilityPhaseDiagnostics {
     private readonly writeArtifact: WriteArtifact = writeFileSync,
     private readonly now: () => number = Date.now,
   ) {}
+  recordStartupTiming(observation: PortabilityObservation): void {
+    if (!this.outputPath || observation.phase !== "setup" ||
+      !STARTUP_TIMING_CHECKPOINTS.includes(observation.checkpoint as (typeof STARTUP_TIMING_CHECKPOINTS)[number]) ||
+      (observation.outcome !== "enter" && observation.outcome !== "pass" && observation.outcome !== "throw")) return;
+    this.record(observation);
+  }
+
+
+  createHealthWaitObserver(startedAt: number): ((checkpoint: HealthWaitCheckpoint) => void) | undefined {
+    if (!this.outputPath) return undefined;
+
+    let sawNonOkResponse = false;
+    let sawFetchRejection = false;
+    let terminalObserved = false;
+
+    return (checkpoint) => {
+      if (
+        checkpoint !== "health-child-exit-observed" &&
+        checkpoint !== "health-deadline-branch" &&
+        checkpoint !== "health-response-non-ok" &&
+        checkpoint !== "health-fetch-rejected"
+      ) {
+        return;
+      }
+      if (terminalObserved) return;
+      if (checkpoint === "health-response-non-ok") {
+        if (sawNonOkResponse) return;
+        sawNonOkResponse = true;
+      } else if (checkpoint === "health-fetch-rejected") {
+        if (sawFetchRejection) return;
+        sawFetchRejection = true;
+      } else {
+        terminalObserved = true;
+      }
+
+      try {
+        const outcome: PortabilityOutcome = checkpoint === "health-response-non-ok" ? "unknown" : "throw";
+        this.record({
+          phase: "setup",
+          checkpoint,
+          outcome,
+          elapsedMs: this.elapsedSince(startedAt),
+        });
+      } catch {
+        // Health-wait observation must not affect the request or its original error.
+      }
+    };
+  }
 
   async run<T>(
     phase: PortabilityPhase,

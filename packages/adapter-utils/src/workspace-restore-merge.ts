@@ -135,39 +135,147 @@ export function directorySnapshotSha256(snapshot: DirectorySnapshot): string {
 }
 
 const SMALL_FILE_STREAM_THRESHOLD_BYTES = 64 * 1024;
-const SMALL_FILE_STREAM_HIGH_WATER_MARK_BYTES = 8 * 1024;
+const SMALL_FILE_READ_BUFFER_BYTES = 8 * 1024;
 
-async function hashFile(filePath: string, fileSize: number): Promise<string> {
+async function hashFile(filePath: string, fileSize: number, smallFileBuffer?: Buffer): Promise<string> {
+  if (fileSize <= SMALL_FILE_STREAM_THRESHOLD_BYTES) {
+    const file = await fs.open(filePath, "r");
+    try {
+      const hash = createHash("sha256");
+      const buffer = smallFileBuffer ?? Buffer.alloc(SMALL_FILE_READ_BUFFER_BYTES);
+      while (true) {
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, null);
+        if (bytesRead === 0) break;
+        hash.update(buffer.subarray(0, bytesRead));
+      }
+      return hash.digest("hex");
+    } finally {
+      await file.close();
+    }
+  }
+
   return await new Promise((resolve, reject) => {
     const hash = createHash("sha256");
-    const stream = fileSize <= SMALL_FILE_STREAM_THRESHOLD_BYTES
-      ? createReadStream(filePath, { highWaterMark: SMALL_FILE_STREAM_HIGH_WATER_MARK_BYTES })
-      : createReadStream(filePath);
+    const stream = createReadStream(filePath);
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("error", reject);
     stream.on("end", () => resolve(hash.digest("hex")));
   });
 }
 
+const SMALL_FILE_HASH_WINDOW_SIZE = 4;
+
+type SettledSmallFileHash = { hash: string } | { error: unknown };
+
+interface CaptureHashScratch {
+  buffers: Array<Buffer | undefined>;
+}
+
+interface CapturePathMatcher {
+  matches(relative: string): boolean;
+  close(): void;
+}
+interface PendingSmallFileHash {
+  relative: string;
+  mode: number;
+  slot: number;
+  result: Promise<SettledSmallFileHash>;
+}
+
 async function* walkDirectory(
-  root: string, exclude: readonly string[], ignored: ReturnType<typeof workspacePathMatcher>, relative = "",
+  root: string, exclude: readonly string[], ignored: CapturePathMatcher, scratch: CaptureHashScratch, relative = "",
 ): AsyncGenerator<[string, SnapshotEntry]> {
   const current = relative ? path.join(root, relative) : root;
-  for await (const entry of await fs.opendir(current)) {
-    const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
-    if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
-    const fullPath = path.join(root, nextRelative);
-    const stats = await fs.lstat(fullPath);
-    if (stats.isDirectory()) {
-      yield [nextRelative, { kind: "dir" }];
-      yield* walkDirectory(root, exclude, ignored, nextRelative);
-    } else if (stats.isSymbolicLink()) {
-      yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
-    } else if (stats.isFile()) {
-      yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath, stats.size) }];
+  const pending = new Array<PendingSmallFileHash | undefined>(SMALL_FILE_HASH_WINDOW_SIZE);
+  let head = 0;
+  let tail = 0;
+  let pendingCount = 0;
+  let hashFailureObserved = false;
+  let consumerFailureObserved = false;
+  let consumerFailure: unknown;
+
+  async function* consumeHead(): AsyncGenerator<[string, SnapshotEntry]> {
+    const record = pending[head]!;
+    const result = await record.result;
+    if ("error" in result) throw result.error;
+    try {
+      yield [record.relative, { kind: "file", mode: record.mode, hash: result.hash }];
+    } catch (error) {
+      consumerFailureObserved = true;
+      consumerFailure = error;
+      throw error;
     }
+    pending[record.slot] = undefined;
+    head = (record.slot + 1) % SMALL_FILE_HASH_WINDOW_SIZE;
+    pendingCount -= 1;
+  }
+
+  async function* drainSmallFiles(): AsyncGenerator<[string, SnapshotEntry]> {
+    while (pendingCount > 0) yield* consumeHead();
+  }
+
+  async function settlePending(): Promise<{ found: false } | { found: true; error: unknown }> {
+    let firstHashError: unknown;
+    let hashErrorFound = false;
+    for (let index = 0; index < pendingCount; index += 1) {
+      const record = pending[(head + index) % SMALL_FILE_HASH_WINDOW_SIZE]!;
+      const result = await record.result;
+      if ("error" in result && !hashErrorFound) {
+        firstHashError = result.error;
+        hashErrorFound = true;
+      }
+    }
+    return hashErrorFound ? { found: true, error: firstHashError } : { found: false };
+  }
+
+  try {
+    for await (const entry of await fs.opendir(current)) {
+      const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
+      if (hashFailureObserved) yield* drainSmallFiles();
+      if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
+      const fullPath = path.join(root, nextRelative);
+      const stats = await fs.lstat(fullPath);
+      if (hashFailureObserved) yield* drainSmallFiles();
+      if (stats.isFile() && stats.size <= SMALL_FILE_STREAM_THRESHOLD_BYTES) {
+        const slot = tail;
+        const buffer = scratch.buffers[slot] ?? (scratch.buffers[slot] = Buffer.alloc(SMALL_FILE_READ_BUFFER_BYTES));
+        const result = hashFile(fullPath, stats.size, buffer).then<SettledSmallFileHash, SettledSmallFileHash>(
+          (hash) => ({ hash }),
+          (error: unknown) => {
+            hashFailureObserved = true;
+            return { error };
+          },
+        );
+        pending[slot] = { relative: nextRelative, mode: stats.mode, slot, result };
+        tail = (tail + 1) % SMALL_FILE_HASH_WINDOW_SIZE;
+        pendingCount += 1;
+        if (pendingCount === SMALL_FILE_HASH_WINDOW_SIZE) yield* consumeHead();
+      } else {
+        yield* drainSmallFiles();
+        if (stats.isDirectory()) {
+          yield [nextRelative, { kind: "dir" }];
+          yield* walkDirectory(root, exclude, ignored, scratch, nextRelative);
+        } else if (stats.isSymbolicLink()) {
+          yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
+        } else if (stats.isFile()) {
+          yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath, stats.size) }];
+        }
+      }
+    }
+    yield* drainSmallFiles();
+  } catch (error) {
+    if (consumerFailureObserved) {
+      await settlePending();
+      throw consumerFailure;
+    }
+    const settled = await settlePending();
+    if (settled.found) throw settled.error;
+    throw error;
+  } finally {
+    await settlePending();
   }
 }
+
 
 async function readSnapshotEntry(root: string, relative: string): Promise<SnapshotEntry | null> {
   const fullPath = path.join(root, relative);
@@ -544,6 +652,7 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
   // An interrupted restore must not leave a truncated current file. Keep the
   // incoming tree until its owner records success; exact retries deduplicate.
   const temporary = path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
+  let renamed = false;
   try {
     await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, temporary);
@@ -554,7 +663,8 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
     const existing = await fs.lstat(targetPath).catch(() => null);
     if (existing?.isDirectory()) await fs.rm(targetPath, { recursive: true, force: true });
     await fs.rename(temporary, targetPath);
-  } finally { await fs.rm(temporary, { force: true }); }
+    renamed = true;
+  } finally { if (!renamed) await fs.rm(temporary, { force: true }); }
 
 }
 
@@ -568,7 +678,8 @@ export async function captureDirectorySnapshot(
   try {
     writer = options.diskBacked ? await createWorkspaceManifest("paperclip-workspace-baseline-") : null;
     const memory = new Map<string, SnapshotEntry>();
-    for await (const [relative, entry] of walkDirectory(rootDir, exclude, ignored)) {
+    const scratch: CaptureHashScratch = { buffers: [] };
+    for await (const [relative, entry] of walkDirectory(rootDir, exclude, ignored, scratch)) {
       if (writer) writer.add("baseline", relative, JSON.stringify(entry));
       else memory.set(relative, entry);
     }

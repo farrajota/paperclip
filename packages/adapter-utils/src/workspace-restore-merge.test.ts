@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import nodeFs from "node:fs";
 import { promises as fsPromises } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -171,6 +173,196 @@ describe("workspace restore merge", () => {
       lstatSpy.mockRestore();
       await disposeDirectorySnapshot(snapshot);
       await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+  it("settles earlier file hashes before reporting a later discovery failure", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-settlement-"));
+    cleanupDirs.push(rootDir);
+    await writeFile(path.join(rootDir, "first.txt"), "first", "utf8");
+    await writeFile(path.join(rootDir, "second.txt"), "second", "utf8");
+
+    const hashError = new Error("earlier hash failed");
+    const discoveryError = new Error("later entry could not be inspected");
+    let firstFilePath: string | undefined;
+    let closeStarted!: () => void;
+    const closeStartedPromise = new Promise<void>((resolve) => { closeStarted = resolve; });
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    const failedHandle = {
+      read: async () => { throw hashError; },
+      close: async () => { closeStarted(); await closeGate; },
+    } as unknown as FileHandle;
+
+    const realLstat = fsPromises.lstat;
+    const lstatSpy = vi.spyOn(fsPromises, "lstat").mockImplementation(async (observedPath) => {
+      const stats = await realLstat(observedPath);
+      if (typeof observedPath === "string" && path.dirname(observedPath) === rootDir && stats.isFile()) {
+        if (firstFilePath) throw discoveryError;
+        firstFilePath = observedPath;
+      }
+      return stats;
+    });
+    const realOpen = fsPromises.open;
+    const openSpy = vi.spyOn(fsPromises, "open").mockImplementation((observedPath, flags, mode) => {
+      if (observedPath === firstFilePath) return Promise.resolve(failedHandle);
+      return realOpen(observedPath, flags, mode);
+    });
+
+    const capture = captureDirectorySnapshot(rootDir, { exclude: [] });
+    let settled = false;
+    void capture.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await closeStartedPromise;
+      expect(settled).toBe(false);
+      releaseClose();
+      await expect(capture).rejects.toBe(hashError);
+    } finally {
+      releaseClose();
+      openSpy.mockRestore();
+      lstatSpy.mockRestore();
+    }
+  });
+
+  it("waits for pending small-file closes before rolling back a disk-backed snapshot after writer failure", async () => {
+    if (process.platform === "win32") return;
+
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-pending-tail-"));
+    cleanupDirs.push(rootDir);
+    const directoryNames = ["a".repeat(220), "b".repeat(220), "c".repeat(220)];
+    const directory = path.join(rootDir, ...directoryNames);
+    await mkdir(directory, { recursive: true });
+
+    const fileName = (index: number) => `f${String(index).padStart(4, "0")}${"x".repeat(215)}`;
+    let directoryRelative = "";
+    const directoryRelativePaths: string[] = [];
+    for (const name of directoryNames) {
+      directoryRelative = directoryRelative ? path.posix.join(directoryRelative, name) : name;
+      directoryRelativePaths.push(directoryRelative);
+    }
+    const firstFilePath = path.join(directory, fileName(0));
+    await writeFile(firstFilePath, "");
+    const mode = (await lstat(firstFilePath)).mode;
+    const directoryRecordBytes = directoryRelativePaths.reduce(
+      (total, relative) => total + Buffer.byteLength(relative) + Buffer.byteLength(JSON.stringify({ kind: "dir" })),
+      0,
+    );
+    const fileRelative = path.posix.join(directoryRelative, fileName(0));
+    const fileRecordBytes = Buffer.byteLength(fileRelative)
+      + Buffer.byteLength(JSON.stringify({ kind: "file", mode, hash: "0".repeat(64) }));
+    // Match the manifest writer's reserve-check interval without adding a test hook.
+    const diskCheckIntervalBytes = 1024 * 1024;
+    const failingRecordIndex = Math.ceil((diskCheckIntervalBytes - directoryRecordBytes) / fileRecordBytes);
+    const fileCount = failingRecordIndex + 3;
+    for (let index = 1; index < fileCount; index += 1) {
+      await writeFile(path.join(directory, fileName(index)), "");
+    }
+
+    const reserveBytes = 256 * 1024 * 1024;
+    const available = nodeFs.statfsSync(os.tmpdir(), { bigint: true });
+    const healthyCapacity = {
+      ...available,
+      bsize: 1n,
+      bavail: BigInt(reserveBytes) + 16n * 1024n * 1024n,
+    };
+    vi.stubEnv("PAPERCLIP_WORKSPACE_MANIFEST_MIN_FREE_BYTES", String(reserveBytes));
+
+    let resolveReserveFailure!: () => void;
+    const reserveFailureObserved = new Promise<void>((resolve) => { resolveReserveFailure = resolve; });
+    let initialCapacityCheck = true;
+    const statfsSpy = vi.spyOn(nodeFs, "statfsSync").mockImplementation(() => {
+      if (initialCapacityCheck) {
+        initialCapacityCheck = false;
+        return healthyCapacity as never;
+      }
+      resolveReserveFailure();
+      return { ...healthyCapacity, bavail: 0n } as never;
+    });
+
+    let manifestDirectory: string | undefined;
+    const realMkdtemp = fsPromises.mkdtemp.bind(fsPromises);
+    const mkdtempSpy = vi.spyOn(fsPromises, "mkdtemp").mockImplementation(async (prefix, options) => {
+      const created = await realMkdtemp(prefix, options);
+      manifestDirectory = String(created);
+      return created;
+    });
+
+    let resolveTailClosesStarted!: () => void;
+    const tailClosesStarted = new Promise<void>((resolve) => { resolveTailClosesStarted = resolve; });
+    let releaseTailClose!: () => void;
+    const tailCloseGate = new Promise<void>((resolve) => { releaseTailClose = resolve; });
+    let tailCloseStartedCount = 0;
+    let tailCloseFinishedCount = 0;
+    const realOpen = fsPromises.open;
+    let openedFileCount = 0;
+    const openSpy = vi.spyOn(fsPromises, "open").mockImplementation((observedPath, flags, openMode) => {
+      const openIndex = ++openedFileCount;
+      return realOpen(observedPath, flags, openMode).then((file) => {
+        if (openIndex <= failingRecordIndex || openIndex > failingRecordIndex + 3) return file;
+        return {
+          read: file.read.bind(file),
+          close: async () => {
+            tailCloseStartedCount += 1;
+            if (tailCloseStartedCount === 3) resolveTailClosesStarted();
+            await tailCloseGate;
+            await file.close();
+            tailCloseFinishedCount += 1;
+          },
+        } as unknown as FileHandle;
+      });
+    });
+
+    const manifestRemovals: string[] = [];
+    let removalBeforeTailCloses = false;
+    const realRm = fsPromises.rm.bind(fsPromises);
+    const rmSpy = vi.spyOn(fsPromises, "rm").mockImplementation(async (target, options) => {
+      if (String(target) === manifestDirectory) {
+        manifestRemovals.push(String(target));
+        if (tailCloseFinishedCount !== 3) removalBeforeTailCloses = true;
+      }
+      await realRm(target, options);
+    });
+
+    let publishedSnapshot: DirectorySnapshot | null = null;
+    const capture = captureDirectorySnapshot(rootDir, { exclude: [], diskBacked: true }).then((snapshot) => {
+      publishedSnapshot = snapshot;
+      return snapshot;
+    });
+    let captureSettled = false;
+    void capture.then(() => { captureSettled = true; }, () => { captureSettled = true; });
+
+    try {
+      const observation = await Promise.race([
+        Promise.all([reserveFailureObserved, tailClosesStarted]).then(() => "writer-failed-with-tail-pending" as const),
+        capture.then(() => "capture-settled" as const, () => "capture-settled" as const),
+      ]);
+      expect(observation).toBe("writer-failed-with-tail-pending");
+      expect(captureSettled).toBe(false);
+      expect(manifestRemovals).toEqual([]);
+
+      releaseTailClose();
+      let captureError: unknown;
+      try {
+        await capture;
+      } catch (error) {
+        captureError = error;
+      }
+      expect(captureError).toMatchObject({
+        code: "workspace_git_scan_failed",
+        message: "Workspace manifest storage is below its free-space reserve",
+      });
+      expect(publishedSnapshot).toBeNull();
+      expect(tailCloseFinishedCount).toBe(3);
+      expect(removalBeforeTailCloses).toBe(false);
+      expect(manifestRemovals).toEqual([manifestDirectory]);
+      await expect(stat(manifestDirectory!)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseTailClose();
+      await capture.catch(() => undefined);
+      rmSpy.mockRestore();
+      openSpy.mockRestore();
+      mkdtempSpy.mockRestore();
+      statfsSpy.mockRestore();
+      vi.unstubAllEnvs();
     }
   });
 

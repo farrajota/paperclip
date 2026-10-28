@@ -195,6 +195,67 @@ function maybeEnableUiDevMiddleware(entrypoint: string): void {
     process.env.PAPERCLIP_UI_DEV_MIDDLEWARE = "true";
   }
 }
+const STARTUP_TIMING_FLAG = "PAPERCLIP_TEST_CLI_STARTUP_TIMINGS";
+const STARTUP_TIMING_PREFIX = "PAPERCLIP_TEST_CLI_STARTUP ";
+const MAX_STARTUP_TIMING_MS = 3_600_000;
+
+function startupTimingsEnabled(): boolean {
+  return process.env[STARTUP_TIMING_FLAG] === "1";
+}
+
+function startupElapsedMs(startedAt: number): number {
+  try {
+    const elapsedMs = Math.floor(Date.now() - startedAt);
+    if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return 0;
+    return Math.min(elapsedMs, MAX_STARTUP_TIMING_MS);
+  } catch {
+    return 0;
+  }
+}
+
+function writeStartupTiming(checkpoint: string, outcome: "enter" | "pass" | "throw", elapsedMs: number): void {
+  try {
+    // Keep diagnostic write errors local without adding a stdout error listener.
+    const stdoutFd = process.stdout.fd;
+    let remaining = `${STARTUP_TIMING_PREFIX}${JSON.stringify({ checkpoint, outcome, elapsedMs })}\n`;
+    while (remaining.length > 0) {
+      const written = fs.writeSync(stdoutFd, remaining, null, "utf8");
+      if (written <= 0 || written >= remaining.length) return;
+      remaining = remaining.slice(written);
+    }
+  } catch {
+    // Synchronous diagnostic writes keep stream failures out of startup behavior.
+  }
+}
+
+function runStartupTimingSync<T>(checkpoint: string, operation: () => T): T {
+  let startedAt = 0;
+  try { startedAt = Date.now(); } catch { /* Keep diagnostics isolated from startup. */ }
+  writeStartupTiming(checkpoint, "enter", 0);
+  try {
+    const result = operation();
+    writeStartupTiming(checkpoint, "pass", startupElapsedMs(startedAt));
+    return result;
+  } catch (error) {
+    writeStartupTiming(checkpoint, "throw", startupElapsedMs(startedAt));
+    throw error;
+  }
+}
+
+async function runStartupTiming<T>(checkpoint: string, operation: () => Promise<T>): Promise<T> {
+  let startedAt = 0;
+  try { startedAt = Date.now(); } catch { /* Keep diagnostics isolated from startup. */ }
+  writeStartupTiming(checkpoint, "enter", 0);
+  try {
+    const result = await operation();
+    writeStartupTiming(checkpoint, "pass", startupElapsedMs(startedAt));
+    return result;
+  } catch (error) {
+    writeStartupTiming(checkpoint, "throw", startupElapsedMs(startedAt));
+    throw error;
+  }
+}
+
 
 function ensureDevWorkspaceBuildDeps(projectRoot: string): void {
   const buildScript = path.resolve(projectRoot, "scripts/ensure-plugin-build-deps.mjs");
@@ -224,15 +285,24 @@ async function importServerEntry(): Promise<StartedServer> {
   const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const devEntry = path.resolve(projectRoot, "server/src/index.ts");
   if (fs.existsSync(devEntry)) {
-    ensureDevWorkspaceBuildDeps(projectRoot);
+    if (startupTimingsEnabled()) {
+      runStartupTimingSync("startup-workspace-prerequisites", () => ensureDevWorkspaceBuildDeps(projectRoot));
+    } else {
+      ensureDevWorkspaceBuildDeps(projectRoot);
+    }
     maybeEnableUiDevMiddleware(devEntry);
-    const mod = await import(pathToFileURL(devEntry).href);
+    const serverEntryUrl = pathToFileURL(devEntry).href;
+    const mod = startupTimingsEnabled()
+      ? await runStartupTiming("startup-server-import", () => import(serverEntryUrl))
+      : await import(serverEntryUrl);
     return await startServerFromModule(mod, devEntry);
   }
 
   // Production mode: import the published @paperclipai/server package
   try {
-    const mod = await import("@paperclipai/server");
+    const mod = startupTimingsEnabled()
+      ? await runStartupTiming("startup-server-import", () => import("@paperclipai/server"))
+      : await import("@paperclipai/server");
     return await startServerFromModule(mod, "@paperclipai/server");
   } catch (err) {
     const missingSpecifier = getMissingModuleSpecifier(err);
@@ -259,6 +329,9 @@ async function startServerFromModule(mod: unknown, label: string): Promise<Start
   const startServer = (mod as { startServer?: () => Promise<StartedServer> }).startServer;
   if (typeof startServer !== "function") {
     throw new Error(`Paperclip server entrypoint did not export startServer(): ${label}`);
+  }
+  if (startupTimingsEnabled()) {
+    return await runStartupTiming("startup-server-start", () => startServer());
   }
   return await startServer();
 }

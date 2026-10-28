@@ -1,3 +1,4 @@
+import { Console } from "node:console";
 import { execFile, type ExecFileOptions } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -32,6 +33,60 @@ async function execute(command: string, args: string[], options: ExecFileOptions
     throw new Error(`Fixture command failed: ${String(error)}\n${stderr.slice(-8192)}`, { cause: error });
   }
 }
+
+type PostCommandStage = "initial" | "deletion";
+type PostCommandOperation = "git_extract" | "overlay_extract" | "delete_paths";
+type PostCommandEdge = "enter" | "exit";
+type PostCommandOutcome = "pending" | "resolved" | "rejected";
+
+let postCommandConsole: Console | null = null;
+try {
+  postCommandConsole = new Console({ stdout: process.stderr, stderr: process.stderr, ignoreErrors: true });
+} catch { /* Optional diagnostics must not affect fixture execution. */ }
+let postCommandRecordCount = 0;
+let postCommandByteCount = 0;
+
+function emitPostCommandObservation(
+  stage: PostCommandStage,
+  operation: PostCommandOperation,
+  edge: PostCommandEdge,
+  outcome: PostCommandOutcome,
+  elapsedMs: number | null,
+): void {
+  try {
+    if (!postCommandConsole || postCommandRecordCount >= 10) return;
+    const record = JSON.stringify({ event: "post_command_observation", stage, operation, edge, outcome, elapsedMs });
+    const byteLength = Buffer.byteLength(record, "utf8") + 1;
+    if (byteLength > 256 || postCommandByteCount + byteLength > 2560) return;
+    postCommandRecordCount += 1;
+    postCommandByteCount += byteLength;
+    postCommandConsole.log(record);
+  } catch { /* Optional diagnostics must not affect fixture execution. */ }
+}
+
+function readPostCommandClock(): number | null {
+  try {
+    const now = performance.now();
+    return Number.isFinite(now) ? now : null;
+  } catch { return null; }
+}
+
+function elapsedPostCommandMs(start: number | null): number | null {
+  if (start === null) return null;
+  const end = readPostCommandClock();
+  if (end === null) return null;
+  const rawElapsed = end - start;
+  if (!Number.isFinite(rawElapsed) || rawElapsed < 0) return null;
+  const elapsed = Math.round(rawElapsed);
+  return Number.isSafeInteger(elapsed) ? elapsed : null;
+}
+
+function postCommandOperation(stage: PostCommandStage, position: number): PostCommandOperation | null {
+  if (position === 0) return "git_extract";
+  if (position === 1) return "overlay_extract";
+  if (stage === "deletion" && position === 2) return "delete_paths";
+  return null;
+}
 const directories: string[] = [];
 const snapshots: GitWorkspaceSnapshot[] = [];
 const runtimes: PreparedSandboxManagedRuntime[] = [];
@@ -42,7 +97,7 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) await fs.rm(directory, { recursive: true, force: true });
 }, 60_000);
 
-function localClient(commands: string[]): SandboxManagedRuntimeClient {
+function localClient(commands: string[], stage: PostCommandStage): SandboxManagedRuntimeClient {
   return {
     makeDir: async (dir) => { await fs.mkdir(dir, { recursive: true }); },
     writeFile: async (file, bytes) => { await fs.writeFile(file, Buffer.from(bytes)); },
@@ -63,9 +118,20 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
           const copyFailure = copyResults.find((result) => result.status === "rejected");
           if (copyFailure) throw copyFailure.reason;
         }
+        let commandPosition = 0;
         for (const command of operation.postUploadCommands ?? []) {
+          const label = postCommandOperation(stage, commandPosition);
+          commandPosition += 1;
           commands.push(command.command);
-          await execute("sh", ["-c", command.command], { maxBuffer: 64 * 1024, timeout: command.timeoutMs });
+          if (label) emitPostCommandObservation(stage, label, "enter", "pending", null);
+          const start = label ? readPostCommandClock() : null;
+          try {
+            await execute("sh", ["-c", command.command], { maxBuffer: 64 * 1024, timeout: command.timeoutMs });
+          } catch (error) {
+            if (label) emitPostCommandObservation(stage, label, "exit", "rejected", elapsedPostCommandMs(start));
+            throw error;
+          }
+          if (label) emitPostCommandObservation(stage, label, "exit", "resolved", elapsedPostCommandMs(start));
         }
       }
       return { operations: [] };
@@ -77,12 +143,51 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
 const realGitTimeoutMs = process.platform === "darwin" ? 300_000 : 180_000;
 it("streams and stages all four real Git filename lanes above 32 MiB through the shared scheduler", async () => {
   const diagnosticStartedAt = performance.now();
+  let diagnosticRecordCount = 0;
+  let diagnosticBytes = 0;
+  const emitDiagnostic = (record: object) => {
+    try {
+      const line = JSON.stringify(record);
+      const bytes = Buffer.byteLength(line) + 1;
+      if (diagnosticRecordCount >= 18 || diagnosticBytes + bytes > 4096) return;
+      console.log(line);
+      diagnosticRecordCount++;
+      diagnosticBytes += bytes;
+    } catch {
+      // Diagnostics must not change the fixture's result or error.
+    }
+  };
   const observePhase = (phase: StreamDiagnosticPhase) => {
-    console.log(JSON.stringify({
+    emitDiagnostic({
       event: "native_stream_bounded_diagnostic",
       phase,
       elapsedMs: Math.floor(performance.now() - diagnosticStartedAt),
-    }));
+    });
+  };
+  const timeExistingSpan = <T>(stage: "initial" | "deletion", name: string, work: () => Promise<T>): Promise<T> => {
+    const span = name === "snapshot.baseline" ? "baseline"
+      : name === "pack" ? "pack"
+      : name === "stage.workspace" ? "workspace"
+      : null;
+    if (span === null) return work();
+    let startedAt: number | undefined;
+    try { startedAt = performance.now(); } catch { /* Optional timing only. */ }
+    return (async () => {
+      try {
+        return await work();
+      } finally {
+        try {
+          if (startedAt !== undefined) {
+            const elapsedMs = Math.floor(performance.now() - startedAt);
+            if (Number.isFinite(elapsedMs) && elapsedMs >= 0) {
+              emitDiagnostic({ event: "native_stream_stage_diagnostic", stage, span, elapsedMs });
+            }
+          }
+        } catch {
+          // Diagnostic timing must not replace the awaited span's result or error.
+        }
+      }
+    })();
   };
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "pc-stream-git-")));
   directories.push(root);
@@ -172,15 +277,16 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   await fs.writeFile(path.join(parent, "late.js"), "must not stage");
   const commands: string[] = [];
   const remote = path.join(root, "remote");
-  const stage = async (gitSnapshot: GitWorkspaceSnapshot) => {
+  const stage = async (gitSnapshot: GitWorkspaceSnapshot, stageLabel: "initial" | "deletion") => {
     const runtime = await prepareSandboxManagedRuntime({
       spec: { transport: "sandbox", provider: "test", sandboxId: "test", remoteCwd: remote, timeoutMs: 120_000, apiKey: null },
-      client: localClient(commands), adapterKey: "stream-test", workspaceLocalDir: repo, workspaceGitSnapshot: gitSnapshot,
+      client: localClient(commands, stageLabel), adapterKey: "stream-test", workspaceLocalDir: repo, workspaceGitSnapshot: gitSnapshot,
+      runtimeSpan: (name, work) => timeExistingSpan(stageLabel, name, work),
     });
     runtimes.push(runtime);
     return runtime;
   };
-  const runtime = await stage(snapshot);
+  const runtime = await stage(snapshot, "initial");
   observePhase(StreamDiagnosticPhase.StageReady);
   const remoteParent = path.join(remote, path.relative(repo, parent));
   const shortRemoteParent = path.join(root, "staged-check");
@@ -257,7 +363,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   observePhase(StreamDiagnosticPhase.FixtureDeletionComplete);
   const deleted = await scan();
   checkLargeLane(deleted.deletedPaths);
-  await stage(deleted);
+  await stage(deleted, "deletion");
   let remaining = 0;
   for await (const _entry of await fs.opendir(remoteParent)) remaining++;
   expect(remaining).toBe(0);

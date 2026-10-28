@@ -4,7 +4,8 @@
 
 ### Patch Changes
 
-- Add opt-in bounded company portability test lifecycle diagnostics via `PAPERCLIP_TEST_COMPANY_PORTABILITY_PHASE_OUTPUT`.
+- Extend opt-in company portability diagnostics with bounded startup timings around the fixed `startup-workspace-prerequisites`, `startup-server-import`, and `startup-server-start` calls. The child emits at most six fixed-name outcome and elapsed-time frames only when the dedicated test flag is enabled; `enter` frames use elapsed time zero, and the fixture accepts only closed, canonical, ordered frames as setup observations.
+  Artifacts retain the existing limits of 38 observations, 256 UTF-8 bytes per observation, and 8,192 UTF-8 bytes total, with elapsed times bounded to 0–3,600,000 ms. No raw errors or raw child stdout/stderr are included in the artifact; these timings do not diagnose startup cause.
 
 ## 0.3.1
 

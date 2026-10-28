@@ -3,8 +3,12 @@
 ## Unreleased
 
 ### Patch Changes
-- Select an 8 KiB bounded read buffer for baseline hashing of files observed at 64 KiB or smaller, while continuing to hash each stream through EOF; larger files retain the default stream buffer. This reduces small-file stream buffer allocation without changing snapshot content or claiming a measured speedup.
+- Hash files observed at 64 KiB or smaller with sequential reads into one fixed 8 KiB buffer through actual EOF, while larger files retain streaming; no size-based allocation or read limit is introduced, and no speedup is claimed.
+- Admit small-file snapshot hashes through an ordered rolling queue of at most four capture-local 8 KiB slots; consume only the head and reuse its slot after awaited close and consumer resumption, while draining owned work before failures or traversal boundaries. No speedup or CI qualification is claimed.
+- Encode NUL-delimited records directly into the existing 64 KiB chunk when each UTF-8 record fits, retaining byte-splitting fallback and write boundaries for larger records; no speedup is claimed.
+- Add bounded test-only timings for the existing baseline snapshot, nested pack, and workspace staging spans in the full streaming fixture, labeled for initial and deletion stages. Diagnostics retain the original phase records and do not claim isolated span cost, cause, performance improvement, or CI qualification.
 - Reuse each selected workspace overlay entry's checked `lstat` result for its staging copy, removing a duplicate source metadata lookup without changing path checks or copy semantics; no benchmark result is claimed.
+- Skip the final removal request for a staged workspace file after its awaited rename succeeds; initial and failure cleanup remain unchanged, and no speedup is claimed.
 
 - Write staging tar-entry and deleted-path NUL lists in bounded 64 KiB chunks instead of one filesystem write per filename, retaining exact filename bytes, path validation, ordered extraction/deletion, and awaited cleanup; no elapsed-time improvement is claimed.
 

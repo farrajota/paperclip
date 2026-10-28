@@ -836,6 +836,17 @@ async function writeNulDelimitedFile(
     const chunk = Buffer.alloc(WORKSPACE_STREAM_CHUNK_BYTES);
     let used = 0;
     for await (const entry of entries) {
+      const recordBytes = Buffer.byteLength(entry, "utf8") + 1;
+      if (recordBytes <= chunk.length - used) {
+        used += chunk.write(entry, used, recordBytes - 1, "utf8");
+        chunk[used++] = 0;
+        if (used === chunk.length) {
+          await file.writeFile(chunk);
+          used = 0;
+        }
+        continue;
+      }
+
       const record = Buffer.from(`${entry}\0`);
       let offset = 0;
       while (offset < record.length) {
@@ -919,14 +930,18 @@ async function copyWorkspaceEntry(
 
   const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
   await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+  let published = false;
   try {
     await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, stagedTargetPath);
     });
     await fs.chmod(stagedTargetPath, stats.mode);
     await fs.rename(stagedTargetPath, targetPath);
+    published = true;
   } finally {
-    await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    if (!published) {
+      await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
