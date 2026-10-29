@@ -14,6 +14,7 @@
 - Write staging tar-entry and deleted-path NUL lists in bounded 64 KiB chunks instead of one filesystem write per filename, retaining exact filename bytes, path validation, ordered extraction/deletion, and awaited cleanup; no elapsed-time improvement is claimed.
 
 - Validate each opened Linux ancestor path descriptor as a directory before advancing workspace and device-login credential reads, preserving existing leaf validation and descriptor cleanup.
+- Partially evaluate bounded immutable single-segment workspace exclusions, omit only root-only patterns subsumed by the same literal segment, and reuse one bounded parent-prefix match; ambiguous and other patterns retain the original matcher, including empty-segment behavior. No measured speedup or CI qualification is claimed.
 
 - Restore the server's declared MCP SDK and HTTP-injection dependencies to the pinned workspace lockfile so the stable-based fork installs with `pnpm@9.15.4 --frozen-lockfile`; runtime dependency declarations are unchanged.
 

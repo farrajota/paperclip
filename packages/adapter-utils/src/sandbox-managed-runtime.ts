@@ -1001,7 +1001,77 @@ async function copySelectedWorkspaceEntries(input: {
   };
   await assertSourceRoot();
   const ignored = workspacePathMatcher(input.ignoredPaths);
-  // Cache only bounded path spellings; every entry still checks live metadata.
+  // Partially evaluate only bounded, immutable lexical exclusions. Oversized
+  // inputs retain the original predicate path without changing selection.
+  const MAX_EXCLUDE_PATTERNS = 128;
+  const MAX_EXCLUDE_SEGMENT_LENGTH = 256;
+  const MAX_PARENT_PREFIX_LENGTH = 4096;
+  let lexicalSegments: Set<string> | undefined;
+  let remainingExcludes: string[] | undefined;
+  if (input.exclude.length <= MAX_EXCLUDE_PATTERNS) {
+    const segments = new Set<string>();
+    const remaining: string[] = [];
+    let eligible = true;
+    for (const pattern of input.exclude) {
+      if (pattern.startsWith("*/") && pattern.endsWith("/*")) {
+        const segment = pattern.slice(2, -2);
+        if (segment.length > 0 && !segment.includes("/")) {
+          if (segment.length > MAX_EXCLUDE_SEGMENT_LENGTH) { eligible = false; break; }
+          segments.add(segment);
+          continue;
+        }
+      } else if (pattern.startsWith("*/")) {
+        const segment = pattern.slice(2);
+        if (segment.length > 0 && !segment.includes("/")) {
+          if (segment.length > MAX_EXCLUDE_SEGMENT_LENGTH) { eligible = false; break; }
+          segments.add(segment);
+          continue;
+        }
+      }
+      remaining.push(pattern);
+    }
+    if (eligible) {
+      let retainedCount = 0;
+      for (const pattern of remaining) {
+        // Keep */ patterns in the original matcher; for example, */* matches internal empty segments.
+        if (pattern.startsWith("*/")) {
+          remaining[retainedCount++] = pattern;
+          continue;
+        }
+        const root = pattern.endsWith("/*") ? pattern.slice(0, -2) : pattern;
+        if (!segments.has(root)) remaining[retainedCount++] = pattern;
+      }
+      remaining.length = retainedCount;
+      lexicalSegments = segments;
+      remainingExcludes = remaining;
+    }
+  }
+  let cachedParentPrefix: string | undefined;
+  let cachedParentExcluded = false;
+  const parentMatchesLexicalSegment = (parent: string): boolean => {
+    if (!lexicalSegments) return false;
+    for (const segment of lexicalSegments) {
+      let start = 0;
+      while (start < parent.length) {
+        const end = parent.indexOf("/", start);
+        const segmentEnd = end < 0 ? parent.length : end;
+        if (segmentEnd - start === segment.length && parent.startsWith(segment, start)) return true;
+        if (end < 0) break;
+        start = end + 1;
+      }
+    }
+    return false;
+  };
+  const pathMatchesLexicalSegment = (relative: string, parentLength: number): boolean => {
+    if (!lexicalSegments) return false;
+    const basenameStart = parentLength < 0 ? 0 : parentLength + 1;
+    const basenameLength = relative.length - basenameStart;
+    for (const segment of lexicalSegments) {
+      if (basenameLength === segment.length && relative.startsWith(segment, basenameStart)) return true;
+    }
+    return false;
+  };
+  // Cache only one bounded parent spelling and its pure predicate result.
   let cachedParent: {
     directory: string;
     segments: readonly string[];
@@ -1081,7 +1151,23 @@ async function copySelectedWorkspaceEntries(input: {
   };
   try {
     for (const relative of workspacePaths(input.relativePaths)) {
-      if (shouldExcludePath(relative, input.exclude) || ignored.matches(relative)) continue;
+      const parentLength = relative.lastIndexOf("/");
+      let excluded: boolean;
+      if (!lexicalSegments || !remainingExcludes || parentLength > MAX_PARENT_PREFIX_LENGTH) {
+        excluded = shouldExcludePath(relative, input.exclude);
+      } else {
+        if (parentLength < 0) {
+          excluded = pathMatchesLexicalSegment(relative, parentLength) || shouldExcludePath(relative, remainingExcludes);
+        } else {
+          if (cachedParentPrefix === undefined || cachedParentPrefix.length !== parentLength || !relative.startsWith(cachedParentPrefix)) {
+            cachedParentPrefix = relative.slice(0, parentLength);
+            cachedParentExcluded = parentMatchesLexicalSegment(cachedParentPrefix);
+          }
+          excluded = cachedParentExcluded || pathMatchesLexicalSegment(relative, parentLength) ||
+            shouldExcludePath(relative, remainingExcludes);
+        }
+      }
+      if (excluded || ignored.matches(relative)) continue;
       batch.push(relative);
       // Keep manifest consumption and filesystem work bounded to four entries.
       if (batch.length === 4) await copyBatch();

@@ -380,10 +380,22 @@ describe("sandbox callback bridge", () => {
     const directories = sandboxCallbackBridgeDirectories(queueDir);
     const processed: string[] = [];
     let pollCount = 0;
-    const { promise: firstPoll, resolve: signalFirstPoll } = Promise.withResolvers<void>();
-    const { promise: secondPoll, resolve: signalSecondPoll } = Promise.withResolvers<void>();
-    const { promise: stalePollFinished, resolve: finishStalePoll } = Promise.withResolvers<void>();
-    const { promise: firstRequestReleased, resolve: releaseFirstRequest } = Promise.withResolvers<void>();
+    let signalFirstPoll!: () => void;
+    const firstPoll = new Promise<void>((resolve) => {
+      signalFirstPoll = resolve;
+    });
+    let signalSecondPoll!: () => void;
+    const secondPoll = new Promise<void>((resolve) => {
+      signalSecondPoll = resolve;
+    });
+    let finishStalePoll!: () => void;
+    const stalePollFinished = new Promise<void>((resolve) => {
+      finishStalePoll = resolve;
+    });
+    let releaseFirstRequest!: () => void;
+    const firstRequestReleased = new Promise<void>((resolve) => {
+      releaseFirstRequest = resolve;
+    });
     const baseClient = createFileSystemSandboxCallbackBridgeQueueClient();
     const worker = await startSandboxCallbackBridgeWorker({
       client: {

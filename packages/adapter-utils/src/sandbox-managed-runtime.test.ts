@@ -1221,6 +1221,18 @@ describe("sandbox managed runtime", () => {
       "utf8",
     );
     await writeFile(path.join(localWorkspaceDir, "src", "local-only.ts"), "export const local = true;\n", "utf8");
+    await mkdir(path.join(localWorkspaceDir, "packages", "ui", "literal[1]"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, "packages", "ui", "literal1"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, "packages", "ui", "multi", "path"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, "packages", "ui", "multi", "path-sibling"), { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "literal[1]", "drop.txt"), "excluded literal segment\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "literal1", "keep.txt"), "retained literal sibling\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "multi", "path", "drop.txt"), "excluded multisegment path\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "multi", "path-sibling", "keep.txt"), "retained multisegment sibling\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "fallback.txt"), "excluded remaining pattern\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "fallback-sibling.txt"), "retained remaining sibling\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "empty-segment.txt"), "excluded empty-segment spelling\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "empty-segment-sibling.txt"), "retained empty-segment sibling\n", "utf8");
 
     const uploadedTars: { remotePath: string; bytes: Buffer }[] = [];
     const downloadedTars: { remotePath: string; bytes: Buffer }[] = [];
@@ -1249,6 +1261,8 @@ describe("sandbox managed runtime", () => {
     };
 
     attachFallbackSyncIn(client);
+    const workspaceGitSnapshot = await gitSync.readGitWorkspaceSnapshot(localWorkspaceDir);
+    if (!workspaceGitSnapshot) throw new Error("Expected a Git-backed workspace snapshot");
     const prepared = await prepareSandboxManagedRuntime({
       spec: {
         transport: "sandbox",
@@ -1261,6 +1275,8 @@ describe("sandbox managed runtime", () => {
       adapterKey: "test-adapter",
       client,
       workspaceLocalDir: localWorkspaceDir,
+      workspaceGitSnapshot,
+      workspaceExclude: ["*/literal[1]", "literal[1]", "literal[1]/*", "*/multi/path", "packages/ui/fallback.txt"],
     });
 
     const workspaceUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
@@ -1269,6 +1285,14 @@ describe("sandbox managed runtime", () => {
     expect(workspaceMembers).toContain("src/local-only.ts");
     expect(workspaceMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
     expect(workspaceMembers.some((entry) => entry.includes("/node_modules/") || entry.endsWith("/node_modules"))).toBe(false);
+    expect(workspaceMembers).toContain("packages/ui/literal1/keep.txt");
+    expect(workspaceMembers).not.toContain("packages/ui/literal[1]/drop.txt");
+    expect(workspaceMembers).toContain("packages/ui/multi/path-sibling/keep.txt");
+    expect(workspaceMembers).not.toContain("packages/ui/multi/path/drop.txt");
+    expect(workspaceMembers).toContain("packages/ui/fallback-sibling.txt");
+    expect(workspaceMembers).not.toContain("packages/ui/fallback.txt");
+    expect(workspaceMembers).toContain("packages/ui/empty-segment-sibling.txt");
+    expect(workspaceMembers).toContain("packages/ui/empty-segment.txt");
 
     await expect(readFile(path.join(remoteWorkspaceDir, "src", "local-only.ts"), "utf8")).resolves.toBe("export const local = true;\n");
     await expect(readFile(path.join(remoteWorkspaceDir, "node_modules", "root-package", "cache.bin"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
@@ -1300,6 +1324,40 @@ describe("sandbox managed runtime", () => {
     expect(downloadMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry.includes("/node_modules/") || entry.endsWith("/node_modules"))).toBe(false);
+
+    // Exercise the legacy array spelling inbound only: these patterns have a
+    // different wildcard meaning to the real outbound tar consumer.
+    const legacySnapshot = await gitSync.readGitWorkspaceSnapshot(localWorkspaceDir);
+    if (!legacySnapshot) throw new Error("Expected a Git-backed workspace snapshot");
+    legacySnapshot.overlayPaths = [
+      "packages/ui//empty-segment.txt",
+      "packages/ui/empty-segment-sibling.txt",
+    ];
+    const priorUploadCount = uploadedTars.length;
+    const legacyPrepared = await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-1",
+        remoteCwd: path.join(rootDir, "legacy-remote-workspace"),
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+      workspaceGitSnapshot: legacySnapshot,
+      workspaceExclude: ["*/*", "*/*/*"],
+    });
+    try {
+      const legacyUpload = uploadedTars.slice(priorUploadCount).find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
+      expect(legacyUpload).toBeDefined();
+      const legacyMembers = await listTarMembers(rootDir, "legacy-workspace-upload.tar", legacyUpload!.bytes);
+      expect(legacyMembers).toContain("packages/ui/empty-segment-sibling.txt");
+      expect(legacyMembers).not.toContain("packages/ui/empty-segment.txt");
+    } finally {
+      await legacyPrepared.cleanupWorkspaceSnapshot();
+    }
   });
 
   it.each(["symlink", "root_symlink", "root_alias", "root_alias_retarget", "case_alias", "EACCES", "EIO", "ENOENT"])("handles an overlay source changed after the snapshot: %s", async (change) => {
