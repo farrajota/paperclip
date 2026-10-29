@@ -908,6 +908,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   let inFlight = 0;
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
+  let stopNeedsFreshPoll = false;
   let settleResolve: (() => void) | null = null;
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
@@ -1573,13 +1574,20 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // (including the guard's own backstop and abort timers).
         const actionableFileNames = fileNames.filter((fileName) => !inFlightRequestGuards.has(fileName));
         if (actionableFileNames.length === 0) {
-          lastSuccessfulIterationAt = Date.now();
           if (stopping) {
+            // A listing already in flight when stop was requested can return an
+            // empty snapshot from before queued requests were committed. Confirm
+            // that snapshot with one fresh poll before ending the drain.
+            if (stopNeedsFreshPoll && Date.now() < stopDeadline) {
+              stopNeedsFreshPoll = false;
+              continue;
+            }
             break;
           }
           await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
           continue;
         }
+        stopNeedsFreshPoll = false;
         for (const fileName of actionableFileNames) {
           if (stopping && Date.now() >= stopDeadline) break;
           inFlight += 1;
@@ -1655,6 +1663,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   return {
     stop: async (options = {}) => {
       stopping = true;
+      stopNeedsFreshPoll = true;
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
       if (!settled) {
