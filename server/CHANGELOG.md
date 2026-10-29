@@ -9,6 +9,7 @@
 - Add bounded test-only timings for the existing baseline snapshot, nested pack, and workspace staging spans in the full streaming fixture, labeled for initial and deletion stages. Diagnostics retain the original phase records and do not claim isolated span cost, cause, performance improvement, or CI qualification.
 - Reuse each selected workspace overlay entry's checked `lstat` result for its staging copy, removing a duplicate source metadata lookup without changing path checks or copy semantics; no benchmark result is claimed.
 - Skip the final removal request for a staged workspace file after its awaited rename succeeds; initial and failure cleanup remain unchanged, and no speedup is claimed.
+- Group disk-manifest ignore membership into category-scoped queries over up to four exact path prefixes, preserving literal matching across deeper ancestors; no speedup or CI qualification is claimed.
 
 - Write staging tar-entry and deleted-path NUL lists in bounded 64 KiB chunks instead of one filesystem write per filename, retaining exact filename bytes, path validation, ordered extraction/deletion, and awaited cleanup; no elapsed-time improvement is claimed.
 
