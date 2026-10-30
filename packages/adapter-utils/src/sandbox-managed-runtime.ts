@@ -668,7 +668,7 @@ function buildRemoveDeletedPathsCommand(input: { remoteDir: string; manifestPath
   // one argument list for the full snapshot. Refuse symlink ancestors.
   const remove = `for entry do
     parent=$entry
-    while [ "\${parent#*/}" != "$parent" ]; do
+    while case "$parent" in */*) : ;; *) ! : ;; esac; do
       parent=\${parent%/*}
       if [ -L "$parent" ] || { [ -e "$parent" ] && [ ! -d "$parent" ]; }; then exit 42; fi
     done
