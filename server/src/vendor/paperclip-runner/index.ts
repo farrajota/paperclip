@@ -64,71 +64,160 @@ export type DurablePrpControlPlane =
 export type PaperclipSemanticDispatcher =
   import("@paperclipai/paperclip-runner").PaperclipSemanticDispatcher;
 
-const sourceUrl = new URL(
-  "../../../../packages/paperclip-runner/src/index.ts",
+const sourceRootUrl = new URL(
+  "../../../../packages/paperclip-runner/src/",
   import.meta.url,
 );
-const runner = (await import(sourceUrl.href)) as RunnerModule;
 
-export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
-export const runnerCodexDynamicToolsFit = runner.runnerCodexDynamicToolsFit;
-export const inspectWarmRunTransition = runner.inspectWarmRunTransition;
-export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
+function loadRunnerSource<K extends keyof RunnerModule>(
+  relativePath: string,
+): Promise<Pick<RunnerModule, K>> {
+  return import(new URL(relativePath, sourceRootUrl).href) as Promise<
+    Pick<RunnerModule, K>
+  >;
+}
+
+const [
+  controlPlane,
+  runnerdTransport,
+  backendContracts,
+  semanticDispatcher,
+  semanticCatalog,
+  harnessContracts,
+  runtimeContext,
+  acpxRecovery,
+  backendFactory,
+  codexBackend,
+  authorizedTools,
+  sessionRuntime,
+  resultNormalization,
+  codexTurnDiff,
+  executionContracts,
+  questionContracts,
+  acpxProfiles,
+  replayContracts,
+] = await Promise.all([
+  loadRunnerSource<
+    | "inspectWarmRunTransition"
+    | "DurablePrpControlPlane"
+  >("control-plane/durable-prp-control-plane.ts"),
+  loadRunnerSource<
+    | "readRunnerdArtifactBinding"
+    | "retainedRunnerdMaintenanceIsIdle"
+    | "drainRetainedRunnerdMaintenanceOperations"
+    | "settleRetainedRunnerdSession"
+    | "runnerCodexDynamicToolsFit"
+    | "resolveSourceCodexHome"
+    | "defaultCapabilityRunnerdBinary"
+    | "createRunnerdCodexTransport"
+  >("live/runnerd-codex-transport.ts"),
+  loadRunnerSource<
+    | "nativeRestartInterruptedTurnId"
+    | "SemanticToolOutcomeUnknownError"
+    | "NativeSessionProtocolIntegrityError"
+    | "NativeSessionCleanupQuarantinedError"
+    | "NativeProviderTerminalFailure"
+  >("contracts/native-session-backend.ts"),
+  loadRunnerSource<"PaperclipSemanticDispatcher">("semantic-tools/paperclip-dispatcher.ts"),
+  loadRunnerSource<"CAPABILITY_SEMANTIC_TOOL_CATALOG">("semantic-tools/catalog.ts"),
+  loadRunnerSource<
+    | "HarnessRuntimeRequestResolutionError"
+    | "parseHarnessRuntimeRequestResolution"
+  >("contracts/harness-driver.ts"),
+  loadRunnerSource<
+    | "NATIVE_RUNTIME_ASSET_SCHEMA"
+    | "PAPERCLIP_EXECUTION_PROMPT"
+    | "PAPERCLIP_EXECUTION_PROMPT_REVISION"
+    | "canonicalNativeRuntimeContextDigest"
+    | "nativeRuntimePromptDigest"
+    | "parseNativeRuntimeContext"
+  >("contracts/runtime-context.ts"),
+  loadRunnerSource<"acpxRuntimeSessionDirectoryName">("drivers/acpx/recovery-identity.ts"),
+  loadRunnerSource<"createNativeSessionBackend">("backends/native-backend-factory.ts"),
+  loadRunnerSource<"describeRunnerdNativeSessionBackend">("backends/codex-native-backend.ts"),
+  loadRunnerSource<"createPaperclipRunnerAuthorizedToolSet">("semantic-tools/runner-authorized-tools.ts"),
+  loadRunnerSource<
+    | "completeRetainedNativeSessionCleanup"
+    | "completeTerminatedRemoteNativeSessionCleanup"
+    | "completeTerminatedLocalNativeSessionCleanup"
+    | "applyNativeSessionGoalControl"
+    | "executeNativeSession"
+  >("native-session-runtime.ts"),
+  loadRunnerSource<"normalizePrpResultSignals">("protocol/result-normalization.ts"),
+  loadRunnerSource<"parseCodexTurnDiff">("drivers/codex/codex-turn-diff.ts"),
+  loadRunnerSource<"parseNativeExecutionInput">("contracts/native-execution.ts"),
+  loadRunnerSource<
+    | "parsePaperclipQuestionSet"
+    | "parsePaperclipQuestionResponse"
+  >("contracts/question-set.ts"),
+  loadRunnerSource<"resolveQualifiedAcpxProfile">("drivers/acpx/qualified-profiles.ts"),
+  loadRunnerSource<
+    | "validatePrpEvent"
+    | "validatePrpStructuredRunResult"
+  >("protocol/replay-contract.ts"),
+  // Preserve canonical operation validation without loading unused aggregate APIs.
+  import(new URL("catalog/canonical-operations.ts", sourceRootUrl).href),
+]);
+
+export const DurablePrpControlPlane = controlPlane.DurablePrpControlPlane;
+export const runnerCodexDynamicToolsFit = runnerdTransport.runnerCodexDynamicToolsFit;
+export const inspectWarmRunTransition = controlPlane.inspectWarmRunTransition;
+export const readRunnerdArtifactBinding = runnerdTransport.readRunnerdArtifactBinding;
 export const NativeSessionCleanupQuarantinedError =
-  runner.NativeSessionCleanupQuarantinedError;
+  backendContracts.NativeSessionCleanupQuarantinedError;
 export const NativeSessionProtocolIntegrityError =
-  runner.NativeSessionProtocolIntegrityError;
-export const SemanticToolOutcomeUnknownError = runner.SemanticToolOutcomeUnknownError;
-export const PaperclipSemanticDispatcher = runner.PaperclipSemanticDispatcher;
+  backendContracts.NativeSessionProtocolIntegrityError;
+export const SemanticToolOutcomeUnknownError = backendContracts.SemanticToolOutcomeUnknownError;
+export const PaperclipSemanticDispatcher = semanticDispatcher.PaperclipSemanticDispatcher;
 export const CAPABILITY_SEMANTIC_TOOL_CATALOG =
-  runner.CAPABILITY_SEMANTIC_TOOL_CATALOG;
+  semanticCatalog.CAPABILITY_SEMANTIC_TOOL_CATALOG;
 export const HarnessRuntimeRequestResolutionError =
-  runner.HarnessRuntimeRequestResolutionError;
-export const NATIVE_RUNTIME_ASSET_SCHEMA = runner.NATIVE_RUNTIME_ASSET_SCHEMA;
-export const PAPERCLIP_EXECUTION_PROMPT = runner.PAPERCLIP_EXECUTION_PROMPT;
+  harnessContracts.HarnessRuntimeRequestResolutionError;
+export const NATIVE_RUNTIME_ASSET_SCHEMA = runtimeContext.NATIVE_RUNTIME_ASSET_SCHEMA;
+export const PAPERCLIP_EXECUTION_PROMPT = runtimeContext.PAPERCLIP_EXECUTION_PROMPT;
 export const PAPERCLIP_EXECUTION_PROMPT_REVISION =
-  runner.PAPERCLIP_EXECUTION_PROMPT_REVISION;
+  runtimeContext.PAPERCLIP_EXECUTION_PROMPT_REVISION;
 export const acpxRuntimeSessionDirectoryName =
-  runner.acpxRuntimeSessionDirectoryName;
+  acpxRecovery.acpxRuntimeSessionDirectoryName;
 export const canonicalNativeRuntimeContextDigest =
-  runner.canonicalNativeRuntimeContextDigest;
-export const createNativeSessionBackend = runner.createNativeSessionBackend;
-export const describeRunnerdNativeSessionBackend = runner.describeRunnerdNativeSessionBackend;
+  runtimeContext.canonicalNativeRuntimeContextDigest;
+export const createNativeSessionBackend = backendFactory.createNativeSessionBackend;
+export const describeRunnerdNativeSessionBackend = codexBackend.describeRunnerdNativeSessionBackend;
 export const createPaperclipRunnerAuthorizedToolSet =
-  runner.createPaperclipRunnerAuthorizedToolSet;
+  authorizedTools.createPaperclipRunnerAuthorizedToolSet;
 export const createRunnerdCodexTransport: (
   options?: import("@paperclipai/paperclip-runner").RunnerdCodexTransportOptions,
 ) => import("@paperclipai/paperclip-runner").RunnerdCodexTransport =
-  runner.createRunnerdCodexTransport;
+  runnerdTransport.createRunnerdCodexTransport;
 export const defaultCapabilityRunnerdBinary =
-  runner.defaultCapabilityRunnerdBinary;
-export const executeNativeSession = runner.executeNativeSession;
+  runnerdTransport.defaultCapabilityRunnerdBinary;
+export const executeNativeSession = sessionRuntime.executeNativeSession;
 export const applyNativeSessionGoalControl =
-  runner.applyNativeSessionGoalControl;
-export const completeRetainedNativeSessionCleanup = runner.completeRetainedNativeSessionCleanup;
-export const settleRetainedRunnerdSession = runner.settleRetainedRunnerdSession;
+  sessionRuntime.applyNativeSessionGoalControl;
+export const completeRetainedNativeSessionCleanup = sessionRuntime.completeRetainedNativeSessionCleanup;
+export const settleRetainedRunnerdSession = runnerdTransport.settleRetainedRunnerdSession;
 export const retainedRunnerdMaintenanceIsIdle =
-  runner.retainedRunnerdMaintenanceIsIdle;
+  runnerdTransport.retainedRunnerdMaintenanceIsIdle;
 export const drainRetainedRunnerdMaintenanceOperations =
-  runner.drainRetainedRunnerdMaintenanceOperations;
-export const nativeRuntimePromptDigest = runner.nativeRuntimePromptDigest;
-export const normalizePrpResultSignals = runner.normalizePrpResultSignals;
-export const parseCodexTurnDiff = runner.parseCodexTurnDiff;
+  runnerdTransport.drainRetainedRunnerdMaintenanceOperations;
+export const nativeRuntimePromptDigest = runtimeContext.nativeRuntimePromptDigest;
+export const normalizePrpResultSignals = resultNormalization.normalizePrpResultSignals;
+export const parseCodexTurnDiff = codexTurnDiff.parseCodexTurnDiff;
 export const parseHarnessRuntimeRequestResolution =
-  runner.parseHarnessRuntimeRequestResolution;
-export const parseNativeExecutionInput = runner.parseNativeExecutionInput;
-export const parseNativeRuntimeContext = runner.parseNativeRuntimeContext;
-export const parsePaperclipQuestionSet = runner.parsePaperclipQuestionSet;
+  harnessContracts.parseHarnessRuntimeRequestResolution;
+export const parseNativeExecutionInput = executionContracts.parseNativeExecutionInput;
+export const parseNativeRuntimeContext = runtimeContext.parseNativeRuntimeContext;
+export const parsePaperclipQuestionSet = questionContracts.parsePaperclipQuestionSet;
 export const parsePaperclipQuestionResponse =
-  runner.parsePaperclipQuestionResponse;
-export const resolveQualifiedAcpxProfile = runner.resolveQualifiedAcpxProfile;
-export const resolveSourceCodexHome = runner.resolveSourceCodexHome;
-export const validatePrpEvent = runner.validatePrpEvent;
+  questionContracts.parsePaperclipQuestionResponse;
+export const resolveQualifiedAcpxProfile = acpxProfiles.resolveQualifiedAcpxProfile;
+export const resolveSourceCodexHome = runnerdTransport.resolveSourceCodexHome;
+export const validatePrpEvent = replayContracts.validatePrpEvent;
 export const validatePrpStructuredRunResult =
-  runner.validatePrpStructuredRunResult;
+  replayContracts.validatePrpStructuredRunResult;
 
-export const NativeProviderTerminalFailure = runner.NativeProviderTerminalFailure;
-export const nativeRestartInterruptedTurnId = runner.nativeRestartInterruptedTurnId;
+export const NativeProviderTerminalFailure = backendContracts.NativeProviderTerminalFailure;
+export const nativeRestartInterruptedTurnId = backendContracts.nativeRestartInterruptedTurnId;
 
-export const completeTerminatedRemoteNativeSessionCleanup = runner.completeTerminatedRemoteNativeSessionCleanup;
-export const completeTerminatedLocalNativeSessionCleanup = runner.completeTerminatedLocalNativeSessionCleanup;
+export const completeTerminatedRemoteNativeSessionCleanup = sessionRuntime.completeTerminatedRemoteNativeSessionCleanup;
+export const completeTerminatedLocalNativeSessionCleanup = sessionRuntime.completeTerminatedLocalNativeSessionCleanup;

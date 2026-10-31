@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Patch Changes
+- Load the source-mode server runner shim from its canonical required modules instead of the aggregate runner entry, preserving existing exports and canonical operation validation. Compiled runner vendoring is unchanged; no startup timing or CI qualification is claimed.
 - Hash files observed at 64 KiB or smaller with sequential reads into one fixed 8 KiB buffer through actual EOF, while larger files retain streaming; no size-based allocation or read limit is introduced, and no speedup is claimed.
 - Admit small-file snapshot hashes through an ordered rolling queue of at most four capture-local 8 KiB slots; consume only the head and reuse its slot after awaited close and consumer resumption, while draining owned work before failures or traversal boundaries. No speedup or CI qualification is claimed.
 - Encode NUL-delimited records directly into the existing 64 KiB chunk when each UTF-8 record fits, retaining byte-splitting fallback and write boundaries for larger records; no speedup is claimed.
