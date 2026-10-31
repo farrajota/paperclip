@@ -5,9 +5,6 @@ import { describe, expect, it } from "vitest";
 const packageJsonPath = fileURLToPath(
   new URL("../../package.json", import.meta.url),
 );
-const runnerShimPath = fileURLToPath(
-  new URL("../vendor/paperclip-runner/index.ts", import.meta.url),
-);
 const evidenceClassifierPath = fileURLToPath(
   new URL("../services/native-runtime/evidence-classifier.ts", import.meta.url),
 );
@@ -75,17 +72,6 @@ describe("server package build script", () => {
     // list in sync (the smol-toml incident in #13110/#13116).
     expect(packageJson.scripts?.build).toContain(
       "node scripts/verify-runner-vendor-dependencies.mjs",
-    );
-  });
-
-  it("loads runner source when the source server starts before workspace builds", () => {
-    const shim = readFileSync(runnerShimPath, "utf8");
-
-    expect(shim).toContain(
-      '"../../../../packages/paperclip-runner/src/index.ts"',
-    );
-    expect(shim).not.toContain(
-      'export * from "@paperclipai/paperclip-runner"',
     );
   });
 

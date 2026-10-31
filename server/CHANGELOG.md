@@ -11,7 +11,7 @@
 - Reuse each selected workspace overlay entry's checked `lstat` result for its staging copy, removing a duplicate source metadata lookup without changing path checks or copy semantics; no benchmark result is claimed.
 - Skip the final removal request for a staged workspace file after its awaited rename succeeds; initial and failure cleanup remain unchanged, and no speedup is claimed.
 - Detect whether each deleted-path ancestor has a slash with POSIX `case` matching instead of prefix-removal expansion and string comparison; ancestor checks and per-path deletion remain ordered, with no speedup or CI qualification claimed.
-- Group disk-manifest ignore membership into category-scoped queries over up to four exact path prefixes, preserving literal matching across deeper ancestors; no speedup or CI qualification is claimed.
+- Group disk-manifest ignore membership into category-scoped queries over up to eight exact path prefixes, preserving literal matching across deeper ancestors; for an applicable 40,000-file pass where the leaf and four ancestors miss, this can avoid 40,000 JavaScript-to-SQLite query calls by fitting those candidates in one query instead of two. This is an inferred source-operation count, not a measured speedup or CI qualification.
 
 - Write staging tar-entry and deleted-path NUL lists in bounded 64 KiB chunks instead of one filesystem write per filename, retaining exact filename bytes, path validation, ordered extraction/deletion, and awaited cleanup; no elapsed-time improvement is claimed.
 
