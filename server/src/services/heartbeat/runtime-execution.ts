@@ -47,15 +47,13 @@ import { conflict } from "../../errors.js";
 import { getStartupTraceContext } from "../../instrumentation.js";
 import { logger } from "../../middleware/logger.js";
 import {
-  buildNativeProviderEnvironment,
-  executePaperclipNativeSession,
-  finalizeNativeRun,
-  isRunnerIngressAuthorized,
-  materializeLegacyQuestionResponseWakeProjection,
   NativeCancellationPendingRecoveryError,
   NativeControllerDetachedForRestartError,
-  recordNativeFinalizationFailure,
-} from "../native-runtime/index.js";
+} from "../native-runtime/native-session-errors.js";
+import type * as NativeSessionExecutor from "../native-runtime/native-session-executor.js";
+import { isRunnerIngressAuthorized } from "../native-runtime/runtime-mode.js";
+import { materializeLegacyQuestionResponseWakeProjection } from "../native-runtime/native-interaction-bridge.js";
+import { finalizeNativeRun, recordNativeFinalizationFailure } from "../native-runtime/native-run-finalizer.js";
 import {
   buildNativeHeartbeatPreparationSpans,
   buildNativeWakeIngressSpan,
@@ -94,11 +92,10 @@ import type { ProviderResourceDisposition } from "../environment-runtime.js";
 import type { NativeExecutionInput, NativeSessionBackend } from "../../vendor/paperclip-runner/index.js";
 import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import type { RealizedExecutionWorkspace } from "../workspace-runtime.js";
-import type { reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
 
 type Selection = HeartbeatRuntimeSelectionInput;
 type Selected = Extract<HeartbeatRuntimeSelectionResult, { selected: true }>;
-type NativeSessionInput = Parameters<typeof executePaperclipNativeSession>[0];
+type NativeSessionInput = Parameters<typeof NativeSessionExecutor.executePaperclipNativeSession>[0];
 type RunState = ReturnType<typeof createHeartbeatRunState>;
 type Lifecycle = ReturnType<typeof createHeartbeatLifecycle>;
 
@@ -134,7 +131,7 @@ export interface HeartbeatRuntimeExecutionInput {
   config: Pick<Selection["config"], "runtimeConfig" | "resolvedConfig" | "managedAiRuntime"> & {
     resolvedInstanceSettings: { experimental: Pick<Awaited<ReturnType<ReturnType<typeof instanceSettingsService>["getExperimental"]>>, "enableWorkspaceBranchReconcileForward" | "enableWorkspaceDirtyQuarantineRepair"> };
     configuredTaskEnvironment: Parameters<typeof configuredEnvironmentProjection>[0];
-    adapterEnv: Parameters<typeof buildNativeProviderEnvironment>[0];
+    adapterEnv: Parameters<typeof NativeSessionExecutor.buildNativeProviderEnvironment>[0];
     agentIdentity: AdapterExecutionContext["agentIdentity"];
     observability?: AdapterExecutionContext["observability"];
     runtimeEnv: Selection["runtimeEnv"];
@@ -153,7 +150,7 @@ export interface HeartbeatRuntimeExecutionInput {
     getInstructionSave: () => Record<string, unknown> | null;
     nativeInstructionWorkingCopy: () => NativeSessionInput["instructionWorkingCopy"];
     collectStoppedInstructions: AdapterExecutionContext["onProviderStopped"];
-    nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>>;
+    nativeInstructionReservation: Awaited<ReturnType<typeof NativeSessionExecutor.reserveWarmNativeInstructionDirectory>>;
     releaseInstructionCopy: () => Promise<void>;
   };
   trace: {
@@ -502,8 +499,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
   const runGoalControlRequestId = readNonEmptyString(
     context.goalControlRequestId,
   );
+  let nativeSessionExecutor: typeof NativeSessionExecutor | undefined;
   try {
     if (nativeRuntimeResolution.kind === "native") {
+      nativeSessionExecutor = await import("../native-runtime/native-session-executor.js");
       if (!nativeExecution || !nativeRunnerInstanceId)
         throw new Error("native_runtime_selection_not_persisted");
       const expectedNativeMcpDigest =
@@ -581,7 +580,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {
-            return executePaperclipNativeSession({
+            return nativeSessionExecutor!.executePaperclipNativeSession({
               casesEnabled: context.paperclipCasesEnabled === true,
               db,
               execution: nativeExecution,
@@ -645,7 +644,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               dotWorkspaceRoot: nativeExecution.provider.kind === "openai_dot" && resolvedConfig.dotWorkspaceAccess === true ? executionWorkspace.cwd : undefined,
               runnerEnvironment: {
                 ...configuredEnvironmentProjection(configuredTaskEnvironment),
-                ...buildNativeProviderEnvironment(
+                ...nativeSessionExecutor!.buildNativeProviderEnvironment(
                   adapterEnv,
                   process.env,
                   executionWorkspace.cwd,
@@ -1167,8 +1166,22 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         "failed to revoke heartbeat-run MCP gateway tokens",
       );
     }
-    await nativeInstructionReservation?.release();
-    await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+    try {
+      await nativeInstructionReservation?.release();
+    } catch (releaseErr) {
+      logger.warn(
+        { err: releaseErr, runId: run.id, companyId: agent.companyId },
+        "failed to release native instruction reservation",
+      );
+    }
+    try {
+      await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+    } catch (releaseErr) {
+      logger.warn(
+        { err: releaseErr, runId: run.id, companyId: agent.companyId },
+        "failed to release instruction working copy",
+      );
+    }
   }
   return { dispatched: true, adapterResult };
 }

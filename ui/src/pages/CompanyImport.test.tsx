@@ -504,16 +504,22 @@ describe("CompanyImport", () => {
 
     // Hold the last part so the visible upload progress can be observed.
     let resolveLastPart!: (value: { ok: true; index: number; alreadyCompleted: boolean }) => void;
+    let markLastPartStarted!: () => void;
+    const lastPartStarted = new Promise<void>((resolve) => {
+      markLastPartStarted = resolve;
+    });
     mockCompaniesApi.importTransferUploadPart.mockImplementation((_id: string, index: number) => {
       if (index === 0) return Promise.resolve({ ok: true, index, alreadyCompleted: false });
       return new Promise((resolve) => {
         resolveLastPart = resolve;
+        markLastPartStarted();
       });
     });
 
     await renderPage();
     await chooseLocalZip(buildLargeZipFile());
     await clickButton((text) => text === "Preview import");
+    await lastPartStarted;
     await vi.waitFor(() => {
       expect(mockCompaniesApi.importTransferUploadPart).toHaveBeenCalledTimes(2);
     });
@@ -580,14 +586,21 @@ describe("CompanyImport", () => {
   it("retries a failed part before surfacing the error panel, keeping the transfer resumable", async () => {
     mockReadZipArchive.mockResolvedValue({ rootPath: "big-package", files: previewFiles });
     mockCompaniesApi.importTransferCreate.mockResolvedValue(buildTransferCreated([0, 1]));
+    // Hashing precedes the upload; synchronize at the actual I/O boundary.
+    let markFailedPartStarted!: () => void;
+    const failedPartStarted = new Promise<void>((resolve) => {
+      markFailedPartStarted = resolve;
+    });
     mockCompaniesApi.importTransferUploadPart.mockImplementation((_id: string, index: number) => {
       if (index === 0) return Promise.resolve({ ok: true, index, alreadyCompleted: false });
+      markFailedPartStarted();
       return Promise.reject(new Error("socket hang up"));
     });
 
     await renderPage();
     await chooseLocalZip(buildLargeZipFile());
     await clickButton((text) => text === "Preview import");
+    await failedPartStarted;
     await vi.waitFor(() => {
       expect(container.textContent).toContain("Preview failed: socket hang up");
     });
@@ -609,13 +622,12 @@ describe("CompanyImport", () => {
 
     await clickButton((text) => text === "Preview import");
     await vi.waitFor(() => {
-      expect(mockCompaniesApi.importTransferPreview).toHaveBeenCalledTimes(1);
+      expect(container.textContent).toContain("Import preview");
     });
-    await settle();
 
     expect(mockCompaniesApi.importTransferUploadPart).toHaveBeenCalledTimes(1);
     expect(mockCompaniesApi.importTransferUploadPart).toHaveBeenCalledWith("transfer-1", 1, expect.anything());
-    expect(container.textContent).toContain("Import preview");
+    expect(mockCompaniesApi.importTransferPreview).toHaveBeenCalledTimes(1);
   });
 
   it("re-uploads only the missing parts when resuming an interrupted transfer", async () => {
@@ -623,18 +635,26 @@ describe("CompanyImport", () => {
     // file resumes that transfer, so only part 1 travels.
     mockReadZipArchive.mockResolvedValue({ rootPath: "big-package", files: previewFiles });
     mockCompaniesApi.importTransferCreate.mockResolvedValue(buildTransferCreated([1]));
+    let markMissingPartStarted!: () => void;
+    const missingPartStarted = new Promise<void>((resolve) => {
+      markMissingPartStarted = resolve;
+    });
+    mockCompaniesApi.importTransferUploadPart.mockImplementation(async (_id: string, index: number) => {
+      markMissingPartStarted();
+      return { ok: true, index, alreadyCompleted: false };
+    });
 
     await renderPage();
     await chooseLocalZip(buildLargeZipFile());
     await clickButton((text) => text === "Preview import");
+    await missingPartStarted;
     await vi.waitFor(() => {
-      expect(mockCompaniesApi.importTransferPreview).toHaveBeenCalledTimes(1);
+      expect(container.textContent).toContain("Import preview");
     });
-    await settle();
 
     expect(mockCompaniesApi.importTransferUploadPart).toHaveBeenCalledTimes(1);
     expect(mockCompaniesApi.importTransferUploadPart).toHaveBeenCalledWith("transfer-1", 1, expect.anything());
-    expect(container.textContent).toContain("Import preview");
+    expect(mockCompaniesApi.importTransferPreview).toHaveBeenCalledTimes(1);
   });
 
   it("explains the disabled preview button until a package is chosen", async () => {

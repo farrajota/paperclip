@@ -173,11 +173,17 @@ const externalAdapter: ServerAdapterModule = {
 
 const missingAdapterType = "missing_adapter_validation_test";
 
+// Module initialization is shared; each case still resets mocks and adapter overrides.
+vi.doUnmock("../routes/agents.js");
+vi.doUnmock("../routes/authz.js");
+vi.doUnmock("../middleware/index.js");
+registerModuleMocks();
+const [{ agentRoutes }, { errorHandler }] = await Promise.all([
+  vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+  vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+]);
+
 async function createApp(actorOverride: Record<string, unknown> = {}) {
-  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -242,12 +248,6 @@ async function unregisterTestAdapter(type: string) {
 
 describe("agent routes adapter validation", () => {
   beforeEach(async () => {
-    vi.resetModules();
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    vi.doUnmock("../routes/agents.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue([]);
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
@@ -332,10 +332,6 @@ describe("agent routes adapter validation", () => {
     }));
     await unregisterTestAdapter("external_test");
     await unregisterTestAdapter(missingAdapterType);
-    await Promise.all([
-      vi.importActual("../routes/agents.js"),
-      vi.importActual("../middleware/index.js"),
-    ]);
   });
 
   it("routes narrow roster edits through authorization, config merging and audit history", async () => {
@@ -363,6 +359,7 @@ describe("agent routes adapter validation", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await unregisterTestAdapter("external_test");
     await unregisterTestAdapter(missingAdapterType);
   });

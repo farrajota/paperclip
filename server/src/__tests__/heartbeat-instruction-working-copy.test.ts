@@ -2,25 +2,39 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, heartbeatRunEvents, issues, principalPermissionGrants } from "@paperclipai/db";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import type * as AgentInstructionAuthorization from "../services/agent-instruction-authorization.js";
+import type * as AgentInstructionWorkingCopies from "../services/agent-instruction-working-copies.js";
 
-const cleanup = vi.hoisted(() => ({ failures: new Set<string>(), revocations: new Set<string>(), attempts: new Map<string, number>() }));
+const cleanup = vi.hoisted(() => ({ failures: new Set<string>(), instructionEditRevocations: new Set<string>(), attempts: new Map<string, number>() }));
+vi.mock("../services/agent-instruction-authorization.js", async importOriginal => {
+  const actual = await importOriginal<typeof AgentInstructionAuthorization>();
+  return {
+    ...actual,
+    authorizeInstructionCommit: async (...args: Parameters<typeof actual.authorizeInstructionCommit>) => {
+      const [connection, actor] = args;
+      if (actor.type === "agent" && typeof actor.companyId === "string" && cleanup.instructionEditRevocations.has(actor.companyId)) {
+        await connection.delete(principalPermissionGrants).where(and(
+          eq(principalPermissionGrants.companyId, actor.companyId),
+          eq(principalPermissionGrants.permissionKey, "agents:configure"),
+        ));
+      }
+      return actual.authorizeInstructionCommit(...args);
+    },
+  };
+});
+
 vi.mock("../services/agent-instruction-working-copies.js", async importOriginal => {
-  const actual = await importOriginal<typeof import("../services/agent-instruction-working-copies.js")>();
+  const actual = await importOriginal<typeof AgentInstructionWorkingCopies>();
   return { ...actual, agentInstructionWorkingCopyService: (...args: Parameters<typeof actual.agentInstructionWorkingCopyService>) => {
     const copies = actual.agentInstructionWorkingCopyService(...args);
-    return { ...copies, prepare: async (input: Parameters<typeof copies.prepare>[0]) => {
-      if (cleanup.revocations.has(input.companyId)) {
-        await args[0].update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, input.companyId));
-      }
-      return copies.prepare(input);
-    }, release: async (companyId: string, runId: string) => {
+    return { ...copies, release: async (companyId: string, runId: string) => {
       cleanup.attempts.set(runId, (cleanup.attempts.get(runId) ?? 0) + 1);
       if (cleanup.failures.has(companyId)) throw new Error("Fixture cleanup unavailable");
       return copies.release(companyId, runId);
@@ -94,7 +108,7 @@ describePostgres("heartbeat instruction working-copy lifecycle", () => {
     await db.insert(agents).values({ id: agentId, companyId, name: "Editor", adapterType, status: "idle", adapterConfig: { cwd, instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: entryFile } });
     await db.insert(companyMemberships).values({ companyId, principalType: "agent", principalId: agentId, membershipRole: "member" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Save agent instructions", status: "todo", assigneeAgentId: agentId, responsibleUserId: userId, issueNumber: 1 });
-    return { companyId, agentId, issueId, root };
+    return { companyId, agentId, issueId, userId, root };
   }
 
   async function execute(f: Awaited<ReturnType<typeof seed>>) {
@@ -123,15 +137,24 @@ describePostgres("heartbeat instruction working-copy lifecycle", () => {
     expect(second.finished.resultJson?.instructionSave).toMatchObject({ state: "unchanged" });
   });
 
-  it("continues without a copy or save claim when access is revoked after dispatch admission", async () => {
+  it("continues without a copy or save claim when instruction-edit permission is revoked after dispatch admission", async () => {
     const f = await seed();
-    cleanup.revocations.add(f.companyId);
+    cleanup.instructionEditRevocations.add(f.companyId);
     const { finished, input, events } = await execute(f);
     expect(finished.status, finished.error ?? undefined).toBe("succeeded");
     expect(input.instructionPath).toBeNull();
     expect(input.context.paperclipTaskMarkdown).toContain("No editable agent instruction working copy is registered");
     expect(finished.resultJson?.instructionSave).toBeUndefined();
     expect(events.some(event => event.eventType === "instruction_save" && event.payload?.state === "unavailable")).toBe(true);
+    expect(await db.select().from(principalPermissionGrants).where(and(
+      eq(principalPermissionGrants.companyId, f.companyId),
+      eq(principalPermissionGrants.permissionKey, "agents:configure"),
+    ))).toEqual([]);
+    expect(await db.select({ status: companyMemberships.status }).from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, f.companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, f.userId),
+    ))).toEqual([{ status: "active" }]);
     expect(await fs.readFile(path.join(f.root, entryFile), "utf8")).toBe(initial);
   });
 

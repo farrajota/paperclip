@@ -61,6 +61,10 @@ const apiPrefixes: Record<string, string> = {
   "task-workspaces.ts": "/api",
   "file-resources.ts": "/api",
   "folders.ts": "/api",
+  "governance-milestones.ts": "/api",
+  "governance-operations.ts": "/api",
+  "governance-outcomes.ts": "/api",
+  "governance-planning.ts": "/api",
   "goals.ts": "/api",
   "health.ts": "/api/health",
   "liveness.ts": "/api/liveness",
@@ -318,17 +322,74 @@ describe("openapi routes", () => {
     const spec = buildOpenApiSpec() as any;
     const paths = Object.keys(spec.paths);
     expect(paths.filter((path) => /pipelines|review-cases|case-events/.test(path))).toEqual([]);
-    // Standalone handoffs also use caseId; that parameter name no longer
-    // identifies a removed Pipeline operation. Retain only their live paths.
+    // Standalone handoffs and the governance milestone endpoint both use caseId;
+    // this parameter name no longer identifies a removed Pipeline operation.
     expect(paths.filter((path) => path.startsWith("/api/cases/{caseId}")).sort()).toEqual([
       "/api/cases/{caseId}/handoffs",
       "/api/cases/{caseId}/handoffs/{handoffId}/cancel",
       "/api/cases/{caseId}/handoffs/{handoffId}/retry",
+      "/api/cases/{caseId}/milestones",
     ]);
     expect(spec.paths["/api/companies/{companyId}/cases"].post).toBeDefined();
     expect(spec.paths["/api/companies/{companyId}/case-handoffs"].post).toBeDefined();
     expect(spec.paths["/api/cases/{id}"].get).toBeDefined();
     expect(spec.paths["/api/routines/{id}/run"].post).toBeDefined();
+  });
+
+  it("documents governance access and response boundaries", () => {
+    const { spec } = loadSpecRoutes();
+    const operationsRead = spec.paths["/api/companies/{companyId}/governance-operations"].get;
+    expect(operationsRead.description).toContain("company-access failures return 403");
+    expect(operationsRead.description).toContain("returns 404 for a missing company or service-level company-scope denial");
+    expect(operationsRead.responses["403"]).toBeDefined();
+    expect(operationsRead.responses["404"]).toBeDefined();
+
+    const planningRead = spec.paths["/api/issues/{id}/planning"].get;
+    expect(planningRead.responses["200"].content["application/json"].schema).toMatchObject({
+      type: "object",
+      nullable: true,
+    });
+
+    const occurrencesRead = spec.paths["/api/routines/{id}/occurrences"].get;
+    expect(occurrencesRead.responses["400"]).toBeDefined();
+    expect(occurrencesRead.responses["422"]).toBeDefined();
+    expect(occurrencesRead.description).toContain("Pagination type/range/length validation failures return 400");
+    expect(occurrencesRead.description).toContain("malformed cursor contents return 422");
+
+    const occurrenceDisposition = spec.paths["/api/routines/{id}/occurrences/{occurrenceId}/disposition"].post;
+    expect(occurrenceDisposition.responses["422"]).toBeDefined();
+    expect(occurrenceDisposition.description).toContain("unavailable owners or invalid obligation/execution states return 422");
+
+    const exceptionPaths = [
+      "/api/companies/{companyId}/governance-operations/occurrences/{occurrenceId}/exceptions",
+      "/api/companies/{companyId}/governance-operations/exceptions/{exceptionId}/pause",
+      "/api/companies/{companyId}/governance-operations/exceptions/{exceptionId}/resume",
+      "/api/companies/{companyId}/governance-operations/exceptions/{exceptionId}/resolve",
+    ];
+    for (const path of exceptionPaths) {
+      const operation = spec.paths[path].post;
+      expect(operation.description).toContain("persisted but are not included in the response");
+      expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+      expect(operation.security).toEqual([
+        { BoardSessionAuth: [] },
+        { BoardApiKeyAuth: [] },
+      ]);
+    }
+  });
+
+  it("documents milestone follow-up delivery as an array including empty results", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/milestones/{milestoneId}/followups"].post;
+    const schema = operation.responses["200"].content["application/json"].schema;
+
+    expect(schema.type).toBe("array");
+    expect(schema.minItems ?? 0).toBe(0);
+    expect(schema.items.type).toBe("object");
+    expect(schema.items.properties).toEqual({
+      actionKey: { type: "string" },
+      issueId: { type: "string", format: "uuid" },
+    });
+    expect(schema.items.required).toEqual(["actionKey", "issueId"]);
   });
 
   it("documents anonymous liveness separately from database readiness", () => {

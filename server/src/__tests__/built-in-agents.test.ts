@@ -672,6 +672,13 @@ describeEmbeddedPostgres("built-in agents", () => {
 
   it("reconciles an enabled Reflection Coach bundle with skill sync and a disabled routine", async () => {
     const companyId = await seedCompany({ requireApproval: false });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "operator",
+    });
     const root = await createAgentLifecycle(db).requestHire(companyId, {
       name: "CEO",
       role: "ceo",
@@ -748,6 +755,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       title: "Review recent agent trajectories for coaching proposals",
       status: "paused",
       assigneeAgentId: state.agentId,
+      responsibleUserId: "responsible-user",
+      createdByUserId: null,
     });
     const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, routine!.id));
     expect(trigger).toMatchObject({
@@ -1498,8 +1507,20 @@ describeEmbeddedPostgres("built-in agents", () => {
 
   it("keeps a built-in routine task while the agent prepares", async () => {
     const companyId = await seedCompany({ requireApproval: false });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "operator",
+    });
+    // The native producer must not manufacture membership for its audit label.
+    // A real active company user can still manually dispatch the routine.
     const builtIns = createBuiltInAgentService(db);
     const created = await builtIns.ensure(companyId, "reflection-coach");
+    expect(created.agentId).toBeDefined();
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    expect(routine).toMatchObject({ responsibleUserId: "responsible-user", createdByUserId: null });
     await lifecycleWorker.stop();
     lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "pending" });
     try {
@@ -1520,6 +1541,45 @@ describeEmbeddedPostgres("built-in agents", () => {
       await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
       lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
     }
+  });
+
+  it("uses the oldest active owner and fails closed after that owner is revoked", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    await db.update(companies).set({ defaultResponsibleUserId: null }).where(eq(companies.id, companyId));
+    await db.insert(companyMemberships).values([
+      { companyId, principalType: "user", principalId: "first-owner", status: "active", membershipRole: "owner", createdAt: new Date("2026-01-01T00:00:00Z") },
+      { companyId, principalType: "user", principalId: "later-owner", status: "active", membershipRole: "owner", createdAt: new Date("2026-01-02T00:00:00Z") },
+    ]);
+    const builtIns = createBuiltInAgentService(db);
+    await builtIns.ensure(companyId, "reflection-coach");
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    expect(routine).toMatchObject({ responsibleUserId: "first-owner", createdByUserId: null });
+
+    await db.update(companyMemberships).set({ status: "inactive" }).where(and(
+      eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalId, "first-owner"),
+    ));
+    await expect(builtIns.runRoutine(companyId, "reflection-coach", "recent-agent-reflection", { userId: "first-owner" }))
+      .rejects.toMatchObject({ status: 403 });
+    await expect(db.select().from(issues).where(eq(issues.companyId, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("does not replace an inactive configured default owner with another company owner", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "available-owner",
+      status: "active",
+      membershipRole: "owner",
+    });
+    const builtIns = createBuiltInAgentService(db);
+    await builtIns.ensure(companyId, "reflection-coach");
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    expect(routine?.responsibleUserId).toBe("responsible-user");
+
+    await expect(builtIns.runRoutine(companyId, "reflection-coach", "recent-agent-reflection", { userId: "responsible-user" }))
+      .rejects.toMatchObject({ status: 403 });
+    await expect(db.select().from(issues).where(eq(issues.companyId, companyId))).resolves.toHaveLength(0);
   });
 
   it("controls the Reflection Coach routine schedule without enabling it by default", async () => {

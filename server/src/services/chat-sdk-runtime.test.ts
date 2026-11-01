@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatSdkStatePersistence } from "./chat-sdk-state.js";
+import {
+  ChatSdkEndpointNotRegisteredError,
+  DiscordAdapterCompatibilityError,
+} from "./chat-sdk-runtime-errors.js";
 
 const captures = vi.hoisted(() => ({
   chatConfigs: [] as Array<Record<string, unknown>>,
@@ -234,8 +238,6 @@ vi.mock("chat", () => ({
 import {
   CHAT_SDK_SOURCE_REVISION,
   CHAT_SDK_VERSION,
-  DiscordAdapterCompatibilityError,
-  ChatSdkEndpointNotRegisteredError,
   createChatSdkEndpointRuntime,
   createChatSdkRuntime,
   type CreateChatSdkEndpointRuntimeOptions,

@@ -368,11 +368,7 @@ import {
   observeCrossIssueInfluence,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
-import {
-  getNativeSessionSteeringState,
-  NativeSessionSteeringError,
-  steerNativeSession,
-} from "../services/native-runtime/native-session-executor.js";
+import { NativeSessionSteeringError } from "../services/native-runtime/native-session-errors.js";
 import {
   buildQueuedCommentQueueSnapshot,
   decideQueuedCommentQueueSteering,
@@ -7424,7 +7420,7 @@ export function issueRoutes(
       input.issue.conversationAgentId ? "unsupported" : steering.kind !== "probe"
         ? steering.kind
         : input.steeringDisposition
-          ?? (await getNativeSessionSteeringState(steering.steeringRunId)
+          ?? (await (await import("../services/native-runtime/native-session-executor.js")).getNativeSessionSteeringState(steering.steeringRunId)
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
     const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
@@ -16728,7 +16724,7 @@ export function issueRoutes(
             (await storedSteeringAcknowledgement(tx, steeringIdentity ?? {
               companyId: issue.companyId, runId: locked.activeRun.id, messageId: commentId,
             })) ??
-            (await steerNativeSession({
+            (await (await import("../services/native-runtime/native-session-executor.js")).steerNativeSession({
               runId: locked.activeRun.id,
               message: entry.comment.body,
               correlationId: commentId,

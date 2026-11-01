@@ -1,4 +1,3 @@
-import { Cursor } from "@cursor/sdk";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -72,6 +71,7 @@ export async function testEnvironment(
   }
 
   if (apiKey) {
+    const { Cursor } = await import("@cursor/sdk");
     try {
       const me = await Cursor.me({ apiKey });
       checks.push({
@@ -87,25 +87,25 @@ export async function testEnvironment(
         message: err instanceof Error ? err.message : "Failed to validate Cursor API key.",
       });
     }
-  }
 
-  if (apiKey && model) {
-    try {
-      const models = await Cursor.models.list({ apiKey });
-      const match = models.find((entry) => entry.id === model);
-      checks.push({
-        code: match ? "cursor_cloud_model_ok" : "cursor_cloud_model_unknown",
-        level: match ? "info" : "warn",
-        message: match
-          ? `Model "${model}" is available to the authenticated Cursor account.`
-          : `Model "${model}" was not found in the authenticated Cursor model list.`,
-      });
-    } catch (err) {
-      checks.push({
-        code: "cursor_cloud_model_probe_failed",
-        level: "warn",
-        message: err instanceof Error ? err.message : "Failed to validate model availability.",
-      });
+    if (model) {
+      try {
+        const models = await Cursor.models.list({ apiKey });
+        const match = models.find((entry) => entry.id === model);
+        checks.push({
+          code: match ? "cursor_cloud_model_ok" : "cursor_cloud_model_unknown",
+          level: match ? "info" : "warn",
+          message: match
+            ? `Model "${model}" is available to the authenticated Cursor account.`
+            : `Model "${model}" was not found in the authenticated Cursor model list.`,
+        });
+      } catch (err) {
+        checks.push({
+          code: "cursor_cloud_model_probe_failed",
+          level: "warn",
+          message: err instanceof Error ? err.message : "Failed to validate model availability.",
+        });
+      }
     }
   }
 

@@ -109,10 +109,6 @@ import {
   withQueuedCommentIdsInWakePayload,
   withQueuedCommentIdsInRunContext,
 } from "../issue-queued-comment-queue.js";
-import {
-  cancelNativeSession,
-  closeWarmNativeSessionsForEnvironment,
-} from "../native-runtime/index.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import { isNativeRunnerOwnershipHeld } from "../native-runtime/native-runner-ownership.js";
@@ -252,7 +248,7 @@ export async function cancelHeartbeatNativeRun(input: {
         scope: "run",
         ...(input.cancellationRequestId ? { cancellationRequestId: input.cancellationRequestId } : {}),
       })
-    : await cancelNativeSession(input.runId, input.reason, {
+    : await (await import("../native-runtime/native-session-executor.js")).cancelNativeSession(input.runId, input.reason, {
         db: input.db,
         scope: "run",
         ...(input.cancellationRequestId ? { cancellationRequestId: input.cancellationRequestId } : {}),
@@ -412,7 +408,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
             );
           const aggregate = { closed: 0, busy: 0, failed: 0 };
           for (const environmentId of environmentIds) {
-            const result = await closeWarmNativeSessionsForEnvironment({
+            const result = await (await import("../native-runtime/native-session-executor.js")).closeWarmNativeSessionsForEnvironment({
               environmentId,
               reason,
             });

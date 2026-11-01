@@ -702,11 +702,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       parseObject(run.contextSnapshot).issueId,
     );
     if (!issueId || run.invocationSource !== "automation") return onClear(db);
-    await options.beforeChatControlRecoveryCheck?.({
-      runId: run.id,
-      issueId,
-      stage,
-    });
     if (stage === "dispatch" && nativeRecovery) {
       // Protected historical/already-admitted owners did not previously take
       // this fence's locks. A fresh exact read keeps unrelated Board contention
@@ -738,6 +733,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           return onClear(db);
       }
     }
+    await options.beforeChatControlRecoveryCheck?.({
+      runId: run.id,
+      issueId,
+      stage,
+    });
     let terminal: typeof heartbeatRuns.$inferSelect | null = null;
     try {
       const attempt = () => db.transaction(async (tx) => {

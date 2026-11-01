@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, workspaceOperations, type Db } from "@paperclipai/db";
-import { eq, sql } from "drizzle-orm";
+import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, toolMcpGatewayTokens, toolMcpGateways, toolProfiles, workspaceOperations, type Db } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { trace } from "@opentelemetry/api";
 import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
@@ -16,7 +16,7 @@ import { createAdapterExecutionControl } from "../adapter-execution-control.js";
 import { executionWorkspaceService } from "../execution-workspaces.js";
 import { workspaceOperationService } from "../workspace-operations.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { executePaperclipNativeSession, NativeCancellationPendingRecoveryError, NativeControllerDetachedForRestartError } from "../native-runtime/native-session-executor.js";
+import { NativeCancellationPendingRecoveryError, NativeControllerDetachedForRestartError } from "../native-runtime/native-session-errors.js";
 import { NativeRunnerOwnershipUnverifiedError } from "../native-runtime/native-runner-ownership.js";
 import { NativeWorkspaceFinalizationBusyError, NativeWorkspaceFinalizationOwnershipLostError } from "../native-runtime/native-workspace-finalization-ownership.js";
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
@@ -24,21 +24,32 @@ import { buildNativeExecutionInput } from "../native-runtime/native-execution-in
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
-import { revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
-import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./runtime-execution.js";
+import type * as NativeSessionExecutor from "../native-runtime/native-session-executor.js";
+import type * as RunPreparation from "./run-preparation.js";
+import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput, type HeartbeatRuntimeExecutionResult } from "./runtime-execution.js";
 
 // Keep real accounting, workspace barriers, and task-session persistence. Providers
 // and gateway delivery are external boundaries; browser acceptance covers their wiring.
-vi.mock("../native-runtime/native-session-executor.js", async original => ({
-  ...await original<typeof import("../native-runtime/native-session-executor.js")>(),
-  executePaperclipNativeSession: vi.fn(),
+const nativeExecutorTestState = vi.hoisted(() => ({
+  executePaperclipNativeSession: vi.fn<typeof NativeSessionExecutor.executePaperclipNativeSession>(),
+  moduleLoadGate: undefined as Promise<void> | undefined,
+  onModuleLoadStarted: undefined as (() => void) | undefined,
 }));
+vi.mock("../native-runtime/native-session-executor.js", async original => {
+  nativeExecutorTestState.onModuleLoadStarted?.();
+  await nativeExecutorTestState.moduleLoadGate;
+  return {
+    ...await original<typeof NativeSessionExecutor>(),
+    executePaperclipNativeSession: nativeExecutorTestState.executePaperclipNativeSession,
+  };
+});
+const executePaperclipNativeSession: typeof NativeSessionExecutor.executePaperclipNativeSession =
+  nativeExecutorTestState.executePaperclipNativeSession;
 vi.mock("./run-preparation.js", async original => ({
-  ...await original<typeof import("./run-preparation.js")>(),
+  ...await original<typeof RunPreparation>(),
   buildPaperclipRuntimeMcpServers: vi.fn(async () => []),
   createAdapterRuntimeToolAccess: vi.fn(() => null),
   createManagedMcpRunConfig: vi.fn(async () => null),
-  revokeHeartbeatRunGatewayTokens: vi.fn(async () => {}),
 }));
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -65,6 +76,10 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Executing agent", status: "running", adapterType: native ? "paperclip_runner" : "process", adapterConfig: provider === "codex" ? { provider } : { provider, lifecycleMode: "per_turn", allowUnmeteredProvider: true, [provider === "grok_bot" ? "externalBindingId" : "dotBindingId"]: randomUUID() } }).returning();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Complete this task", assigneeAgentId: agent.id }).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: issue.id, scopeKind: "issue", status: "running", runtimeMode: native ? "native" : "legacy" }).returning();
+    const nativeInstructionReservation: NonNullable<HeartbeatRuntimeExecutionInput["instructions"]["nativeInstructionReservation"]> = { reuseRunId: randomUUID(), adopt: vi.fn(), release: vi.fn(async () => {}) };
+    const [profile] = await db.insert(toolProfiles).values({ companyId: company.id, profileKey: "runtime-cleanup", name: "Runtime cleanup" }).returning();
+    const [gateway] = await db.insert(toolMcpGateways).values({ companyId: company.id, profileId: profile.id, name: "Runtime cleanup", slug: "runtime-cleanup" }).returning();
+    await db.insert(toolMcpGatewayTokens).values({ companyId: company.id, gatewayId: gateway.id, name: "Runtime cleanup", tokenHash: randomUUID(), subjectType: "heartbeat_run", subjectId: run.id });
     const state = createHeartbeatRunState(db);
     const executionControl = createAdapterExecutionControl();
     const adapter = { type: "process", label: "Test process", testEnvironment: vi.fn(), execute: vi.fn<HeartbeatRuntimeExecutionInput["runtime"]["adapter"]["execute"]>(async () => ({ exitCode: 0, signal: null, timedOut: false })) };
@@ -96,7 +111,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       },
       instructions: { instructionCopy: null, getInstructionSave: () => instructionSave, nativeInstructionWorkingCopy: () => undefined,
         collectStoppedInstructions: async () => { instructionSave = { state: "saved", revisionId: "during-execution" }; },
-        nativeInstructionReservation: null, releaseInstructionCopy: vi.fn(async () => {}),
+        nativeInstructionReservation, releaseInstructionCopy: vi.fn(async () => {}),
       },
       trace: { providerTraceCapture: null, nativeRunnerPreparationSpans: [], attestedQuestionResponseAtMs: null, attemptStartedAtMs: Date.now(), environmentAcquireStartedAtMs: Date.now(), environmentRealizeEndedAtMs: Date.now() },
       control: { executionControl, executionPhaseContext: { onExecutionPhase: executionControl.phases.enter },
@@ -113,10 +128,58 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
   }
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
   const finalizations = () => db.select().from(workspaceOperations).where(eq(workspaceOperations.phase, "workspace_finalize"));
-  function expectCleanup(input: HeartbeatRuntimeExecutionInput) {
-    expect(revokeHeartbeatRunGatewayTokens).toHaveBeenCalledWith({ db, companyId: input.agent.companyId, runId: input.run.id });
+  async function gatewayTokens(input: HeartbeatRuntimeExecutionInput) {
+    return db.select({ revokedAt: toolMcpGatewayTokens.revokedAt }).from(toolMcpGatewayTokens).where(and(
+      eq(toolMcpGatewayTokens.companyId, input.agent.companyId),
+      eq(toolMcpGatewayTokens.subjectType, "heartbeat_run"),
+      eq(toolMcpGatewayTokens.subjectId, input.run.id),
+    ));
+  }
+  async function expectCleanup(input: HeartbeatRuntimeExecutionInput) {
+    const tokens = await gatewayTokens(input);
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]?.revokedAt).toBeInstanceOf(Date);
+    expect(input.instructions.nativeInstructionReservation?.release).toHaveBeenCalledOnce();
     expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   }
+  async function expectGatewayTokensPreserved(input: HeartbeatRuntimeExecutionInput) {
+    const tokens = await gatewayTokens(input);
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]?.revokedAt).toBeNull();
+  }
+
+  it("holds native admission until the executor's first module load completes", async () => {
+    const { input } = await fixture(true);
+    let releaseModuleLoad!: () => void;
+    let signalModuleLoadStarted!: () => void;
+    const moduleLoadStarted = new Promise<void>(resolve => { signalModuleLoadStarted = resolve; });
+    nativeExecutorTestState.moduleLoadGate = new Promise<void>(resolve => { releaseModuleLoad = resolve; });
+    nativeExecutorTestState.onModuleLoadStarted = signalModuleLoadStarted;
+    let running: Promise<HeartbeatRuntimeExecutionResult> | undefined;
+    try {
+      const operation = executeHeartbeatRuntime(db, input);
+      running = operation;
+      await moduleLoadStarted;
+      expect(input.effects.onUsageCaptureReady).toHaveBeenCalledOnce();
+      expect(input.effects.onNativeDispatchStarted).not.toHaveBeenCalled();
+      expect(executePaperclipNativeSession).not.toHaveBeenCalled();
+      expect(await finalizations()).toHaveLength(0);
+      expect(input.instructions.nativeInstructionReservation?.release).not.toHaveBeenCalled();
+      expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+
+      releaseModuleLoad();
+      await expect(operation).resolves.toMatchObject({ dispatched: true });
+      expect(input.effects.onNativeDispatchStarted).toHaveBeenCalledOnce();
+      expect(executePaperclipNativeSession).toHaveBeenCalledOnce();
+      expect(await finalizations()).toMatchObject([{ status: "succeeded" }]);
+      await expectCleanup(input);
+    } finally {
+      releaseModuleLoad();
+      if (running) await running.catch(() => undefined);
+      nativeExecutorTestState.moduleLoadGate = undefined;
+      nativeExecutorTestState.onModuleLoadStarted = undefined;
+    }
+  });
 
   it.each([false, true])("preserves the dispatch gate's early return and cleanup (native: %s)", async native => {
     const { input, adapter } = await fixture(native);
@@ -127,7 +190,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.effects.onNativeDispatchStarted).not.toHaveBeenCalled();
     expect(input.effects.onLegacyAdapterEntered).not.toHaveBeenCalled();
     expect(await finalizations()).toHaveLength(0);
-    expectCleanup(input);
+    await expectCleanup(input);
   });
 
   it("captures usage and live instruction saves before finalizing a legacy workspace", async () => {
@@ -142,7 +205,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(await read(run.id)).toMatchObject({ status: "running", costAccountingPending: true, usageJson: { inputTokens: 10, outputTokens: 4, accountingReceiptReady: true } });
     expect(await db.select().from(runUsageReceipts)).toHaveLength(1);
     expect(await finalizations()).toMatchObject([{ status: "succeeded" }]);
-    expectCleanup(input);
+    await expectCleanup(input);
   });
 
   it("preserves Stop metadata and marks no-work accounting without manufacturing a receipt", async () => {
@@ -152,17 +215,24 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     await executeHeartbeatRuntime(db, input);
     expect(await read(run.id)).toMatchObject({ status: "cancelled", resultJson: { stoppedByUser: true }, usageJson: { accountingProviderWorkStarted: false } });
     expect(await db.select().from(runUsageReceipts)).toHaveLength(0);
-    expectCleanup(input);
+    await expectCleanup(input);
   });
 
-  it("records the failed workspace and keeps the original provider error", async () => {
+  it("keeps the provider error when reservation and copy cleanup fail", async () => {
     const { input, adapter } = await fixture();
     const error = new Error("provider failed");
+    const releaseReservation = vi.fn(async () => { throw new Error("reservation cleanup failed"); });
+    input.instructions.nativeInstructionReservation = {
+      ...input.instructions.nativeInstructionReservation!,
+      release: releaseReservation,
+    };
+    input.instructions.releaseInstructionCopy = vi.fn(async () => { throw new Error("copy cleanup failed"); });
     adapter.execute.mockRejectedValueOnce(error);
     await expect(executeHeartbeatRuntime(db, input)).rejects.toBe(error);
     expect(await finalizations()).toMatchObject([{ status: "failed", metadata: { errorMessage: "provider failed" } }]);
     expect(input.effects.onLegacyAdapterEntered).toHaveBeenCalledOnce();
-    expectCleanup(input);
+    expect(releaseReservation).toHaveBeenCalledOnce();
+    await expectCleanup(input);
   });
 
   it.each([
@@ -174,17 +244,25 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
   ] as const)("transfers recovery ownership for %s before cleanup", async (error, effect) => {
     const { input } = await fixture(true);
     vi.mocked(executePaperclipNativeSession).mockRejectedValueOnce(error);
+    let recoveryOwnershipWasTransferredBeforeCleanup = false;
     input.instructions.releaseInstructionCopy = vi.fn(async () => {
-      if (effect) expect(input.effects[effect]).toHaveBeenCalledOnce();
+      recoveryOwnershipWasTransferredBeforeCleanup = effect
+        ? vi.mocked(input.effects[effect]).mock.calls.length > 0
+        : false;
     });
     await expect(executeHeartbeatRuntime(db, input)).rejects.toBe(error);
     expect(input.effects.onNativeDispatchStarted).toHaveBeenCalledOnce();
     expect(input.effects.onLegacyAdapterEntered).not.toHaveBeenCalled();
     expect(await finalizations()).toHaveLength(0);
+    if (effect) {
+      expect(recoveryOwnershipWasTransferredBeforeCleanup).toBe(true);
+      expect(input.effects[effect]).toHaveBeenCalledOnce();
+    }
     if (error instanceof NativeControllerDetachedForRestartError) {
-      expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+      await expectGatewayTokensPreserved(input);
       expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
-    } else expectCleanup(input);
+      expect(input.instructions.nativeInstructionReservation?.release).toHaveBeenCalledOnce();
+    } else await expectCleanup(input);
   });
 
   it("dispatches native execution with the selected session and persists its usage", async () => {
@@ -200,7 +278,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.effects.onNativeDispatchStarted).toHaveBeenCalledOnce();
     expect(await read(run.id)).toMatchObject({ status: "running", usageJson: { inputTokens: 7, outputTokens: 3, accountingReceiptReady: true } });
     expect(await finalizations()).toMatchObject([{ status: "succeeded" }]);
-    expectCleanup(input);
+    await expectCleanup(input);
   });
 
   it.each(["expected", "wrong"])("finalizes a plugin worktree through its owner (branch: %s)", async branch => {
@@ -236,7 +314,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     });
     expect(input.effects.onNativeSessionResumeScheduled).toHaveBeenCalledOnce();
     expect(await finalizations()).toHaveLength(0);
-    expectCleanup(input);
+    await expectCleanup(input);
   });
 
   it("records native restoration inside the workspace finalization operation", async () => {
@@ -342,13 +420,22 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     };
     const error = new Error("runner_remote_process_identity_unavailable");
     vi.mocked(executePaperclipNativeSession).mockRejectedValueOnce(error);
+    const providerResourceDispositionsAtCleanup: string[] = [];
     input.instructions.releaseInstructionCopy = vi.fn(async () => {
-      if (provider === "codex") expect(input.effects.onProviderResourceDisposition).toHaveBeenCalledWith("stop_and_retain");
-      else expect(input.effects.onProviderResourceDisposition).not.toHaveBeenCalledWith("stop_and_retain");
+      for (const [disposition] of vi.mocked(input.effects.onProviderResourceDisposition).mock.calls) {
+        providerResourceDispositionsAtCleanup.push(disposition);
+      }
     });
     await expect(executeHeartbeatRuntime(db, input)).rejects.toBe(error);
     expect(input.workspace.nativeWorkspaceSync.restoreWorkspace).not.toHaveBeenCalled();
-    expectCleanup(input);
+    if (provider === "codex") {
+      expect(providerResourceDispositionsAtCleanup).toContain("stop_and_retain");
+      expect(input.effects.onProviderResourceDisposition).toHaveBeenCalledWith("stop_and_retain");
+    } else {
+      expect(providerResourceDispositionsAtCleanup).not.toContain("stop_and_retain");
+      expect(input.effects.onProviderResourceDisposition).not.toHaveBeenCalledWith("stop_and_retain");
+    }
+    await expectCleanup(input);
   });
 
   it("records a failed barrier if the successful finalization write fails", async () => {
@@ -357,7 +444,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     vi.spyOn(input.workspace.workspaceOperationRecorder, "recordOperation").mockRejectedValueOnce(error);
     await expect(executeHeartbeatRuntime(db, input)).rejects.toBe(error);
     expect(await finalizations()).toMatchObject([{ status: "failed" }]);
-    expectCleanup(input);
+    await expectCleanup(input);
   });
 
   it("retains a failed sandbox restore even when persisting its receipt throws", async () => {
@@ -381,14 +468,28 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       expect(input.effects.onProviderResourceDisposition).toHaveBeenCalledWith("stop_and_retain");
       expect(order).toEqual(["restore evidence", "retain sandbox", "receipt write", "cleanup"]);
       expect(await finalizations()).toMatchObject([{ status: "failed" }]);
-      expectCleanup(input);
+      await expectCleanup(input);
     } finally { record.mockRestore(); }
   });
 
   it("runs instruction cleanup even when gateway revocation fails", async () => {
     const { input } = await fixture();
-    vi.mocked(revokeHeartbeatRunGatewayTokens).mockRejectedValueOnce(new Error("gateway unavailable"));
-    expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true });
-    expectCleanup(input);
+    const gatewayFailure = new Error("gateway unavailable");
+    const updateGatewayQuery = db.update.bind(db);
+    const updateSpy = vi.spyOn(db, "update").mockImplementation(table => {
+      if (table === toolMcpGatewayTokens) throw gatewayFailure;
+      return updateGatewayQuery(table);
+    });
+    try {
+      expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true });
+      expect(updateSpy).toHaveBeenCalledWith(toolMcpGatewayTokens);
+      expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
+      expect(input.instructions.nativeInstructionReservation?.release).toHaveBeenCalledOnce();
+      const tokens = await gatewayTokens(input);
+      expect(tokens).toHaveLength(1);
+      expect(tokens[0]?.revokedAt).toBeNull();
+    } finally {
+      updateSpy.mockRestore();
+    }
   });
 });

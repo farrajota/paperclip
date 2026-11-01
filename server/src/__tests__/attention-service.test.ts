@@ -1090,6 +1090,31 @@ describeEmbeddedPostgres("attention service", () => {
       .toEqual([issueKeyedFailureId, unkeyedKeptFailureId].sort());
   });
 
+  it("keeps the newest same-agent issue failure when failed runs have different timestamps", async () => {
+    const { companyId, workerId } = await seedCompany("ATK");
+    const issueId = await insertIssue({ companyId, identifier: "ATK-4", title: "Mixed-time keyed failures", status: "in_progress" });
+    const earlierId = randomUUID(), laterId = randomUUID();
+    const earlierAt = new Date("2026-07-09T12:00:00.000Z");
+    const laterAt = new Date("2026-07-09T12:00:01.000Z");
+    await db.insert(heartbeatRuns).values([earlierId, laterId].map((id, index) => {
+      const createdAt = index === 0 ? earlierAt : laterAt;
+      return {
+        id, companyId, agentId: workerId, invocationSource: "automation", status: "failed",
+        error: "adapter failed", contextSnapshot: { issueId },
+        createdAt, updatedAt: createdAt, finishedAt: createdAt,
+      };
+    }));
+    await db.insert(heartbeatRunEvents).values([earlierId, laterId].map((runId) => ({
+      companyId, runId, agentId: workerId, seq: 1, eventType: "lifecycle",
+      message: "Bounded retry exhausted after scheduled attempts",
+    })));
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter(item => item.sourceKind === "failed_run").map(item => item.subject.id))
+      .toEqual([laterId]);
+  });
+
   it("keeps newer-run response size bounded despite unrelated retained history", async () => {
     const { companyId, workerId } = await seedCompany("ATW");
     const issueId = await insertIssue({ companyId, identifier: "ATW-1", title: "Exhausted task", status: "in_progress" });
@@ -1165,7 +1190,11 @@ describeEmbeddedPostgres("attention service", () => {
       });
       expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id).sort())
         .toEqual([...keptIds].sort());
-    } finally { capture.flush(); }
+    } finally {
+      capture.flush();
+      await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    }
     const reads = events.filter(event => event.event === "paperclip.db_response_capture.entry.v1"
       && event.table === "heartbeat_runs" && (event.operation === "select" || event.operation === "execute"));
     expect(reads.reduce((sum, event) => sum + Number(event.calls), 0)).toBeGreaterThan(0);
@@ -1204,6 +1233,8 @@ describeEmbeddedPostgres("attention service", () => {
     });
     expect(feed.items.filter(item => item.sourceKind === "failed_run").map(item => item.subject.id).sort())
       .toEqual([...keptIds].sort());
+    await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
   }, 180_000);
 
   it("enriches interaction details with project, workspace, plan metadata, and images", async () => {

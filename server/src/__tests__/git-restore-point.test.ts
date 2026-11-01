@@ -216,12 +216,17 @@ describe("git restore points", () => {
     expect(manifest.preserved).toEqual([orphan]);
   });
 
-  it("keeps capture objects out of the repository", async () => {
+  it("keeps snapshot and capture objects and configuration out of the repository", async () => {
     await write(work, "notes/todo.md", "untracked work\n");
+    await fs.appendFile(path.join(work, ".git", "info", "exclude"), "*.tsbuildinfo\n");
+    await write(work, "build.tsbuildinfo", "ignored work\n");
+    const configBefore = await read(work, ".git/config");
     const before = git(work, "count-objects", "-v");
+    await currentRestorePointSnapshot(work);
     expect(await captureRestorePoint({ cwd: work, upstreamCommits: upstream() })).not.toBeNull();
     expect(git(work, "count-objects", "-v")).toBe(before);
     expect(git(work, "fsck", "--no-reflogs", "--unreachable", "--no-progress")).toBe("");
+    expect(await read(work, ".git/config")).toBe(configBefore);
   });
 
   it("produces the same snapshot ids for unchanged contents and different ids after a change", async () => {

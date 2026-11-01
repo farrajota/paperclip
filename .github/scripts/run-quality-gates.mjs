@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * run-quality-gates.mjs
- * Orchestrates all quality gates. Fetches PR data once, runs all gates,
- * posts or updates a single consolidated comment via commitperclip.
+ * Orchestrates deterministic PR metadata gates and fetches PR data once.
+ * Posts or updates a consolidated comment with the workflow's GitHub token.
  *
- * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH
+ * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
  * Exit: 0 if all quality gates pass, 1 if any fail.
  */
 import { fileURLToPath } from 'node:url';
@@ -14,7 +14,6 @@ import { checkTemplate } from './check-pr-template.mjs';
 import { checkLinkedIssue } from './check-pr-linked-issue.mjs';
 import { checkDedupSearch } from './check-pr-dedup-search.mjs';
 import { checkTestCoverage } from './check-pr-test-coverage.mjs';
-import { checkLockfile } from './check-pr-lockfile.mjs';
 import { checkDependencies } from './check-pr-dependencies.mjs';
 import { checkReleaseBootstrap } from './check-pr-release-bootstrap.mjs';
 import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors.mjs';
@@ -57,7 +56,7 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
+      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip' || c.user.login === 'github-actions[bot]') &&
            c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
@@ -83,7 +82,7 @@ async function upsertComment(token, repo, prNumber, body, existing) {
 }
 
 async function main() {
-  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
+  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
     console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER env vars required');
@@ -120,17 +119,15 @@ async function main() {
 
   const prBody = pr.body ?? '';
   const author = PR_AUTHOR ?? pr.user.login;
-  const branch = PR_BRANCH ?? pr.head.ref;
 
   // Run all quality gates (pure functions run sync, deps check is async)
   const prTitle = pr.title ?? '';
-  const [templateResult, issueResult, dedupResult, testResult, lockfileResult, depsResult, bootstrapResult] =
+  const [templateResult, issueResult, dedupResult, testResult, depsResult, bootstrapResult] =
     await Promise.all([
       Promise.resolve(checkTemplate(prBody)),
       Promise.resolve(checkLinkedIssue(prBody, prTitle)),
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
       Promise.resolve(checkTestCoverage(files, prTitle)),
-      Promise.resolve(checkLockfile(files, author, branch)),
       checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
       checkReleaseBootstrap(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
     ]);
@@ -141,7 +138,6 @@ async function main() {
     ...issueResult.failures,
     ...dedupResult.failures,
     ...testResult.failures,
-    ...lockfileResult.failures,
   ];
   const informational = [
     ...(depsResult.informational ?? []),

@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type FileChooser, type Page, type Route } from "@playwright/test";
 
 import {
   fulfill,
@@ -200,10 +200,10 @@ test.describe("chat destination partial updates", () => {
       page.getByRole("switch", { name: "Enable #general" }),
     ).not.toBeChecked();
     await page.reload();
-    await expect(target).toBeChecked();
     await expect(page.getByRole("switch", { name: /^Enable / })).toHaveCount(
       501,
     );
+    await expect(target).toBeChecked();
   });
 });
 
@@ -218,6 +218,18 @@ test.describe("Board send delivery refresh", () => {
         page,
         request,
       }) => {
+        const dismissAnnouncement = page
+          .getByRole("complementary", {
+            name: "Paperclip announcements",
+            exact: true,
+          })
+          .getByRole("button", {
+            name: "Dismiss announcement",
+            exact: true,
+          });
+        await page.addLocatorHandler(dismissAnnouncement, async (dismiss) => {
+          await dismiss.click();
+        });
         const selected = await seedCompanyAndAgent(request);
         const target = await seedCompanyAndAgent(request);
         const issue = await json<{ id: string; identifier: string }>(
@@ -278,11 +290,23 @@ test.describe("Board send delivery refresh", () => {
         if (!classic) {
           await page.getByRole("button", { name: "Add to composer" }).click();
         }
-        const chooserPromise = page.waitForEvent("filechooser");
-        await (classic
+        const uploadControl = classic
           ? page.getByRole("button", { name: "Upload attachment", exact: true })
-          : page.getByRole("menuitem", { name: "Files and images", exact: true })
-        ).click();
+          : page.getByRole("menuitem", { name: "Files and images", exact: true });
+        await page.removeLocatorHandler(dismissAnnouncement);
+        let chooser: FileChooser;
+        try {
+          const chooserPromise = page.waitForEvent("filechooser");
+          const [, selectedChooser] = await Promise.all([
+            uploadControl.click(),
+            chooserPromise,
+          ]);
+          chooser = selectedChooser;
+        } finally {
+          await page.addLocatorHandler(dismissAnnouncement, async (dismiss) => {
+            await dismiss.click();
+          });
+        }
         const responsePromise = page.waitForResponse(
           (response) =>
             response.request().method() === "POST" &&
@@ -290,7 +314,7 @@ test.describe("Board send delivery refresh", () => {
               new URL(response.url()).pathname,
             ),
         );
-        await (await chooserPromise).setFiles(file);
+        await chooser.setFiles(file);
         const response = await responsePromise;
         expect.soft(response.status(), await response.text()).toBe(201);
         expect

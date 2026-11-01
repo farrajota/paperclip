@@ -73,6 +73,14 @@ for (const action of ["task_retry", "retry_after_reload", "inbox_retry", "messag
         });
       }
       const taskUrl = `/${company.issuePrefix}/issues/${issue.identifier}`;
+      const taskDetailResponse = action === "retry_after_reload"
+        ? page.waitForResponse(response => {
+            const url = new URL(response.url());
+            return response.request().method() === "GET"
+              && url.pathname === `/api/issues/${issue.identifier}`
+              && url.searchParams.get("view") !== "core";
+          })
+        : undefined;
       await page.goto(action === "inbox_retry" ? `/${company.issuePrefix}/inbox/all` : taskUrl);
       if (action === "task_retry") {
         const notice = page.getByRole("status", { name: "Task status" });
@@ -83,6 +91,22 @@ for (const action of ["task_retry", "retry_after_reload", "inbox_retry", "messag
         await test.info().attach("task-retry", { body: await notice.screenshot(), contentType: "image/png" });
       }
       if (action === "retry_after_reload") {
+        const selectedTask = await json(await taskDetailResponse!);
+        expect(selectedTask).toMatchObject({
+          id: issue.id,
+          identifier: issue.identifier,
+          status: "blocked",
+          assigneeAgentId: agent.id,
+          interruption: {
+            responsibility: "system",
+            state: "failed",
+            canRetry: true,
+            observedRunId: sourceRunId,
+          },
+        });
+        const notice = page.getByRole("status", { name: "Task status" });
+        await expect(notice).toContainText("Couldn’t finish this attempt. Your message is saved.");
+        await expect(notice.getByRole("button", { name: "Retry", exact: true })).toBeEnabled();
         await page.reload();
         await expect(page.getByRole("button", { name: "Try again", exact: true })).toHaveCount(0);
         await expect(page.getByRole("button", { name: "Retry", exact: true })).toBeEnabled();

@@ -32,10 +32,11 @@ import {
 } from "../../../errors.js";
 import { logger } from "../../../middleware/logger.js";
 
-import {
-  DiscordAdapterCompatibilityError,
-  type ChatSdkMessageCallbackEvent,
-  type DiscordRootMentionAdmissionEvent,
+import { DiscordAdapterCompatibilityError } from "../../chat-sdk-runtime-errors.js";
+
+import type {
+  ChatSdkMessageCallbackEvent,
+  DiscordRootMentionAdmissionEvent,
 } from "../../chat-sdk-runtime.js";
 
 import { classifyChatPublicationError } from "../../chat-publication-errors.js";

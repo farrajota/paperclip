@@ -59,11 +59,7 @@ import {
   isUuidLike,
 } from "@paperclipai/shared";
 
-import {
-  nativeFailedRunRetryStateIsSafe,
-  nativePreProviderRetryAfterCleanupStateIsSafe,
-  nativeProviderRecoveryEvidence,
-} from "../native-runtime/native-session-executor.js";
+import type * as NativeSessionExecutor from "../native-runtime/native-session-executor.js";
 
 import {
   HttpError,
@@ -514,11 +510,12 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           detail.checkpointExists !== true))
     )
       throw failedChatRetryDenied();
-    const evidence = await nativeProviderRecoveryEvidence({
+    const nativeSessionExecutor = await import("../native-runtime/native-session-executor.js");
+    const evidence = await nativeSessionExecutor.nativeProviderRecoveryEvidence({
       db: tx as unknown as Db,
       runId: run.id,
       sourceFailureCode: detail.originalFailureCode as Parameters<
-        typeof nativeProviderRecoveryEvidence
+        typeof NativeSessionExecutor.nativeProviderRecoveryEvidence
       >[0]["sourceFailureCode"],
     });
     if (
@@ -584,9 +581,11 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
     if (run.runtimeMode !== "native") return;
     const { coordinator, leases, retiredOwner } =
       await failedNativeRetryCoordinator(tx, run, source.issueId);
+    // Keep chat retry startup lightweight; only authorized native retry checks need executor predicates.
+    const nativeSessionExecutor = await import("../native-runtime/native-session-executor.js");
     if (retiredOwner) {
       if (
-        !nativePreProviderRetryAfterCleanupStateIsSafe({
+        !nativeSessionExecutor.nativePreProviderRetryAfterCleanupStateIsSafe({
           failedExecution: run.runnerProfileJson?.nativeExecutionInput,
           retiredExecution:
             retiredOwner.predecessor.runnerProfileJson?.nativeExecutionInput,
@@ -616,7 +615,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       (checkpoint?.providerSessionId != null &&
         (typeof checkpoint.providerSessionId !== "string" ||
           checkpoint.providerSessionId.trim().length === 0)) ||
-      !nativeFailedRunRetryStateIsSafe({
+      !nativeSessionExecutor.nativeFailedRunRetryStateIsSafe({
         execution: run.runnerProfileJson?.nativeExecutionInput,
         companyId,
         issueId: source.issueId,

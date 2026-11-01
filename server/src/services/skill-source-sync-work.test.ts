@@ -36,6 +36,7 @@ describe.skipIf(!support.supported)('skill source committed work and deadlines',
   let contextFor: ReturnType<typeof vi.fn<() => Promise<SkillSourceContext>>>;
   let reads: ReturnType<typeof vi.fn>;
   let failDeadline: boolean;
+  let admittedRun: Promise<unknown> | undefined;
   beforeAll(async () => {
     if (externalUrl) await applyPendingMigrations(externalUrl);
     else database = await startEmbeddedPostgresTestDatabase('skill-sync-work-');
@@ -46,6 +47,7 @@ describe.skipIf(!support.supported)('skill source committed work and deadlines',
   beforeEach(async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'], shouldAdvanceTime: true });
     draining = false; standby = false; calls = []; errors = []; failDeadline = false;
+    admittedRun = undefined;
     companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: 'Skill sync', issuePrefix: 'SSW' });
     const reader = githubFixture({ 'test/SKILL.md': '---\nname: test\ndescription: Test workflow\n---\nFollow the workflow.\n' });
@@ -93,12 +95,22 @@ describe.skipIf(!support.supported)('skill source committed work and deadlines',
     coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => !draining && !standby,
       canReconcile: () => !standby, onError: error => errors.push(error) });
     service = skillSourceSyncService(observed, { context: contextFor });
-    await service.start(coordinator).ready;
+    await service.start({ register: (queue, task) => coordinator.register(queue, {
+      ...task,
+      run: signal => {
+        const run = task.run(signal);
+        admittedRun = run;
+        return run;
+      },
+    }) }).ready;
   }
   async function settle() {
     await vi.advanceTimersByTimeAsync(0);
+    // The idle assertion is not a deadline for an already-running real-I/O sweep.
+    if (admittedRun) await Promise.allSettled([admittedRun]);
     await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0));
     await vi.advanceTimersByTimeAsync(0);
+    if (admittedRun) await Promise.allSettled([admittedRun]);
     await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0));
   }
   async function quiet(ms = 60_000) {

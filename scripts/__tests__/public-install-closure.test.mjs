@@ -53,7 +53,7 @@ test('the Build lane warms the cache before pnpm build and hands the same direct
   const build = workflow.slice(workflow.indexOf('\n  build:\n'), workflow.indexOf('\n  verify_serialized_server:\n'));
   const position = fragment => { const index = build.indexOf(fragment); assert.notEqual(index, -1, `Build job must contain ${fragment}`); return index; };
   const warm = position('PAPERCLIP_PUBLIC_INSTALL_NPM_CACHE="$RUNNER_TEMP/public-install-npm-cache" node scripts/warm-public-install-npm-cache.mjs');
-  assert.ok(position('- name: Install dependencies') < warm && warm < position('- name: Build\n'), 'the warm-up overlaps the Rust restore and pnpm build');
+  assert.ok(position('uses: ./.github/actions/setup-ci-dependencies') < warm && warm < position('- name: Build\n'), 'the warm-up overlaps the Rust restore and pnpm build');
   assert.ok(build.includes('set +e\n'), 'a failed warm-up still records its status, so the verifier never waits it out');
   const verify = position('export PAPERCLIP_PUBLIC_INSTALL_NPM_CACHE="$RUNNER_TEMP/public-install-npm-cache"');
   assert.ok(verify < position('node scripts/verify-grok-npm-install.mjs'));

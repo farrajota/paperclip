@@ -3,7 +3,9 @@ import copy
 import importlib.util
 import json
 import os
+from multiprocessing import get_context
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
@@ -41,8 +43,11 @@ class ClientContract(unittest.TestCase):
         client_module.ROOT.mkdir(parents=True)
         (client_module.ROOT / "instructions.md").write_text(client_path.with_name("instructions.md").read_text())
         self.client = client_module.Client(BINDING)
-        self.client.configure(ORIGIN, SCOPE)
-        self.client.remember_identity(identity())
+        # Seed one complete private test profile directly; public configure/identity flows have dedicated contract cases.
+        self.client._publish_profile({"version": 1, "bindingId": BINDING, "origin": ORIGIN,
+                                      "credentialName": CREDENTIAL_NAME, "delegationScope": SCOPE, "generation": 1})
+        self._detector_harness_ready = False
+        self._detector_asset_ready = False
         self.helper = Mock()
         self.helper.read_json_response.side_effect = lambda response: json.loads(response.read())
         self.authd_patch = patch.object(client_module, "AUTHD", self.helper)
@@ -428,10 +433,11 @@ class ClientContract(unittest.TestCase):
     def run_detector(self, response=None, status=200, dry=True, wrapper=False):
         root = Path(self.temporary.name)
         runtime = root / "hook-runtime.sh"
-        runtime.write_text('silent() { printf "SILENT:%s\\n" "$1"; }\nwake() { printf "WAKE:%s\\n" "$1"; }\ndisable_after_run() { printf "DISABLE\\n"; }\n')
         # Run the shipped Bash/embedded Python or actual no-argument wrapper.
         # Only temporary HOME and the HTTPS transport are replaced.
-        (root / "sitecustomize.py").write_text("""
+        if not self._detector_harness_ready:
+            runtime.write_text('silent() { printf "SILENT:%s\\n" "$1"; }\nwake() { printf "WAKE:%s\\n" "$1"; }\ndisable_after_run() { printf "DISABLE\\n"; }\n')
+            (root / "sitecustomize.py").write_text("""
 import json, os
 from pathlib import Path
 from unittest.mock import Mock
@@ -453,12 +459,15 @@ class Opener:
         if status != 200: raise urllib.error.HTTPError(request.full_url, status, 'Synthetic unavailable', None, None)
         return Response()
 urllib.request.build_opener = lambda *args: Opener()
-""")
+            """)
+            self._detector_harness_ready = True
         (root / "requests.jsonl").unlink(missing_ok=True)
         detector = client_path.with_name('detector.sh')
         if wrapper:
             installed = client_module.ROOT / "detector.sh"
-            installed.write_bytes(detector.read_bytes())
+            if not self._detector_asset_ready:
+                installed.write_bytes(detector.read_bytes())
+                self._detector_asset_ready = True
             invocation = [str(client_module.HOOK_ROOT / ("paperclip-muse-" + BINDING + ".sh"))]
         else:
             invocation = ['bash', str(detector), BINDING]
@@ -1151,6 +1160,79 @@ urllib.request.build_opener = lambda *args: Opener()
             answer = self.client.answer(ASSIGNMENT, "question-2")
         self.assertEqual(answer["continuationReceiptId"], rows["question-2"]["continuationReceiptId"])
 
+
+def run_contract_case(name):
+    result = unittest.TestResult()
+    ClientContract(name).run(result)
+    # Return formatted diagnostics, not test instances holding module patches,
+    # mocks or open streams. Keep subtest identities and real tracebacks intact.
+    return {
+        "testsRun": result.testsRun,
+        "details": {
+            attribute: [(str(case), detail) for case, detail in getattr(result, attribute)]
+            for attribute in ("errors", "failures", "skipped", "expectedFailures")
+        },
+        "unexpectedSuccesses": len(result.unexpectedSuccesses),
+    }
+
+
+_CONTRACT_CANCELLATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def initialize_contract_worker():
+    # Fork inherits the parent's handlers and blocked cancellation signals.
+    # Workers must be terminable even while running a blocked case.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _CONTRACT_CANCELLATION_SIGNALS)
+
+
+def cancel_contract_run(signum, frame):
+    # Defer repeated cancellation until the parent's cleanup has reaped workers.
+    signal.pthread_sigmask(signal.SIG_BLOCK, _CONTRACT_CANCELLATION_SIGNALS)
+    raise SystemExit(128 + signum)
+
+
+class IsolatedContractSuite(unittest.TestSuite):
+    def run(self, result, debug=False):
+        cases = list(self)
+        names = [case.id().rsplit(".", 1)[1] for case in cases]
+        # Fork before setUp: module/os patches must never overlap in one process.
+        # Two workers overlap independent fsync/subprocess waits without removing
+        # any publication, durability operation, detector invocation or cleanup.
+        previous_handlers = {signum: signal.getsignal(signum) for signum in _CONTRACT_CANCELLATION_SIGNALS}
+        # Do not allow cancellation between starting workers and owning the pool.
+        # Its threads inherit the mask; only the parent main thread handles it.
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _CONTRACT_CANCELLATION_SIGNALS)
+        pool = None
+        try:
+            for signum in _CONTRACT_CANCELLATION_SIGNALS:
+                signal.signal(signum, cancel_contract_run)
+            pool = get_context("fork").Pool(processes=2, initializer=initialize_contract_worker)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            for case, outcome in zip(cases, pool.imap(run_contract_case, names)):
+                result.testsRun += outcome["testsRun"]
+                for attribute, details in outcome["details"].items():
+                    getattr(result, attribute).extend(
+                        (case, description + "\n" + detail) for description, detail in details)
+                result.unexpectedSuccesses.extend([case] * outcome["unexpectedSuccesses"])
+                if not any(outcome["details"].values()) and not outcome["unexpectedSuccesses"]:
+                    result.addSuccess(case)
+        finally:
+            signal.pthread_sigmask(signal.SIG_BLOCK, _CONTRACT_CANCELLATION_SIGNALS)
+            try:
+                if pool is not None:
+                    # Outcomes already include tearDown. Terminate also stops
+                    # blocked workers on error/cancellation; join reaps our pool.
+                    pool.terminate()
+                    pool.join()
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        return result
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--receiver-sequence"]:
         sequence = json.load(sys.stdin)
@@ -1161,5 +1243,9 @@ if __name__ == "__main__":
         result = unittest.TextTestRunner().run(case)
         if result.wasSuccessful():
             print(json.dumps({"outputs": ["wake", "idle", "wake", "duplicate", "wake", "idle"], "providerAcknowledgement": "not_observed"}))
+        sys.exit(0 if result.wasSuccessful() else 1)
+    if not sys.argv[1:]:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(ClientContract)
+        result = unittest.TextTestRunner().run(IsolatedContractSuite(suite))
         sys.exit(0 if result.wasSuccessful() else 1)
     unittest.main()

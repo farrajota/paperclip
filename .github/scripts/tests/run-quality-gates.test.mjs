@@ -30,6 +30,18 @@ test('findExistingComment: paginates until it finds the commitperclip comment', 
   ]);
 });
 
+test('findExistingComment: updates a workflow-owned quality comment', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 2,
+      user: { login: 'github-actions[bot]' },
+      body: 'Quality review needs changes.\n\n— commitperclip',
+    },
+  ]), 'token', 'farrajota/paperclip', 1);
+
+  assert.equal(comment.id, 2);
+});
+
 test('findExistingComment: returns null when no signed comment exists', async () => {
   const comment = await findExistingComment(async () => ([
     {

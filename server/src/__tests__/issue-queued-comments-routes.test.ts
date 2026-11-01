@@ -37,13 +37,14 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+import { NativeSessionSteeringError } from "../services/native-runtime/native-session-errors.js";
 const steerNativeSessionMock = vi.hoisted(() => vi.fn());
 vi.mock("../services/native-runtime/native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
   steerNativeSessionMock.mockImplementation(actual.steerNativeSession);
   return { ...actual, steerNativeSession: steerNativeSessionMock };
 });
-const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
+// Error identity is shared with the executor through the canonical error owner.
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;

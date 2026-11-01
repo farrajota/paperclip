@@ -1,4 +1,5 @@
-import { AbortMultipartUploadCommand, CompleteMultipartUploadCommand, CreateMultipartUploadCommand, UploadPartCommand, type S3Client } from "@aws-sdk/client-s3";
+import type { S3Client } from "@aws-sdk/client-s3";
+import { getS3Sdk } from "../lib/aws-s3-runtime.js";
 import { Readable } from "node:stream";
 import type { PutObjectInput } from "./types.js";
 import { withS3FailureDiagnostics } from "./s3-failure.js";
@@ -6,6 +7,7 @@ import { withS3FailureDiagnostics } from "./s3-failure.js";
 /** Each part is streamed too: multipart must not become another whole-file
  * buffer or a fixed part-count ceiling below the storage provider's limits. */
 export async function putS3Multipart(client: S3Client, bucket: string, key: string, input: PutObjectInput) {
+  const { AbortMultipartUploadCommand, CompleteMultipartUploadCommand, CreateMultipartUploadCommand, UploadPartCommand } = getS3Sdk();
   const source = input.body instanceof Readable ? input.body : Readable.from([input.body]);
   const iterator = source[Symbol.asyncIterator]();
   let pending = Buffer.alloc(0);

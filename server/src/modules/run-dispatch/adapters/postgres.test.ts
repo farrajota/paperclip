@@ -6,10 +6,12 @@ import {
   activityLog,
   agents,
   approvals,
+  authUsers,
   budgetIncidents,
   budgetPolicies,
   budgetReservations,
   companies,
+  companyMemberships,
   costEvents,
   createDb,
   documentRevisions,
@@ -89,6 +91,8 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await db.delete(heartbeatRuns);
     await db.delete(projects);
     await db.delete(agents);
+    await db.delete(companyMemberships);
+    await db.delete(authUsers);
     await db.delete(companies);
   });
 
@@ -585,6 +589,86 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       transactionSpy.mockRestore();
       vi.unstubAllEnvs();
     }
+  });
+  it("rejects private business work after the responsible user's company membership is suspended", async () => {
+    vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const responsibleUserId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(authUsers).values({
+      id: responsibleUserId,
+      name: "Responsible user",
+      email: `${responsibleUserId}@example.test`,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+    await seedIssue({ companyId, issueId, assigneeAgentId: agentId, status: "in_progress" });
+    await db.update(issues).set({ visibility: "private", responsibleUserId }).where(eq(issues.id, issueId));
+    const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ responsibleUserId }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.principalId, responsibleUserId));
+    const dispatch = vi.fn(async () => "provider must not start");
+    try {
+      const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+        companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(),
+        enforceContinuationOwnership: false, businessWorkAdmission: true, dispatch,
+      });
+      expect(gate).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_access_revoked" } });
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("reuses a terminal checkout after its cleanup is complete", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await seedIssue({ companyId, issueId, assigneeAgentId: agentId, status: "in_progress" });
+    const checkoutRunId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, checkoutRunId));
+    const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId }).where(eq(issues.id, issueId));
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const dispatch = vi.fn(async () => "provider started");
+
+    const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(),
+      enforceContinuationOwnership: false, businessWorkAdmission: true, dispatch,
+    });
+
+    expect(gate).toMatchObject({ dispatched: true });
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
+  it.each(["live", "cleanup pending"] as const)("keeps an unreleased prior checkout from provider admission: %s", async state => {
+    const f = state === "cleanup pending" ? await seedCleanupRetry("queued") : null;
+    const { companyId, agentId } = f ?? await seedCompanyAndAgent();
+    const issueId = f?.issueId ?? randomUUID();
+    if (!f) await seedIssue({ companyId, issueId, assigneeAgentId: agentId, status: "in_progress" });
+    const checkoutRunId = f?.sourceId ?? await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    const runId = f?.runId ?? await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId }).where(eq(issues.id, issueId));
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const dispatch = vi.fn(async () => "must not start");
+
+    const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(),
+      enforceContinuationOwnership: false, businessWorkAdmission: true, dispatch,
+    });
+
+    expect(gate).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_execution_lock_changed" } });
+    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it.each(["revoke", "delete"] as const)("fences an actual grant %s from the final private read through synchronous handoff", async mutation => {

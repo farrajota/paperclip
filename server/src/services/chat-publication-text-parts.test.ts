@@ -7,11 +7,11 @@ import {
   stringifyMarkdown,
 } from "chat";
 import type { SafeChatPublicationPayload } from "@paperclipai/shared";
+import { renderPublicationTransportText } from "./chat-publication-text-parts.js";
 import {
   nativePublicationTextFits,
-  renderPublicationTransportText,
   splitNativePublicationText,
-} from "./chat-publication-text-parts.js";
+} from "./chat-publication-text-splitting.js";
 
 function slackMarkdown(text: string) {
   const payload = new SlackFormatConverter().toSlackPayload({ markdown: text });

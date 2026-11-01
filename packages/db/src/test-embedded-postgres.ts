@@ -168,6 +168,8 @@ function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
 // stop gracefully before abandoning the wait and returning from the hook.
 const EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 5000;
 
+const pendingEmbeddedPostgresCleanups = new Map<Promise<void>, string>();
+
 // `embedded-postgres@18.1.0-beta.16` exposes only `stop(): Promise<void>` — no
 // shutdown-mode argument. Internally it SIGINTs the postgres process (already
 // PostgreSQL "fast shutdown") and resolves *only* on the child's `exit` event,
@@ -178,19 +180,19 @@ const EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 5000;
 // the abandoned process still exits on its own (and again when the runner exits).
 // Errors are swallowed, matching prior behavior.
 //
-// `cleanupFn` (data-dir reclaim) is chained on the raw `stop()` promise, not on
+// Data-dir reclaim is chained on the raw `stop()` promise, not on
 // the timeout race, so the disposable data dir is removed *only after* `stop()`
 // actually settles — i.e. once the child Postgres process has exited. Removing
 // it on the timeout path would pull the data files out from under a still-running
-// cluster and provoke checkpoint / WAL I/O errors. In the fast path `cleanupFn`
+// cluster and provoke checkpoint / WAL I/O errors. In the fast path reclaim
 // has run by the time this resolves; in the timeout path it runs asynchronously
 // once the abandoned process finally exits.
 async function stopEmbeddedPostgresBounded(
   instance: EmbeddedPostgresInstance | null,
-  cleanupFn?: () => void,
+  dataDir: string,
 ): Promise<void> {
   if (!instance) {
-    cleanupFn?.();
+    cleanupEmbeddedPostgresTestDirs(dataDir);
     return;
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -201,11 +203,13 @@ async function stopEmbeddedPostgresBounded(
     })
     .finally(() => {
       try {
-        cleanupFn?.();
+        cleanupEmbeddedPostgresTestDirs(dataDir);
       } catch {
         // Best-effort reclaim; ignore removal errors.
       }
+      pendingEmbeddedPostgresCleanups.delete(stopped);
     });
+  pendingEmbeddedPostgresCleanups.set(stopped, dataDir);
   try {
     await Promise.race([
       stopped,
@@ -250,9 +254,7 @@ async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
       });
       // Stop the failed cluster and remove its data directory. The next attempt
       // allocates a fresh port and a fresh data directory.
-      await stopEmbeddedPostgresBounded(created.instance, () =>
-        cleanupEmbeddedPostgresTestDirs(created.dataDir),
-      );
+      await stopEmbeddedPostgresBounded(created.instance, created.dataDir);
     }
   }
 
@@ -528,7 +530,7 @@ async function buildEmbeddedPostgresTemplate(templateDir: string): Promise<boole
     return true;
   } finally {
     if (!published) {
-      await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+      await stopEmbeddedPostgresBounded(instance, dataDir);
     }
   }
 }
@@ -603,9 +605,7 @@ async function startEmbeddedPostgresFromTemplateWithRetry(
         fallbackMessage: "embedded Postgres startup from template failed",
         recentLogs: created?.getRecentLogs(),
       });
-      await stopEmbeddedPostgresBounded(created?.instance ?? null, () =>
-        cleanupEmbeddedPostgresTestDirs(rootDir),
-      );
+      await stopEmbeddedPostgresBounded(created?.instance ?? null, rootDir);
     }
   }
 
@@ -624,6 +624,18 @@ export const __startEmbeddedPostgresWithRetryForTests = startEmbeddedPostgresWit
 export const __embeddedPostgresStartMaxAttemptsForTests = EMBEDDED_POSTGRES_START_MAX_ATTEMPTS;
 export const __embeddedPostgresTemplateRootDirForTests = templateRootDir;
 export const __isUsableEmbeddedPostgresTemplateForTests = isUsableTemplate;
+// A bounded cleanup can return while its child is still shutting down. Tests
+// removing a scratch parent must await the raw stops and reclaim underneath
+// that parent, without delaying unrelated clusters or changing the stop bound.
+export async function __waitForEmbeddedPostgresCleanupForTests(rootDir: string): Promise<void> {
+  const root = path.resolve(rootDir);
+  const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+  const cleanups: Promise<void>[] = [];
+  for (const [stopped, dataDir] of pendingEmbeddedPostgresCleanups) {
+    if (dataDir === root || dataDir.startsWith(prefix)) cleanups.push(stopped);
+  }
+  await Promise.all(cleanups);
+}
 export function __lastEmbeddedPostgresStartModeForTests(): EmbeddedPostgresStartMode | null {
   return lastStartMode;
 }
@@ -661,7 +673,7 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
   } finally {
     if (started) {
       const { dataDir, instance } = started;
-      await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+      await stopEmbeddedPostgresBounded(instance, dataDir);
     }
   }
 }
@@ -726,11 +738,11 @@ export async function startEmbeddedPostgresTestDatabase(
         // but a queued write on that connection still fires later and finds
         // a null socket.
         await closeRegisteredClients(connectionString);
-        await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+        await stopEmbeddedPostgresBounded(instance, dataDir);
       },
     };
   } catch (error) {
-    await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+    await stopEmbeddedPostgresBounded(instance, dataDir);
     throw new Error(
       `Failed to start embedded PostgreSQL test database: ${
         formatEmbeddedPostgresError(error, {

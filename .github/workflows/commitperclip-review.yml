@@ -4,12 +4,12 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
-# Always runs from base branch context — never executes PR code.
-# pull_request_target gives access to secrets for untrusted fork PRs.
+# pull_request_target runs the base-branch workflow. These steps check out only
+# the event's trusted base SHA and never execute PR-controlled files.
 
 permissions:
-  pull-requests: write
-  checks: write
+  pull-requests: read
+  issues: write
   contents: read
 
 jobs:
@@ -20,10 +20,13 @@ jobs:
       - name: Checkout base branch (never PR code)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: master
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - name: Dependency Review
+        id: dependency_review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        continue-on-error: true
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
           head-ref: ${{ github.event.pull_request.head.sha }}
@@ -33,31 +36,19 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Generate commitperclip token
-        id: token
-        run: |
-          TOKEN=$(node .github/scripts/get-bot-token.mjs)
-          echo "::add-mask::$TOKEN"
-          echo "value=$TOKEN" >> $GITHUB_OUTPUT
-        env:
-          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
-
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.token.outputs.value }}
+          GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
 
+      # Run both independent reviews, then fail the job if either one fails.
       - name: Fail if quality gates failed
-        if: >-
-          github.event.pull_request.user.login != 'dependabot[bot]' &&
-          steps.quality.outcome == 'failure'
+        if: always() && (steps.quality.outcome == 'failure' || steps.dependency_review.outcome == 'failure')
         run: |
-          echo "One or more quality gates failed. See commitperclip comment on the PR for details."
+          echo "Dependency review or one or more PR quality gates failed."
           exit 1

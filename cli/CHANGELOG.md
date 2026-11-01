@@ -1,5 +1,11 @@
 # paperclipai
 
+## Unreleased
+
+### Patch Changes
+
+- Load the heartbeat command and its adapter formatters only when `heartbeat run` executes, avoiding those imports during other CLI commands while preserving command registration and foreground startup checks.
+
 ## 0.3.1
 
 ### Patch Changes

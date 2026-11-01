@@ -4,8 +4,8 @@ import { AGENT_FILES_CONTRACT } from "../agent-file-store.js";
 import { AgentDirectoryReuseInvalidatedError } from "../agent-directory-working-copies.js";
 
 const native = vi.hoisted(() => ({ reserve: vi.fn(), claim: vi.fn() }));
-vi.mock("../native-runtime/index.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../native-runtime/index.js")>(),
+vi.mock("../native-runtime/native-session-executor.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../native-runtime/native-session-executor.js")>(),
   reserveWarmNativeInstructionDirectory: native.reserve,
   claimWarmNativeInstructionCopy: native.claim,
 }));

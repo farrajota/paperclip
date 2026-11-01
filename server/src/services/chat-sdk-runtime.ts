@@ -120,6 +120,10 @@ import {
   createPaperclipChatSdkState,
   type ChatSdkStatePersistence,
 } from "./chat-sdk-state.js";
+import {
+  ChatSdkEndpointNotRegisteredError,
+  DiscordAdapterCompatibilityError,
+} from "./chat-sdk-runtime-errors.js";
 
 export const CHAT_SDK_VERSION = "4.39.0";
 export const CHAT_SDK_SOURCE_REVISION =
@@ -600,14 +604,6 @@ export class TeamsAdapterCompatibilityError extends Error {
   }
 }
 
-export class DiscordAdapterCompatibilityError extends Error {
-  readonly code = "CHAT_ADAPTER_COMPATIBILITY_ERROR";
-
-  constructor(detail: string) {
-    super(`The pinned Discord adapter is incompatible: ${detail}`);
-    this.name = "DiscordAdapterCompatibilityError";
-  }
-}
 
 export class SlackAdapterCompatibilityError extends Error {
   readonly code = "CHAT_ADAPTER_COMPATIBILITY_ERROR";
@@ -3164,15 +3160,6 @@ export function createChatSdkEndpointRuntime(
   return new ChatSdkEndpointRuntime(options);
 }
 
-export class ChatSdkEndpointNotRegisteredError extends Error {
-  readonly endpointId: string;
-
-  constructor(endpointId: string) {
-    super(`No Chat SDK runtime is registered for endpoint ${endpointId}`);
-    this.name = "ChatSdkEndpointNotRegisteredError";
-    this.endpointId = endpointId;
-  }
-}
 
 /** Process-local lifecycle registry; durable state remains in Paperclip persistence. */
 export class ChatSdkRuntime {

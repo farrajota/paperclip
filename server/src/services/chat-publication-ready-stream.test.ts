@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createChatSdkEndpointRuntime } from "./chat-sdk-runtime.js";
 import { streamSafePublicationText } from "./chat-publication-stream.js";
 import { classifyChatPublicationError } from "./chat-publication-errors.js";
-import { nativePublicationTextFits } from "./chat-publication-text-parts.js";
+import { nativePublicationTextFits } from "./chat-publication-text-splitting.js";
 
 // Local qualification only: load an independently copied candidate module,
 // never a behavioral mock. CI/default runs use the installed pinned adapter.

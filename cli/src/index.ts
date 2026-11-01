@@ -9,7 +9,6 @@ import { envCommand } from "./commands/env.js";
 import { channelsCommand } from "./commands/channels.js";
 import { configure } from "./commands/configure.js";
 import { addAllowedHostname } from "./commands/allowed-hostname.js";
-import { heartbeatRun } from "./commands/heartbeat-run.js";
 import { runCommand } from "./commands/run.js";
 import { bootstrapCeoInvite } from "./commands/auth-bootstrap-ceo.js";
 import { dbBackupCommand } from "./commands/db-backup.js";
@@ -232,7 +231,10 @@ heartbeat
   .option("--timeout-ms <ms>", "Max time to wait before giving up", "0")
   .option("--json", "Output raw JSON where applicable")
   .option("--debug", "Show raw adapter stdout/stderr JSON chunks")
-  .action(heartbeatRun);
+  .action(async (opts) => {
+    const { heartbeatRun } = await import("./commands/heartbeat-run.js");
+    await heartbeatRun(opts);
+  });
 
 registerContextCommands(program);
 registerConnectCommand(program);

@@ -19,6 +19,7 @@ import {
   principalPermissionGrants,
   routines,
   routineTriggers,
+  authUsers,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -53,6 +54,7 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("companyService", () => {
   let db!: ReturnType<typeof createDb>;
   let lifecycleWorker: ReturnType<typeof startAgentLifecycle>;
+  let fixtureUserId: string | null = null;
   beforeEach(() => {
     lifecycleWorker = startAgentLifecycle(db, { ...createLifecycleDriver(db, {} as never),
       requiredPluginIds: async () => [], runPlugin: async () => "complete" }, () => true);
@@ -87,6 +89,10 @@ describeEmbeddedPostgres("companyService", () => {
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
+    if (fixtureUserId) {
+      await db.delete(authUsers).where(eq(authUsers.id, fixtureUserId));
+      fixtureUserId = null;
+    }
     await db.delete(cases);
     await db.delete(issues);
     await db.delete(companies);
@@ -137,6 +143,25 @@ describeEmbeddedPostgres("companyService", () => {
     await reconcileBuiltInAgentsOnStartup(db);
     const afterReconcileRows = await db.select().from(agents).where(eq(agents.companyId, created.id));
     expect(afterReconcileRows.filter((row) => readBuiltInAgentMarker(row.metadata))).toHaveLength(0);
+    const ownerUserId = randomUUID();
+    fixtureUserId = ownerUserId;
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: ownerUserId,
+      name: "Fresh Company Owner",
+      email: `${ownerUserId}@example.test`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(companyMemberships).values({
+      companyId: created.id,
+      principalType: "user",
+      principalId: ownerUserId,
+      status: "active",
+      membershipRole: "owner",
+      createdAt: now,
+      updatedAt: now,
+    });
 
     // The Reflection Coach remains available to enable on demand, and enabling
     // it materializes its bundled skill + paused routine.
@@ -165,6 +190,8 @@ describeEmbeddedPostgres("companyService", () => {
     expect(routine).toMatchObject({
       status: "paused",
       assigneeAgentId: enabled.agentId,
+      responsibleUserId: ownerUserId,
+      createdByUserId: null,
       originKind: "built_in_agent_bundle",
       originId: "reflection-coach:recent-agent-reflection",
     });

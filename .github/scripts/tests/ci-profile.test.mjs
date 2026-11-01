@@ -336,8 +336,11 @@ test("workflow exporter runs trusted code and keeps keys out of the PR jobs", ()
   assert.equal(pr.match(/path: \.ci-profile\/\*\.ndjson\n {10}include-hidden-files: true/g).length, 9);
   const routing = readFileSync(new URL("../../workflows/ci-routing.yml", import.meta.url), "utf8");
   assert.match(routing, /PROFILE_CI: \$\{\{ steps.profile.outputs.profile_ci \}\}/);
-  assert.match(routing, /\/git\/ref\/heads\/master/);
-  assert.match(routing, /authorize\.mjs\?ref=\$TRUSTED_PROFILE_SHA/);
+  assert.match(routing, /EVENT_BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
+  assert.match(routing, /\[\[ ! "\$EVENT_BASE_SHA" =~ \^\[0-9a-f\]\{40\}\$ \]\]/);
+  assert.match(routing, /\/repos\/\$GITHUB_REPOSITORY\/contents\/scripts\/ci-profile\/authorize\.mjs\?ref=\$EVENT_BASE_SHA/);
+  assert.match(routing, /export TRUSTED_PROFILE_SHA="\$EVENT_BASE_SHA"\n\s+node "\$RUNNER_TEMP\/ci-profile-authorize\.mjs"/);
+  assert.doesNotMatch(routing, /git\/ref\/heads\/master|paperclipai\/paperclip\/contents\/scripts\/ci-profile/);
 });
 
 test("artifact parsing never extracts paths or executes files and rejects oversized records", () => {

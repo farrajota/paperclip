@@ -1,3 +1,9 @@
+import {
+  NativeCancellationPendingRecoveryError,
+  NativeControllerDetachedForRestartError,
+  NativeRuntimeRequestResolutionError,
+  NativeSessionSteeringError,
+} from "./native-session-errors.js";
 import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
 import { type ProviderPackInstallation, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
@@ -241,19 +247,6 @@ class NativeResultPendingFinalizationError extends Error {
   }
 }
 
-export class NativeCancellationPendingRecoveryError extends Error {
-  constructor() {
-    super("native_cancellation_pending_recovery");
-    this.name = "NativeCancellationPendingRecoveryError";
-  }
-}
-
-export class NativeControllerDetachedForRestartError extends Error {
-  constructor() {
-    super("native_controller_detached_for_restart");
-    this.name = "NativeControllerDetachedForRestartError";
-  }
-}
 
 const activeNativeSessions = new Map<string, ActiveNativeSession>();
 // Shutdown can race provider startup before onSession publishes its handle.
@@ -6713,34 +6706,6 @@ export type NativeSessionSteeringState = {
   activeTurnId: string | null;
 };
 
-export class NativeSessionSteeringError extends Error {
-  constructor(
-    readonly code:
-      | "steering_unsupported"
-      | "steering_temporarily_unavailable"
-      | "steering_stale_turn"
-      | "steering_timeout"
-      | "steering_rejected",
-    message: string,
-  ) {
-    super(message);
-    this.name = "NativeSessionSteeringError";
-  }
-}
-
-export class NativeRuntimeRequestResolutionError extends Error {
-  constructor(
-    readonly code:
-      | "native_session_not_active"
-      | "runtime_request_resolution_unsupported"
-      | "runtime_request_stale_turn"
-      | "runtime_request_resolution_conflict",
-    message: string,
-  ) {
-    super(message);
-    this.name = "NativeRuntimeRequestResolutionError";
-  }
-}
 
 /** Resolve a provider runtime request on an in-process native backend. */
 export async function resolveNativeRuntimeRequest(input: {

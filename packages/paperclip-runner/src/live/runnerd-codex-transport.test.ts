@@ -45,7 +45,7 @@ import { redactCapabilityEvidenceData } from "./evidence-redaction.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import { parsePaperclipQuestionSet } from "../contracts/question-set.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
-import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
+import { DurablePrpControlPlane, type PrpWireAttachment } from "../control-plane/durable-prp-control-plane.js";
 import * as durableControlPlane from "../control-plane/durable-prp-control-plane.js";
 import * as codexCommandRuntime from "../drivers/codex/codex-command.js";
 
@@ -3630,27 +3630,38 @@ it.each(["complete", "api-key", "default-model", "mismatched-model", "model-refr
   const remoteRoot = join(root, "assigned-remote-filesystem");
   const remoteFilesystem = join(remoteRoot, "filesystem");
   const remoteWorkspace = join(remoteFilesystem, "workspace");
-  let registrationReleased = false;
+  let registrationStopped = false;
+  const registrationStarted = mode === "late-remote-release-error" ? Promise.withResolvers<void>() : null;
+  const probeTimeoutMs = mode.startsWith("late-remote-") ? 800 : mode === "late-bootstrap" ? 100 : mode === "missing-completion" ? 1_000 : 10_000;
   let refreshed = false;
   let cleanupConfirmed = false;
   try {
+    if (mode === "late-remote-release-error") vi.useFakeTimers();
     const probe = probeNativeRunnerEnvironment({
       runtimeDirectory, provider: "codex", model: mode === "default-model" ? null : "gpt-6.1-sol", reasoningEffort: "low",
       environment: { PATH: process.env.PATH, OPENAI_API_KEY: mode === "api-key" ? "selected-account" : "", HOME: "/unrelated/home" },
-      timeoutMs: mode.startsWith("late-remote-") ? 800 : mode === "late-bootstrap" ? 100 : mode === "missing-completion" ? 1_000 : 10_000,
+      timeoutMs: probeTimeoutMs,
       ...(remote ? { workingDirectory: remoteWorkspace } : {}),
       transportOptions: {
         ...(remote ? {
           runnerFilesystemRoot: remoteFilesystem, runnerStateDirectory: join(remoteRoot, "runner"),
           readRunnerState: async () => JSON.parse(await readFile(join(remoteRoot, "runner", "runner-state.json"), "utf8")),
-          controlPlaneRegistration: async authority => {
+          controlPlaneRegistration: async (authority, _identity, signal) => {
             await mkdir(remoteWorkspace, { recursive: true, mode: 0o700 });
             const remoteHome = join(remoteFilesystem, "codex-home");
             await mkdir(remoteHome, { mode: 0o700 });
             for (const name of ["auth.json", "config.toml"] as const) await cp(join(runtimeDirectory, "codex-home", name), join(remoteHome, name));
-            if (mode.startsWith("late-remote-")) await new Promise(resolve => setTimeout(resolve, 1000));
+            if (mode === "late-remote-release-error") {
+              // Cross the producer's abort boundary deterministically before
+              // completing registration, so cleanup must release what arrived late.
+              const { promise, resolve: registrationAborted } = Promise.withResolvers<void>();
+              signal.addEventListener("abort", registrationAborted, { once: true });
+              if (signal.aborted) registrationAborted();
+              registrationStarted?.resolve();
+              await promise;
+            } else if (mode.startsWith("late-remote-")) await new Promise(resolveWait => setTimeout(resolveWait, 1000));
             await authority.start();
-            return { connectUrl: authority.connectUrl, release: async () => { registrationReleased = true; await authority.stop(); if (mode === "late-remote-release-error") throw new Error("PRP registration release failed"); } };
+            return { connectUrl: authority.connectUrl, release: async () => { await authority.stop(); registrationStopped = true; if (mode === "late-remote-release-error") throw new Error("PRP registration release failed"); } };
           },
         } : {}),
         runnerBinary: mode === "missing-runtime" ? join(root, "missing-runner") : resolve("runner/target/debug/paperclip-runnerd"),
@@ -3679,11 +3690,15 @@ it.each(["complete", "api-key", "default-model", "mismatched-model", "model-refr
         await rm(runtimeDirectory, { recursive: true, force: true });
       },
     });
+    if (mode === "late-remote-release-error") {
+      await Promise.race([registrationStarted!.promise, probe]);
+      await vi.advanceTimersByTimeAsync(probeTimeoutMs);
+    }
     if (mode === "complete" || mode === "api-key" || mode === "default-model" || mode === "remote-complete") {
       const observedModel = mode === "default-model" ? "gpt-test" : "gpt-6.1-sol";
       await expect(probe).resolves.toEqual({ provider: "codex", providerDriver: "codex_app_server", effectiveModel: observedModel, helloProbePassed: true });
       expect(refreshed).toBe(true);
-      if (remote) expect(registrationReleased).toBe(true);
+      if (remote) expect(registrationStopped).toBe(true);
       expect(cleanupConfirmed).toBe(true);
       await expect(stat(runtimeDirectory)).rejects.toThrow();
       const requests = (await readFile(calls, "utf8")).trim().split("\n").map(line => JSON.parse(line));
@@ -3692,7 +3707,7 @@ it.each(["complete", "api-key", "default-model", "mismatched-model", "model-refr
     } else {
       await expect(probe).rejects.toThrow(mode === "missing-runtime" ? /ENOENT|unavailable|cleanup/i : mode === "mismatched-model" || mode === "remote-mismatched-model" || mode === "model-refresh-error" || mode === "model-cleanup-error" || mode === "missing-model" ? /observed model|mismatched provider model/i : /timed out|cleanup|suspension/i);
       if (mode === "late-remote-release-error") {
-        expect(registrationReleased).toBe(true); expect(cleanupConfirmed).toBe(false);
+        expect(registrationStopped).toBe(true); expect(cleanupConfirmed).toBe(false);
         expect((await stat(runtimeDirectory)).isDirectory()).toBe(true);
       }
       if (mode === "model-refresh-error") {
@@ -3713,7 +3728,7 @@ it.each(["complete", "api-key", "default-model", "mismatched-model", "model-refr
         expect(requests.some(value => value.method === "turn/start")).toBe(false);
       }
     }
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { if (mode === "late-remote-release-error") vi.useRealTimers(); await rm(root, { recursive: true, force: true }); }
 }, 20_000);
 
 function assignedRuntimeContext(
@@ -8604,19 +8619,76 @@ it("keeps an adopted runner alive when the detached controller finalizer closes"
 
 it("adopts an opening session without a checkpoint instead of bootstrapping a duplicate provider", () => verifyLiveRunnerAdoption(false, false, false, false, true), 30_000);
 
-it("cancels startup readiness before releasing the route that settles its ready callback", async () => {
+it.each([false, true])("cancels startup readiness before releasing the route that settles its ready callback (drain completes during suspension: %s)", async (holdDrain) => {
   const root = await mkdtemp(join(tmpdir(), "runnerd-ready-release-cycle-"));
   let releaseReady!: () => void;
   const readyReleased = new Promise<void>(resolve => { releaseReady = resolve; });
   let markReadyStarted!: () => void;
   const readyStarted = new Promise<void>(resolve => { markReadyStarted = resolve; });
   const release = vi.fn(async () => { releaseReady(); });
+  const restorers: Array<() => void> = [];
+  let releaseDrain: (() => void) | undefined;
+  let heldDrainCommandId: string | null = null;
   let core!: DurablePrpControlPlane;
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: fakeCodex,
     codexArgs: fakeCodexArgs(root), stateDirectory: root, sourceCodexHome: "", environment: {}, closeGraceMs: 2_000,
     controlPlaneRegistration: async authority => {
       core = authority;
+      if (holdDrain) {
+        const attach = authority.attachWireConnection.bind(authority);
+        const attachSpy = vi.spyOn(authority, "attachWireConnection").mockImplementation(wire => {
+          let attachment: PrpWireAttachment | undefined;
+          let holding = true;
+          const held: unknown[] = [];
+          attachment = attach({
+            sendJson: value => wire.sendJson(value),
+            close: code => wire.close(code),
+            onClose: listener => wire.onClose(listener),
+            onJson: listener => {
+              releaseDrain = () => {
+                holding = false;
+                for (const value of held) listener(value);
+                held.length = 0;
+              };
+              wire.onJson(value => {
+                if (holding && held.length > 0) {
+                  held.push(value);
+                  return;
+                }
+                if (holding && attachment?.isAuthenticated()) {
+                  const drain = authority.store.state.commands.findLast(command =>
+                    command.type === "runner.drain" && command.status === "pending",
+                  );
+                  if (drain) {
+                    const runner = JSON.parse(readFileSync(join(root, "runner/runner-state.json"), "utf8"));
+                    const result = runner.processedCommands[drain.commandId];
+                    if (result?.status === "completed" && result.commandType === drain.type
+                      && result.controllerSeq === drain.controllerSeq
+                      && result.result?.retainedEventsDrained === true) {
+                      // Hold the genuine durable result, not a fabricated
+                      // checkpoint. Suspension admission releases this FIFO
+                      // after preparation expires, within the same close bound.
+                      heldDrainCommandId = drain.commandId;
+                      held.push(value);
+                      return;
+                    }
+                  }
+                }
+                listener(value);
+              });
+            },
+          });
+          return attachment;
+        });
+        const queue = authority.queueCommand.bind(authority);
+        const queueSpy = vi.spyOn(authority, "queueCommand").mockImplementation((type, ...args) => {
+          const command = queue(type, ...args);
+          if (type === "runner.suspend") releaseDrain?.();
+          return command;
+        });
+        restorers.push(() => attachSpy.mockRestore(), () => queueSpy.mockRestore());
+      }
       await authority.start();
       return { ready: () => { markReadyStarted(); return readyReleased; }, release };
     },
@@ -8630,11 +8702,28 @@ it("cancels startup readiness before releasing the route that settles its ready 
     await expect(opening).rejects.toThrow(/closed/);
     expect(release).toHaveBeenCalledOnce();
     expect(bundle.evidence().runnerExited).toBe(true);
+    expect(bundle.evidence().runnerExitCode).toBe(0);
     expect(bundle.evidence().diagnostics.join("\n")).not.toContain("startup cleanup is unconfirmed");
+    const suspend = core.store.state.commands.findLast(command => command.type === "runner.suspend");
+    expect(suspend?.status).toBe("completed");
+    const drain = core.store.state.commands.findLast(command => command.type === "runner.drain");
+    expect(drain).toMatchObject({ status: "completed", result: { result: { retainedEventsDrained: true } } });
+    if (holdDrain) {
+      expect(heldDrainCommandId).not.toBeNull();
+      expect(drain?.commandId).toBe(heldDrainCommandId);
+      expect(drain!.controllerSeq).toBeLessThan(suspend!.controllerSeq);
+    }
+    const runner = JSON.parse(await readFile(join(root, "runner/runner-state.json"), "utf8"));
+    expect(runner).toMatchObject({ ...core.store.state.identity, lifecycle: "suspended", outbox: [] });
+    expect(runner.ackedSourceSeq).toBe(runner.nextSourceSeq - 1);
+    const provider = JSON.parse(await readFile(join(root, "runner/codex-provider-state.json"), "utf8"));
+    expect(provider).toMatchObject({ pendingEvents: [], queuedEvents: [], activeProviderTurnId: null });
   } finally {
+    releaseDrain?.();
     releaseReady();
     await opening.catch(() => undefined);
     await bundle.transport.close().catch(() => undefined);
+    for (const restore of restorers.reverse()) restore();
     await rm(root, { recursive: true, force: true });
   }
 }, 30_000);

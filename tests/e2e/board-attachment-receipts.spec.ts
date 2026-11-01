@@ -26,14 +26,19 @@ async function body<T>(
   return response.json() as Promise<T>;
 }
 
+function announcementDismissButton(page: Page) {
+  return page
+    .getByRole("complementary", { name: "Paperclip announcements", exact: true })
+    .getByRole("button", { name: "Dismiss announcement", exact: true });
+}
+
 async function setup(page: Page, request: APIRequestContext, classic: boolean) {
   // Announcements can appear after navigation or reload and cover the classic
   // composer's attachment button. Dismiss through the same UI as a Board user.
-  await page.addLocatorHandler(
-    page.getByRole("complementary", { name: "Paperclip announcements", exact: true })
-      .getByRole("button", { name: "Dismiss announcement", exact: true }),
-    async (dismiss) => { await dismiss.click(); },
-  );
+  const dismissAnnouncement = announcementDismissButton(page);
+  await page.addLocatorHandler(dismissAnnouncement, async (dismiss) => {
+    await dismiss.click();
+  });
   const company = await body<{ id: string; issuePrefix: string }>(
     await request.post("/api/companies", {
       data: { name: `Board receipt browser ${randomUUID()}` },
@@ -80,6 +85,7 @@ async function setup(page: Page, request: APIRequestContext, classic: boolean) {
     composer,
     editor,
     send,
+    dismissAnnouncement,
     sendComment: async () => {
       await send.click();
       if (classic) {
@@ -113,11 +119,27 @@ const files = [
   },
 ];
 
-async function openAttachmentChooser(page: Page, composer: Locator) {
+async function openAttachmentChooser(
+  page: Page,
+  composer: Locator,
+  dismissAnnouncement: Locator,
+) {
+  const menuItem = page.getByRole("menuitem", {
+    name: "Files and images",
+    exact: true,
+  });
   await composer.getByRole("button", { name: "Add to composer" }).click();
+  // Keep the dismissal handler from acting inside the open attachment menu.
+  await page.removeLocatorHandler(dismissAnnouncement);
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("menuitem", { name: "Files and images", exact: true }).click();
-  return chooser;
+  try {
+    const [, selectedChooser] = await Promise.all([menuItem.click(), chooser]);
+    return selectedChooser;
+  } finally {
+    await page.addLocatorHandler(dismissAnnouncement, async (dismiss) => {
+      await dismiss.click();
+    });
+  }
 }
 
 async function upload(
@@ -125,7 +147,11 @@ async function upload(
   fixture: Awaited<ReturnType<typeof setup>>,
   file: (typeof files)[number],
 ) {
-  const chooser = await openAttachmentChooser(page, fixture.composer);
+  const chooser = await openAttachmentChooser(
+    page,
+    fixture.composer,
+    fixture.dismissAnnouncement,
+  );
   const response = page.waitForResponse(
     (res) =>
       res.request().method() === "POST" &&
@@ -398,7 +424,11 @@ for (const classic of [false, true])
         await route.fulfill({ response });
       },
     );
-    const chooser = await openAttachmentChooser(page, fixture.composer);
+    const chooser = await openAttachmentChooser(
+      page,
+      fixture.composer,
+      fixture.dismissAnnouncement,
+    );
     await chooser.setFiles(files[1]!);
     await expect.poll(() => arrived).toBe(true);
     await expect(fixture.send).toBeDisabled();
@@ -449,7 +479,11 @@ test("legacy failed upload can be removed before sending the retained text", asy
         body: JSON.stringify({ error: "Fixture upload rejected" }),
       }),
   );
-  const chooser = await openAttachmentChooser(page, fixture.composer);
+  const chooser = await openAttachmentChooser(
+    page,
+    fixture.composer,
+    fixture.dismissAnnouncement,
+  );
   await chooser.setFiles(files[0]!);
   await expect(
     fixture.composer.getByText("Fixture upload rejected", { exact: true }),

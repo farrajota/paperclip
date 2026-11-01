@@ -60,7 +60,6 @@ import { environmentService } from "../services/environments.js";
 import { SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "../services/environment-custom-image-runtime.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
-import { closeWarmNativeSessionsForEnvironment } from "../services/native-runtime/native-session-executor.js";
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1303,7 +1302,7 @@ export function environmentRoutes(
       && impact.reusableSandboxLeaseCount > 0
       && impact.deleteBlockedReasons.every((reason) => reason === "reusable_sandbox_lease")
     ) {
-      const warmSessions = await closeWarmNativeSessionsForEnvironment({
+      const warmSessions = await (await import("../services/native-runtime/native-session-executor.js")).closeWarmNativeSessionsForEnvironment({
         environmentId: existing.id,
         reason: "environment deleted",
       });

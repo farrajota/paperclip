@@ -1727,7 +1727,7 @@ fn hex_nibble(byte: u8) -> Result<u8, DurableRunnerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -1764,6 +1764,13 @@ mod tests {
 
     fn test_state(config: &DurableRunnerConfig) -> DurableState {
         DurableState::new(config)
+    }
+
+    fn os_normalized_read_timeout(timeout: Duration) -> Option<Duration> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        socket.set_read_timeout(Some(timeout)).unwrap();
+        socket.read_timeout().unwrap()
     }
 
     struct ServerCredential<'a> {
@@ -2416,7 +2423,7 @@ mod tests {
         assert_eq!(greeting.lease.unwrap().expose().unwrap(), "lease-secret");
         assert_eq!(
             transport.socket.read_timeout().unwrap(),
-            Some(RUNTIME_READ_TIMEOUT)
+            os_normalized_read_timeout(RUNTIME_READ_TIMEOUT)
         );
     }
 
@@ -2600,7 +2607,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             transport.socket.read_timeout().unwrap(),
-            Some(RUNTIME_READ_TIMEOUT)
+            os_normalized_read_timeout(RUNTIME_READ_TIMEOUT)
         );
         assert_eq!(welcome.connection.lease_id, "lease_1");
         assert_eq!(welcome.lease.unwrap().expose().unwrap(), "lease-secret");

@@ -1,5 +1,6 @@
 import type { WebhookOptions } from "chat";
-import { createChatSdkEndpointRuntime, ChatSdkEndpointNotRegisteredError, type CreateChatSdkEndpointRuntimeOptions } from "./chat-sdk-runtime.js";
+import type { CreateChatSdkEndpointRuntimeOptions } from "./chat-sdk-runtime.js";
+import { ChatSdkEndpointNotRegisteredError } from "./chat-sdk-runtime-errors.js";
 import { createVoiceRuntime, type ChatEndpointRuntime, type CreateVoiceRuntimeOptions } from "./voice/voice-runtime.js";
 
 /** One lifecycle registry for the Chat SDK and hosted voice transports. */
@@ -82,6 +83,9 @@ export class ChatRuntime {
     return await this.enqueueLifecycle(options.endpointId, async () => {
       this.assertReplacementCurrent(options.endpointId, generation);
       await this.retireEndpoint(options.endpointId);
+      this.assertReplacementCurrent(options.endpointId, generation);
+      // The SDK adapters are optional until an SDK endpoint is replaced.
+      const { createChatSdkEndpointRuntime } = await import("./chat-sdk-runtime.js");
       this.assertReplacementCurrent(options.endpointId, generation);
       const next = createChatSdkEndpointRuntime(options);
       this.endpoints.set(options.endpointId, next);

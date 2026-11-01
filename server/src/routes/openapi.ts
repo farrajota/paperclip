@@ -346,6 +346,11 @@ import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
   companyImportTransferDeclarationSchema,
 } from "@paperclipai/shared/company-import-transfer";
+import { createOutcomeCheckinSchema, createOutcomeObservationSchema, createOutcomeTargetSchema, correctOutcomeObservationSchema } from "@paperclipai/shared/governance-outcomes";
+import { milestoneContractInputSchema, milestoneDecisionInputSchema, milestoneEvidenceInputSchema, milestoneFollowupDeliveryInputSchema, milestonePromoteInputSchema } from "@paperclipai/shared/governance-milestones";
+import { governanceOperationExceptionAdmissionSchema, governanceOperationExceptionPauseSchema, governanceOperationExceptionResolveSchema, governanceOperationExceptionResumeSchema } from "@paperclipai/shared/governance-operations";
+import { isIsoCalendarDate, isOffsetQualifiedInstant, isValidIanaTimezone, issuePlanningInputSchema } from "@paperclipai/shared/governance-planning";
+import { routineOccurrenceDispositionRequestSchema } from "@paperclipai/shared/governance-occurrences";
 
 type JsonSchema = Record<string, unknown>;
 type OpenApiResponse = Record<string, unknown>;
@@ -1275,11 +1280,13 @@ function registerCurrentRoute(input: {
   path: string;
   tags: string[];
   summary: string;
+  description?: string;
+  params?: z.ZodTypeAny;
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
 }) {
-  const params = paramsSchemaFromPath(input.path);
+  const params = input.params ?? paramsSchemaFromPath(input.path);
   const request =
     params || input.query || input.body
       ? {
@@ -1293,6 +1300,7 @@ function registerCurrentRoute(input: {
     path: input.path,
     tags: input.tags,
     summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
     ...(request ? { request } : {}),
     responses: input.responses ?? {
       200: r.ok(),
@@ -1391,6 +1399,15 @@ const browserUseOperations = [
 ] as const;
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/goals/{id}/outcomes/targets",
+  "POST /api/companies/{companyId}/governance-operations/occurrences/{occurrenceId}/exceptions",
+  "POST /api/companies/{companyId}/governance-operations/exceptions/{exceptionId}/pause",
+  "POST /api/companies/{companyId}/governance-operations/exceptions/{exceptionId}/resume",
+  "POST /api/companies/{companyId}/governance-operations/exceptions/{exceptionId}/resolve",
+  "POST /api/milestones/{milestoneId}/revisions",
+  "POST /api/milestones/{milestoneId}/revisions/{revisionId}/promote",
+  "PUT /api/issues/{id}/planning",
+  "POST /api/routines/{id}/occurrences/{occurrenceId}/disposition",
   "GET /api/agents/{id}/project-access",
   "POST /api/agents/{id}/project-access",
   "POST /api/issues/{id}/interactions/{interactionId}/dismiss",
@@ -12788,3 +12805,89 @@ for (const [method, path, summary] of [
     404: r.notFound, 409: r.conflict, 422: r.unprocessable,
   },
 });
+
+const governanceCompanyParams = z.object({ companyId: z.string().uuid() });
+const planningUuid = z.string().regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/);
+const planningCompanyParams = z.object({ companyId: planningUuid });
+const governanceCalendarQuery = z.object({
+  from: z.string().refine((value) => isIsoCalendarDate(value) || isOffsetQualifiedInstant(value)),
+  to: z.string().refine((value) => isIsoCalendarDate(value) || isOffsetQualifiedInstant(value)),
+  timezone: z.string().refine(isValidIanaTimezone).optional(),
+  limit: z.string().regex(/^\d+$/).optional(),
+  projectId: planningUuid.optional(),
+  assigneeAgentId: planningUuid.optional(),
+  source: z.enum(["all", "issue", "routine", "run"]).optional(),
+  actualOnly: z.enum(["true", "false"]).optional(),
+});
+const governanceTaskQuery = z.object({
+  query: z.string().max(100).optional(),
+  projectId: planningUuid.optional(),
+  assigneeAgentId: planningUuid.optional(),
+  limit: z.string().regex(/^\d+$/).optional(),
+});
+const planningIssueParams = z.object({ id: planningUuid });
+
+const governanceApiRoutes = [
+  ["get", "/api/goals/{id}/outcomes", "Read goal outcome history and current health", undefined,
+    "Requires authenticated company access and outcome-read authorization. Returns periods, targets, observations, redacted check-ins, current outcomes and request-specific capabilities. Missing and inaccessible goals share the same 404 boundary.", { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound }],
+  ["post", "/api/goals/{id}/outcomes/targets", "Create or revise an outcome target", createOutcomeTargetSchema,
+    "Requires Board actor and company access; only Board users may approve targets. Body uses createOutcomeTargetSchema. Returns the created target with 201; malformed input returns 400, goal missing 404, conflicting revision/period settings 409 and invalid company ownership 422.", { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable }],
+  ["post", "/api/goals/{id}/outcomes/observations", "Record an outcome observation", createOutcomeObservationSchema,
+    "Requires authenticated company access and service-level outcome authorization. Body uses createOutcomeObservationSchema. New observation returns 201; idempotent replay of the same source key and payload returns 200. Invalid target/source/window data returns 422, conflicting source-key reuse 409, and missing resources 404.", { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable }],
+  ["post", "/api/goals/{id}/outcomes/observations/corrections", "Correct an outcome observation", correctOutcomeObservationSchema,
+    "Requires authenticated company access and service-level outcome authorization. Body extends createOutcomeObservationSchema with supersedesId and correctionReason. New correction returns 201; idempotent replay returns 200. Invalid source/correction data returns 422, conflict 409, missing resources 404.", { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable }],
+  ["post", "/api/goals/{id}/outcomes/checkins", "Record an outcome check-in", createOutcomeCheckinSchema,
+    "Requires authenticated company access and service-level outcome authorization. Body uses createOutcomeCheckinSchema; success returns 201. Invalid corrective issue references return 422 and missing resources 404.", { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable }],
+  ["get", "/api/cases/{caseId}/milestones", "Read case milestone history and readiness", undefined,
+    "Requires cases enabled, company access and case-read authorization. Returns milestone, revisions, evidence, decisions, follow-ups, readiness and actor-specific permissions; absent milestone yields null plus empty lists. Disabled cases return 403; missing/inaccessible cases return 404.", { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound }],
+  ["post", "/api/cases/{caseId}/milestones", "Create a case milestone", undefined,
+    "Requires cases enabled, Board or agent actor, case access and task-write authorization. Returns created milestone with 201. Disabled cases return 403; inaccessible cases 404.", { 201: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound }],
+  ["post", "/api/milestones/{milestoneId}/revisions", "Create a milestone contract revision", milestoneContractInputSchema,
+    "Requires cases enabled and Board organization access. Body uses milestoneContractInputSchema. Returns revision with 201; malformed input 400, invalid contract references 422, conflicts 409 and missing milestone 404.", { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable }],
+  ["post", "/api/milestones/{milestoneId}/revisions/{revisionId}/promote", "Promote a milestone revision", milestonePromoteInputSchema,
+    "Requires cases enabled and Board organization access. Body uses milestonePromoteInputSchema. Returns promoted revision; malformed input 400, stale revision/playbook conflict 409, invalid contract 422 and missing resources 404.", { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable }],
+  ["post", "/api/milestones/{milestoneId}/evidence", "Submit milestone evidence", milestoneEvidenceInputSchema,
+    "Requires cases enabled, Board or agent actor, milestone/case access and task-write authorization. Body uses milestoneEvidenceInputSchema; evidence returns 201. Invalid/unverified evidence returns 422 and missing resources 404.", { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable }],
+  ["post", "/api/milestones/{milestoneId}/revisions/{revisionId}/decisions", "Record a milestone review decision", milestoneDecisionInputSchema,
+    "Requires cases enabled; agent reviewers need case access and Board reviewers need Board organization access. Body uses milestoneDecisionInputSchema; returns resulting decision. Malformed input 400, stale revision/evidence conflict 409, invalid decision/evidence 422 and missing resources 404.", { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable }],
+  ["post", "/api/milestones/{milestoneId}/followups", "Deliver milestone follow-ups", milestoneFollowupDeliveryInputSchema,
+    "Requires cases enabled, Board or agent actor and case access; agents additionally need task-write authorization. Body uses milestoneFollowupDeliveryInputSchema; returns an array of { actionKey, issueId } delivery results, including an empty array when none. Invalid delivery returns 422 and missing resources 404.", { 200: r.ok(z.array(z.object({ actionKey: z.string(), issueId: z.string().uuid() }))), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable }],
+] as const;
+for (const [method, path, summary, body, description, responses] of governanceApiRoutes) {
+  registerCurrentRoute({ method, path, tags: ["Governance"], summary, body, description, responses });
+}
+
+registerCurrentRoute({ method: "get", path: "/api/companies/{companyId}/governance-operations", tags: ["Governance"], summary: "Read company governance operations", params: governanceCompanyParams,
+  description: "Requires an authenticated actor and current company access; missing authentication returns 401 and company-access failures return 403. The service also applies company-scope read authorization and returns 404 for a missing company or service-level company-scope denial. Returns a bounded model of authorized routines, cases, tasks, runs, occurrences, exceptions, queues, recoveries, milestones, budgets, capacity, policy notes and exception-management capability.",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound } });
+for (const [suffix, summary, body, result] of [
+  ["/occurrences/{occurrenceId}/exceptions", "Admit a governance occurrence exception", governanceOperationExceptionAdmissionSchema, "Returns the created exception row with 201; received/admitted audit events are persisted but are not included in the response."],
+  ["/exceptions/{exceptionId}/pause", "Pause an exception deadline clock", governanceOperationExceptionPauseSchema, "Returns the updated exception row with 200; transition audit events are persisted but are not included in the response."],
+  ["/exceptions/{exceptionId}/resume", "Resume an exception deadline clock", governanceOperationExceptionResumeSchema, "Returns the updated exception row with 200; transition audit events are persisted but are not included in the response."],
+  ["/exceptions/{exceptionId}/resolve", "Resolve an exception", governanceOperationExceptionResolveSchema, "Returns the updated exception row with 200; transition audit events are persisted but are not included in the response."],
+] as const) registerCurrentRoute({ method: "post", path: `/api/companies/{companyId}/governance-operations${suffix}`, tags: ["Governance"], summary,
+  params: z.object({ companyId: z.string().uuid(), ...(suffix.startsWith("/occurrences/") ? { occurrenceId: z.string().uuid() } : { exceptionId: z.string().uuid() }) }),
+  body,
+  description: `Requires an authenticated human Board actor with active owner/admin/member company membership; impersonated and MCP OAuth actors are rejected. Missing authentication returns 401; company-access and Board-eligibility failures return 403. Body uses the corresponding governanceOperationException schema. ${result} Service-level company-scope denial and missing/unreadable occurrence or exception resources return 404; stale/state conflict 409 and invalid business data 422.`,
+  responses: { [suffix.endsWith("/exceptions") ? 201 : 200]: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable } });
+
+registerCurrentRoute({ method: "get", path: "/api/companies/{companyId}/governance-calendar", tags: ["Governance"], summary: "Read company governance calendar", params: planningCompanyParams, query: governanceCalendarQuery,
+  description: "Requires company access and company-scope read authorization. Both required from/to values must be ISO calendar dates or offset-qualified instants in the same format; from must precede to and the range is limited to 62 calendar days. timezone defaults to UTC; limit defaults to 200 and is capped at 500; optional projectId/assigneeAgentId are UUIDs; source and actualOnly are enumerated filters. Returns authorized calendar events, truncation/completeness warnings, range metadata and Board edit capability. Invalid range/filter returns 400; invalid, missing or cross-tenant company returns 404; company-scope read denial returns 403.",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound } });
+registerCurrentRoute({ method: "get", path: "/api/companies/{companyId}/governance-calendar/tasks", tags: ["Governance"], summary: "Find planable company tasks", params: planningCompanyParams, query: governanceTaskQuery,
+  description: "Requires company access and company-scope read authorization. Optional query is at most 100 characters; projectId and assigneeAgentId are UUIDs; limit defaults to 100 and is capped at 200. Returns authorized task choices and truncation/completeness indicators. Invalid filters return 400; invalid, missing or cross-tenant company returns 404; company-scope read denial returns 403.",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound } });
+registerCurrentRoute({ method: "get", path: "/api/issues/{id}/planning", tags: ["Governance"], summary: "Read issue planning dates", params: planningIssueParams,
+  description: "Requires authenticated access to the issue, including issue-level authorization. Issue IDs must match UUID syntax. Returns the planning row or null when absent; malformed, missing and unauthorized issues share the 404 boundary.",
+  responses: { 200: r.ok(z.record(z.string(), z.unknown()).nullable()), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound } });
+registerCurrentRoute({ method: "put", path: "/api/issues/{id}/planning", tags: ["Governance"], summary: "Update issue planning dates", params: planningIssueParams, body: issuePlanningInputSchema,
+  description: "Board actors only. Body uses strict issuePlanningInputSchema with dateMode, timezone and expectedRevision. Returns the updated planning row; malformed/resulting dates return 400, stale revision 409 and malformed/missing/unauthorized issues 404.",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict } });
+
+registerCurrentRoute({ method: "get", path: "/api/routines/{id}/occurrences", tags: ["Routines"], summary: "List routine occurrences",
+  query: z.object({ limit: z.string().regex(/^\d+$/).optional(), cursor: z.string().max(1024).optional() }),
+  description: "Requires authenticated access to the routine; occurrence visibility is filtered by actor authorization. limit defaults to 100 and must be an integer from 1 to 200; cursor is optional and at most 1024 characters. Returns a cursor-paginated occurrence list. Pagination type/range/length validation failures return 400; malformed cursor contents return 422; missing/inaccessible routine returns 404.",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable } });
+registerCurrentRoute({ method: "post", path: "/api/routines/{id}/occurrences/{occurrenceId}/disposition", tags: ["Routines"], summary: "Set routine occurrence disposition", body: routineOccurrenceDispositionRequestSchema,
+  description: "Board actors only, with permission to manage the routine and access to its matching occurrence. Body uses routineOccurrenceDispositionRequestSchema; returns the updated occurrence. Invalid input returns 400; unavailable owners or invalid obligation/execution states return 422; missing routine/occurrence 404; authorization failures 403.",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable } });

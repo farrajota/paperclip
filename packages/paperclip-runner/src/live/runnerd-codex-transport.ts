@@ -2503,35 +2503,37 @@ async function settleRetainedRunnerdSessionOwned(
       }),
     );
   }
-  // A previously journaled suspend must be honored before a later drain.
-  // A second exact-authority connection can then drain the retained provider
-  // prefix; no old command is removed, reordered, or treated as completed.
+  // A previously journaled suspend must be reconciled before a later drain,
+  // even when retained provider state is still active. Its exact failed
+  // terminal receipt is delivered first; a later epoch stops and drains the
+  // retained provider prefix without reordering or removing old commands.
   let completedTerminalEpochFingerprint: string | null = null;
   for (let epoch = 0; epoch < 4; epoch++) {
     await authorize();
     if (![...pids].every(maintenanceProcessAbsent)) throw maintenanceDenied();
     const before = readMaintenanceState(root);
     assertMaintenanceBinding(before, input.identity, input.providerSessionId);
-    const terminalOnly = before.runner.pendingTerminalDelivery != null;
     const pendingTerminal = record(before.runner.pendingTerminalDelivery);
+    const failedTerminalReplay = (
+      before.control.commands as Array<Record<string, unknown>>
+    ).some(
+      (command) =>
+        command.commandId === pendingTerminal.commandId &&
+        command.controllerSeq === pendingTerminal.controllerSeq &&
+        command.type === "runner.suspend" &&
+        pendingTerminal.commandType === "runner.suspend" &&
+        pendingTerminal.lifecycle === "suspended" &&
+        command.status === "failed",
+    );
+    const terminalOnly =
+      before.runner.pendingTerminalDelivery != null &&
+      (before.provider.lifecycle !== "turn_active" || failedTerminalReplay);
     const completedTerminalOnly =
       terminalOnly &&
       completedTerminalEpochFingerprint === before.fingerprint &&
       completedMaintenanceTerminalReceipt(before) !== null;
     completedTerminalEpochFingerprint = null;
-    if (
-      terminalOnly &&
-      !completedTerminalOnly &&
-      !(before.control.commands as Array<Record<string, unknown>>).some(
-        (command) =>
-          command.commandId === pendingTerminal.commandId &&
-          command.controllerSeq === pendingTerminal.controllerSeq &&
-          command.type === "runner.suspend" &&
-          pendingTerminal.commandType === "runner.suspend" &&
-          pendingTerminal.lifecycle === "suspended" &&
-          command.status === "failed",
-      )
-    )
+    if (terminalOnly && !completedTerminalOnly && !failedTerminalReplay)
       throw maintenanceDenied();
     const epochRestoresProvider =
       !terminalOnly && before.provider.lifecycle === "turn_active";
@@ -2731,27 +2733,36 @@ async function settleRetainedRunnerdSessionOwned(
       let drainQueued = false;
       while (!exited) {
         await authorize();
-        const state = readMaintenanceState(root);
-        assertMaintenanceBinding(
-          state,
-          input.identity,
-          input.providerSessionId,
-          epochRestoresProvider,
-        );
-        const provider = providerDrainStateFromSnapshot(state.provider);
-        if (!terminalOnly && !terminalQueued && provider.providerSettled) {
-          if (!drainQueued) {
-            core.queueCommand("runner.drain", {}, undefined, true);
-            drainQueued = true;
-          } else if (
-            provider.pendingEventCount === 0 &&
-            (state.runner.outbox as unknown[]).length === 0 &&
-            !core.store.state.commands.some(
-              (command) => command.status === "pending",
-            )
-          ) {
-            core.queueCommand("runner.suspend", {}, undefined, true);
-            terminalQueued = true;
+        // Delivery-only recovery cannot queue provider commands. Re-reading and
+        // hashing the entire retained prefix here blocks the same event loop
+        // that must durably commit it before the runner's old-authority ACK
+        // fence expires. Keep authorization live, but inspect command-driving
+        // snapshots only in epochs that can actually issue those commands.
+        // Initial binding and the joined retirement's exact binding/provider/
+        // command-prefix checks still apply to every delivery-only epoch.
+        if (!terminalOnly) {
+          const state = readMaintenanceState(root);
+          assertMaintenanceBinding(
+            state,
+            input.identity,
+            input.providerSessionId,
+            epochRestoresProvider,
+          );
+          const provider = providerDrainStateFromSnapshot(state.provider);
+          if (!terminalQueued && provider.providerSettled) {
+            if (!drainQueued) {
+              core.queueCommand("runner.drain", {}, undefined, true);
+              drainQueued = true;
+            } else if (
+              provider.pendingEventCount === 0 &&
+              (state.runner.outbox as unknown[]).length === 0 &&
+              !core.store.state.commands.some(
+                (command) => command.status === "pending",
+              )
+            ) {
+              core.queueCommand("runner.suspend", {}, undefined, true);
+              terminalQueued = true;
+            }
           }
         }
         await new Promise((resolveWait) => setTimeout(resolveWait, 10));
@@ -4433,21 +4444,23 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   async #drainSettledProviderEventsBeforeSuspend(
     timeoutMs = 1_000,
-  ): Promise<boolean> {
+  ): Promise<{ drained: boolean; commandId: string | null }> {
     const core = this.#core;
-    if (!core) return false;
+    if (!core) return { drained: false, commandId: null };
+    let commandId: string | null = null;
     try {
       const drained = await awaitProviderDrainBarrier({
         readProviderState: () => this.#providerDrainState(),
         semanticResultsSettled: () => core.semanticToolResultsSettled(),
         commands: () => core.store.state.commands,
-        queueDrain: (commandId) => {
-          core.queueCommand("runner.drain", {}, commandId, true);
+        queueDrain: (nextCommandId) => {
+          core.queueCommand("runner.drain", {}, nextCommandId, true);
+          commandId = nextCommandId;
         },
         pump: () => this.#pumpEventsSafely(),
         deadline: Date.now() + timeoutMs,
       });
-      if (drained) return true;
+      if (drained) return { drained: true, commandId };
     } catch {
       // A failed drain still proceeds through bounded suspension/containment,
       // but can never authorize a reusable checkpoint or deletion of evidence.
@@ -4465,7 +4478,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             record(record(lastDrain?.result).result).retainedEventsDrained ?? null,
         }),
     );
-    return false;
+    return { drained: false, commandId };
   }
 
   close(reason?: string): Promise<void> {
@@ -4584,6 +4597,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     // `unsettled` and preserve its original bootstrap diagnostic.
     let runnerSuspended = false;
     let providerDrained = false;
+    let preparationDrainCommandId: string | null = null;
     let suspensionRequired = false;
     let lastSuspensionState: Record<string, unknown> | null = null;
     let suspensionState: {
@@ -4619,9 +4633,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         // slow-but-idle runner is not held to a tighter deadline than a
         // runner that just stopped a turn.
         await this.#stopProviderBeforeSuspend(preparationDeadline);
-        providerDrained = await this.#drainSettledProviderEventsBeforeSuspend(
+        const drain = await this.#drainSettledProviderEventsBeforeSuspend(
           Math.min(5_000, Math.max(0, preparationDeadline - Date.now())),
         );
+        providerDrained = drain.drained;
+        preparationDrainCommandId = drain.commandId;
       }
       // Local durable roots are reused too. Process exit alone cannot prove
       // their authority is safe to rotate; require the same exact suspension
@@ -4642,6 +4658,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         pump: () => this.#pumpEventsSafely(),
         deadline: closeDeadline,
       });
+      if (!providerDrained && runnerSuspended && preparationDrainCommandId !== null
+        && Date.now() < closeDeadline) {
+        // Preparation stops admitting drain work before the suspension reserve,
+        // but its last exact command can still complete ahead of the suspend.
+        // Join that genuine receipt instead of latching its earlier timeout;
+        // neither a quiet provider nor suspension alone proves the drain.
+        const drain = this.#core.getCommand(preparationDrainCommandId);
+        const provider = this.#providerDrainState();
+        providerDrained = drain?.status === "completed"
+          && record(record(drain.result).result).retainedEventsDrained === true
+          && this.#core.semanticToolResultsSettled()
+          && (provider === null || (provider !== "unreadable"
+            && provider.pendingEventCount === 0 && provider.providerSettled));
+      }
       if (!runnerSuspended) {
         const command = [...this.#core.store.state.commands].reverse().find(
           (candidate) => candidate.type === "runner.suspend",

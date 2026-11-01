@@ -3,15 +3,16 @@ name: Refresh Lockfile
 on:
   push:
     branches:
-      - master
+      - zay/main
   workflow_dispatch:
 
 concurrency:
-  group: refresh-lockfile-master
+  group: refresh-lockfile-zay-main
   cancel-in-progress: false
 
 jobs:
   refresh:
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/zay/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -75,15 +76,16 @@ jobs:
 
           # Only reuse an open PR from this repository owner, not a fork with the same branch name.
           pr_url="$(
-            gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
+            gh pr list --state open --base zay/main --head "$BRANCH" --json url,headRepositoryOwner \
               --jq ".[] | select(.headRepositoryOwner.login == \"$REPO_OWNER\") | .url" |
             head -n 1
           )"
           if [ -z "$pr_url" ]; then
             pr_url="$(gh pr create \
+              --base zay/main \
               --head "$BRANCH" \
               --title "chore(lockfile): refresh pnpm-lock.yaml" \
-              --body "Auto-generated lockfile refresh after dependencies changed on master. This PR only updates pnpm-lock.yaml.")"
+              --body "Auto-generated lockfile refresh after dependencies changed on zay/main. This PR only updates pnpm-lock.yaml.")"
             echo "Created new PR: $pr_url"
           else
             echo "PR already exists: $pr_url"

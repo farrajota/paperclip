@@ -9,7 +9,7 @@ import { environmentService } from "../environments.js";
 import { createHeartbeatRecovery, type HeartbeatRecoveryDependencies } from "./recovery.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import type { HotRestartIntent } from "../hot-restart.js";
-import type { NativeRestartRecoveryClaim, NativeRestartRecoveryDisposition } from "../native-runtime/index.js";
+import type { NativeRestartRecoveryClaim, NativeRestartRecoveryDisposition } from "../native-runtime/native-restart-recovery.js";
 import { NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE } from "../native-runtime/native-runner-ownership.js";
 import { allowLegacyShutdownWorkspaceCleanup, beginLegacyShutdownWorkspaceSettlement, finishLegacyShutdownWorkspaceSettlement, maintainLegacyShutdownWorkspaceSettlement, legacyShutdownWorkspaceResourceProtected, sweepLegacyShutdownWorkspaceSettlements } from "../legacy-shutdown-workspace-settlement.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../adapter-execution-control.js";
@@ -32,12 +32,18 @@ vi.mock("../hot-restart.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../hot-restart.js")>(),
   readHotRestartIntent: hotRestart.read,
 }));
-vi.mock("../native-runtime/index.js", async (importOriginal) => ({
-  ...await importOriginal<typeof import("../native-runtime/index.js")>(),
+vi.mock("../native-runtime/native-session-executor.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../native-runtime/native-session-executor.js")>(),
   closeIdleWarmNativeSessionsForRestart: native.closeIdle,
   detachNativeSessionsForRestart: native.detach,
+}));
+vi.mock("../native-runtime/native-finalization-reconciler.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../native-runtime/native-finalization-reconciler.js")>(),
   reconcileNativeFinalizations: native.finalizations,
   reconcileRetainedNativeSessionCleanups: native.cleanups,
+}));
+vi.mock("../native-runtime/native-restart-recovery.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../native-runtime/native-restart-recovery.js")>(),
   claimNativeRestartRecoveries: native.claims,
 }));
 vi.mock("../../vendor/paperclip-runner/index.js", async (importOriginal) => ({

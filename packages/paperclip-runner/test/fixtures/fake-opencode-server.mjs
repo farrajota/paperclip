@@ -278,7 +278,7 @@ const server = createServer(async (request, response) => {
       return;
     }
     clients.add(response);
-    request.on("close", () => clients.delete(response));
+    response.once("close", () => clients.delete(response));
     return;
   }
   if (request.method === "POST" && request.url === "/session")
@@ -976,4 +976,18 @@ const server = createServer(async (request, response) => {
 
 server.listen(port, "127.0.0.1");
 for (const signal of ["SIGTERM", "SIGINT"])
-  process.on(signal, () => server.close(() => process.exit(0)));
+  process.on(signal, () => {
+    server.close(() => process.exit(0));
+    // Idle sweeps miss accepted pre-request sockets. Force-close remaining
+    // fixture connections only after retained SSE responses complete or disconnect.
+    const closeRemainingConnections = () => {
+      if (clients.size === 0) server.closeAllConnections();
+    };
+    // End SSE responses, then reap connections made idle after close()'s sweep.
+    for (const response of clients) {
+      response.once("finish", () => server.closeIdleConnections());
+      response.once("close", closeRemainingConnections);
+      response.end();
+    }
+    closeRemainingConnections();
+  });

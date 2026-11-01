@@ -26,15 +26,20 @@ function runShard(args) {
   return result.stdout.trim().split(/\s+/).filter(Boolean);
 }
 
-function readTrustedPrWorkflow() {
+function readForkPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+    /^\s+uses: \.\/\.github\/workflows\/pr-trusted\.yml\s*$/m,
+    "pr.yml must call the fork-local PR workflow",
   );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
-  return readFileSync(trustedPrWorkflow, "utf8");
+  const workflow = readFileSync(trustedPrWorkflow, "utf8");
+  assert.doesNotMatch(
+    `${caller}\n${workflow}`,
+    /paperclipai\/paperclip\/\.github\/workflows\/(?:pr-trusted|ci-routing)\.yml@master/,
+    "PR workflow routing must not depend on mutable upstream master",
+  );
+  return workflow;
 }
 
 function readWorkflowJobs(workflow) {
@@ -158,15 +163,15 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
-  assert.ok(readTrustedPrWorkflow().length > 0);
+test("pr.yml routes to the fork-local PR workflow", () => {
+  assert.ok(readForkPrWorkflow().length > 0);
 });
 
-test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
+test("the fork-local PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
   // Branch protection requires a check literally named `e2e`. The shards run
-  // as `e2e shard (n/3)`, so the aggregate job below is what keeps the
-  // required-check contract intact — same pattern as the `verify` aggregate.
-  const workflow = readTrustedPrWorkflow();
+  // as `e2e shard (n/8)`, so the aggregate keeps the required-check contract
+  // intact and reports failure whenever a shard fails.
+  const workflow = readForkPrWorkflow();
   const jobs = readWorkflowJobs(workflow);
 
   const aggregate = jobs.get("e2e");
@@ -208,21 +213,23 @@ test("the trusted PR workflow keeps a stable aggregate check named e2e over the 
   }
 });
 
-test("runner selection has reserved AWS capacity and executes metadata checks only", () => {
+test("runner selection uses hosted metadata without checkout or secret access", () => {
   const workflow = readFileSync(routingWorkflow, "utf8");
   const jobs = readWorkflowJobs(workflow.split(/^jobs:\n/m)[1]);
   assert.deepEqual([...jobs.keys()], ["gate"]);
-  assert.match(jobs.get("gate"), /^ {4}runs-on: \$\{\{ vars\.AWS_CI_ENABLED[\s\S]*paperclip-ci-routing-x64/m);
+  assert.match(jobs.get("gate"), /^ {4}runs-on: ubuntu-latest$/m);
   assert.doesNotMatch(jobs.get("gate"), /uses:|actions\/checkout|secrets\./);
+  assert.match(workflow, /^permissions:\n  actions: read\n  contents: read\n  pull-requests: read$/m);
   assert.match(workflow, /^ {6}runner:\n {8}value: \$\{\{ jobs\.gate\.outputs\.runner \}\}$/m);
   assert.match(workflow, /^ {6}full_ci:\n {8}value: \$\{\{ jobs\.gate\.outputs\.full_ci \}\}$/m);
-  assert.doesNotMatch(workflow, /^ {2}(?:actions|contents|pull-requests): write$/m);
+  assert.match(jobs.get("gate"), /runner=ubuntu-latest/);
+  assert.doesNotMatch(workflow, /AWS_CI_ENABLED|paperclip-ci-routing-x64|^ {2}(?:actions|contents|pull-requests): write$/m);
 });
 
-test("the trusted PR workflow limits full CI to merge-relevant stack layers", () => {
-  const workflow = readFileSync(trustedPrWorkflow, "utf8");
+test("the fork-local PR workflow limits full CI to merge-relevant stack layers", () => {
+  const workflow = readForkPrWorkflow();
   const jobs = readWorkflowJobs(workflow);
-  assert.match(jobs.get("gate"), /uses: paperclipai\/paperclip\/\.github\/workflows\/ci-routing\.yml@master/);
+  assert.match(jobs.get("gate"), /uses: \.\/\.github\/workflows\/ci-routing\.yml/);
   const gate = readWorkflowJobs(readFileSync(routingWorkflow, "utf8")).get("gate");
 
   assert.match(gate, /^ {6}full_ci: \$\{\{ steps\.scope\.outputs\.full_ci \}\}$/m);
@@ -299,10 +306,10 @@ test("the stacked PR scope selector runs full CI only where intended", () => {
   );
 });
 
-test("the trusted PR workflow passes the shard's spec filter to Playwright without a literal --", () => {
+test("the fork-local PR workflow passes the shard's spec filter to Playwright without a literal --", () => {
   // `pnpm run test:e2e -- $specs` forwards the literal separator to Playwright,
   // so the specs after it are not applied as file filters.
-  const workflow = readTrustedPrWorkflow();
+  const workflow = readForkPrWorkflow();
   assert.ok(
     !/pnpm run test:e2e --\s/.test(workflow),
     "pr-trusted.yml must not insert a literal `--` between `pnpm run test:e2e` and the spec filter",
@@ -314,41 +321,36 @@ test("the trusted PR workflow passes the shard's spec filter to Playwright witho
   );
 });
 
-test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
-  // Validate the proposed workflow here. The caller executes the merged master
-  // workflow; edits to this workflow take effect after code-owner review and merge.
-  const workflow = readFileSync(trustedPrWorkflow, "utf8");
-  assert.match(
-    workflow,
-    /policy:\n    needs: \[gate\][\s\S]{0,160}timeout-minutes: 10/,
-    "the unconditional resolution step needs the same timeout headroom as the lockfile refresh workflow",
-  );
-  const policy = workflow.split("  policy:\n")[1].split("  typecheck_release_registry:\n")[0];
-  assert.doesNotMatch(
-    policy,
-    /cache: pnpm|uses: actions\/cache/,
-    "resolution-only policy must not restore or save a dependency store",
-  );
-  assert.match(
-    policy,
-    /pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile/,
-    "the policy job must resolve the complete merge tree without rewriting platform metadata",
-  );
+test("the PR policy and all shared-action consumers reject stale lockfiles", () => {
+  const workflow = readForkPrWorkflow();
+  const jobs = readWorkflowJobs(workflow);
+  const policy = jobs.get("policy");
+  assert.ok(policy, "the PR workflow must include its unconditional policy job");
+  assert.match(policy, /pnpm install --frozen-lockfile --ignore-scripts/);
+  assert.match(policy, /version: 9\.15\.4/);
+  assert.doesNotMatch(policy, /--resolution-only|--no-frozen-lockfile/);
 
-  // Test lanes no longer wait on a policy-job artifact: each install step
-  // resolves a stale lockfile inline, so a manifest-changing or stacked PR
-  // still installs while the policy job validates resolution in parallel.
-  const fallbackInstalls = workflow.match(
-    /if ! pnpm install --frozen-lockfile; then\n[\s\S]{0,240}?pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile\n\s+pnpm install --frozen-lockfile\n\s+fi/g,
-  ) ?? [];
-  assert.equal(
-    fallbackInstalls.length,
-    7,
-    "every downstream install job must resolve a stale lockfile inline",
+  const dependencySetupConsumers = [...jobs.values()].filter((job) =>
+    /uses: \.\/\.github\/actions\/setup-ci-dependencies/.test(job),
   );
+  assert.equal(dependencySetupConsumers.length, 7, "all seven existing CI consumers must use the shared dependency action");
+
+  const dependencyAction = readFileSync(
+    path.join(repoRoot, ".github", "actions", "setup-ci-dependencies", "action.yml"),
+    "utf8",
+  );
+  assert.match(dependencyAction, /pnpm install --frozen-lockfile/);
   assert.doesNotMatch(
-    workflow,
-    /Restore regenerated PR lockfile|lockfile_regenerated|name: pr-lockfile/,
-    "the policy lockfile artifact chain must stay removed; it put the policy job on every lane's critical path",
+    `${workflow}\n${dependencyAction}`,
+    /--resolution-only|--no-frozen-lockfile|if ! pnpm install --frozen-lockfile/,
+    "stale lockfiles must fail rather than trigger a resolution or retry fallback",
+  );
+  const installCommands = [...`${workflow}\n${dependencyAction}`.matchAll(/\bpnpm install\b[^\n]*/g)].map(
+    ([command]) => command,
+  );
+  assert.equal(installCommands.length, 2, "policy and shared action must be the only PR install paths");
+  assert.ok(
+    installCommands.every((command) => /pnpm install --frozen-lockfile\b/.test(command)),
+    "every PR dependency install must require the frozen lockfile",
   );
 });

@@ -51,7 +51,8 @@ import { createRunnerTestTlsTunnel, dockerCommandRunner } from "../../__tests__/
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
 import { waitForPendingRunFailureReports } from "../run-failure-report.js";
-import { closeIdleWarmNativeSessionsForRestart, executePaperclipNativeSession, NativeControllerDetachedForRestartError } from "./native-session-executor.js";
+import { closeIdleWarmNativeSessionsForRestart, executePaperclipNativeSession } from "./native-session-executor.js";
+import { NativeControllerDetachedForRestartError } from "./native-session-errors.js";
 
 const mockCaptureRunFailure = vi.hoisted(() => vi.fn());
 vi.mock("../../sentry.js", async () => {

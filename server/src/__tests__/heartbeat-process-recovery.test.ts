@@ -12520,6 +12520,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status,
       wakeupRequestId,
       retryOfRunId: extra?.parentId ?? source.runId,
+      responsibleUserId: "responsible-user",
       contextSnapshot: context,
       ...(status === "succeeded"
         ? { finishedAt: new Date(), livenessState: "advanced" }

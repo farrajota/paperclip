@@ -186,10 +186,7 @@ import {
   readPendingNativeRuntimeRequest,
   type NativeRuntimeRequestResolver,
 } from "../services/native-runtime/runtime-request-resolution-authority.js";
-import {
-  NativeRuntimeRequestResolutionError,
-  resolveNativeRuntimeRequest,
-} from "../services/native-runtime/native-session-executor.js";
+import { NativeRuntimeRequestResolutionError } from "../services/native-runtime/native-session-errors.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import {
   instanceSettingsService,
@@ -7234,7 +7231,9 @@ export function agentRoutes(
         }
         let queued: { commandId: string };
         try {
-          queued = await resolveNativeRuntimeRequest({
+          // A static import would eagerly load native execution on source-mode startup with no native work.
+          const nativeSessionExecutor = await import("../services/native-runtime/native-session-executor.js");
+          queued = await nativeSessionExecutor.resolveNativeRuntimeRequest({
             runId,
             requestId,
             turnId: currentPendingRequest.turnId,

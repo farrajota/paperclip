@@ -362,6 +362,22 @@ If recovery cannot be truthful, state names the outcome. For example, failure
 to reserve storage for a P0 event records `p0_storage_exhausted` and the
 `unrecoverable` lifecycle. It never reports a fresh session as resumed.
 
+A pending terminal-delivery marker does not prove that its provider turn has
+stopped. An exact failed `runner.suspend` terminal replay first reconciles its
+old receipt in a delivery-only epoch, even when the retained provider remains
+`turn_active`. A later epoch must still stop that owned provider and drain its
+retained prefix. Cleanup and retirement continue to require the existing
+command, event and acknowledgement settlement proof; delivery alone cannot
+satisfy it.
+
+Delivery-only epochs continue to check authorization while waiting, but do not
+repeatedly read, parse and fingerprint the durable state files to decide which
+provider command to issue: those epochs cannot issue provider commands. Initial
+binding checks, authenticated event processing, exact retirement and final
+settlement checks remain required. Command-driving state polling belongs to the
+later provider-stop/drain epoch; receipt acknowledgements retain their existing
+deadline.
+
 ## Protocol versions and warm handoff
 
 Ordinary PRP v1 connections remain supported. A warm `run.attach` that changes

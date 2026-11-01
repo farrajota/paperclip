@@ -43,19 +43,10 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
-import {
-  claimNativeRestartRecoveries,
-  closeIdleWarmNativeSessionsForRestart,
-  currentNativeControllerIdentity,
-  dispatchNativeSessionResumptions,
-  detachNativeSessionsForRestart,
-  isNativeSessionId,
-  readNativeWorkspaceSyncReference,
-  type NativeRestartRecoveryClaim,
-  reconcileNativeFinalizations,
-  reconcileRetainedNativeSessionCleanup,
-  reconcileRetainedNativeSessionCleanups,
-} from "../native-runtime/index.js";
+import { claimNativeRestartRecoveries, currentNativeControllerIdentity, type NativeRestartRecoveryClaim } from "../native-runtime/native-restart-recovery.js";
+import { dispatchNativeSessionResumptions, reconcileNativeFinalizations, reconcileRetainedNativeSessionCleanups } from "../native-runtime/native-finalization-reconciler.js";
+import { isNativeSessionId } from "../native-runtime/native-session-resume.js";
+import { readNativeWorkspaceSyncReference } from "../native-runtime/native-workspace-sync.js";
 import { drainRetainedRunnerdMaintenanceOperations } from "../../vendor/paperclip-runner/index.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { parseObject } from "../../adapters/utils.js";
@@ -463,7 +454,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     now = new Date(),
   ) {
     enterShutdown();
-    const idleSessions = await closeIdleWarmNativeSessionsForRestart();
+    const idleSessions = await (await import("../native-runtime/native-session-executor.js")).closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
     }
@@ -586,7 +577,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       )
       .map(({ run }) => run.id);
     const detachedNativeSessions =
-      await detachNativeSessionsForRestart(nativeRunIds);
+      await (await import("../native-runtime/native-session-executor.js")).detachNativeSessionsForRestart(nativeRunIds);
 
     logger.info(
       {
@@ -1107,7 +1098,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         // hot restart. Leaving the old event consumer attached lets its
         // finalizer interrupt/suspend Claude while the next server is adopting
         // the same turn.
-        await detachNativeSessionsForRestart([run.id]);
+        await (await import("../native-runtime/native-session-executor.js")).detachNativeSessionsForRestart([run.id]);
         const recoveryHistoryEntry = JSON.stringify({
           at: now.toISOString(),
           restartKind: "graceful",
@@ -1894,7 +1885,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // control-only repair must not hold up unrelated provider ingress or the
     // entire orphan reaper, but shutdown must still await its physical owner.
     const cleanup = reconcileRetainedNativeSessionCleanups(db, {
-      cleanup: (input) => reconcileRetainedNativeSessionCleanup(db, input),
+      cleanup: async (input) => (await import("../native-runtime/native-session-executor.js")).reconcileRetainedNativeSessionCleanup(db, input),
       onError: (error, runId) => {
         logger.warn(
           { err: error, runId },

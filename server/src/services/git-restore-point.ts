@@ -161,11 +161,16 @@ async function snapshotStore(cwd: string, temporary: string) {
   await execFile("git", ["init", "-q", "--bare", store], { env: isolatedEnv() });
   const repositoryObjects = await objectsDirectory(cwd);
   await fs.writeFile(path.join(store, "objects", "info", "alternates"), `${repositoryObjects}\n`);
+  const configCount = Number(process.env.GIT_CONFIG_COUNT ?? "0");
   return {
     store,
     env: {
       GIT_OBJECT_DIRECTORY: path.join(store, "objects"),
       GIT_ALTERNATE_OBJECT_DIRECTORIES: repositoryObjects,
+      // These loose objects are repacked or discarded; scope their representation to redirected writes, not pack compression.
+      GIT_CONFIG_COUNT: String(configCount + 1),
+      [`GIT_CONFIG_KEY_${configCount}`]: "core.looseCompression",
+      [`GIT_CONFIG_VALUE_${configCount}`]: "0",
       ...SNAPSHOT_IDENTITY,
     },
   };
@@ -301,16 +306,26 @@ async function snapshotTrees(cwd: string, env: Record<string, string>, temporary
   await copyIndex(cwd, indexCopy);
   const indexTree = await gitText(cwd, ["write-tree"], { env: { ...env, GIT_INDEX_FILE: indexCopy }, signal })
     .catch(() => { throw new RestorePointSkip("unmerged_index"); });
-  const worktreeIndex = path.join(temporary, "worktree-index");
-  const worktreeEnv = { ...env, GIT_INDEX_FILE: worktreeIndex };
-  await git(cwd, ["read-tree", "HEAD"], { env: worktreeEnv, signal });
-  await git(cwd, ["add", "-u", "--", "."], { env: worktreeEnv, signal });
-  await git(cwd, ["add", "-A", "--", ".", ...EXCLUDED_UNTRACKED], { env: worktreeEnv, signal });
-  const worktreeTree = await gitText(cwd, ["write-tree"], { env: worktreeEnv, signal });
-  const gitlinks = await gitText(cwd, ["ls-tree", "-r", worktreeTree], { env, signal });
-  if (/^160000 /m.test(gitlinks)) throw new RestorePointSkip("submodules_unsupported");
-  const ignoredTree = await rawIgnoredTree(cwd, env, temporary, await savedIgnoredFiles(cwd, signal), signal);
-  return { indexTree, worktreeTree, ignoredTree };
+  const worktree = (async () => {
+    const worktreeIndex = path.join(temporary, "worktree-index");
+    const worktreeEnv = { ...env, GIT_INDEX_FILE: worktreeIndex };
+    await git(cwd, ["read-tree", "HEAD"], { env: worktreeEnv, signal });
+    await git(cwd, ["add", "-u", "--", "."], { env: worktreeEnv, signal });
+    await git(cwd, ["add", "-A", "--", ".", ...EXCLUDED_UNTRACKED], { env: worktreeEnv, signal });
+    const worktreeTree = await gitText(cwd, ["write-tree"], { env: worktreeEnv, signal });
+    const gitlinks = await gitText(cwd, ["ls-tree", "-r", worktreeTree], { env, signal });
+    if (/^160000 /m.test(gitlinks)) throw new RestorePointSkip("submodules_unsupported");
+    return worktreeTree;
+  })();
+  const ignored = (async () => {
+    const files = await savedIgnoredFiles(cwd, signal);
+    return rawIgnoredTree(cwd, env, temporary, files, signal);
+  })();
+  const [worktreeResult, ignoredResult] = await Promise.allSettled([worktree, ignored]);
+  // Both private indexes share the temporary object store; settle both before cleanup and keep worktree failures primary.
+  if (worktreeResult.status === "rejected") throw worktreeResult.reason;
+  if (ignoredResult.status === "rejected") throw ignoredResult.reason;
+  return { indexTree, worktreeTree: worktreeResult.value, ignoredTree: ignoredResult.value };
 }
 
 async function snapshotCommits(cwd: string, env: Record<string, string>, temporary: string, modes: RestorePointSnapshot["modes"], signal?: AbortSignal): Promise<RestorePointSnapshot> {

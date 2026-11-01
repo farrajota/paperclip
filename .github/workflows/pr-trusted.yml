@@ -1,8 +1,5 @@
 name: Trusted PR CI
 
-# Rollout is intentionally two-step: merge this reusable workflow first, then
-# replace pr.yml with an immutable-SHA caller so the active CI definition cannot
-# drift from this file.
 on:
   workflow_call:
 
@@ -22,7 +19,7 @@ concurrency:
 
 jobs:
   gate:
-    uses: paperclipai/paperclip/.github/workflows/ci-routing.yml@master
+    uses: ./.github/workflows/ci-routing.yml
 
   policy:
     needs: [gate]
@@ -54,19 +51,6 @@ jobs:
             echo 'CI_NODE_TEST=--test' >> "$GITHUB_ENV"
           fi
 
-      - name: Block manual lockfile edits
-        if: >-
-          github.head_ref != 'chore/refresh-lockfile' &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
-        run: |
-          # Diff the PR branch against its merge base so recent base-branch commits
-          # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
-          if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
-            echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
-            exit 1
-          fi
-
       - name: Setup Node.js for pnpm bootstrap
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -82,6 +66,9 @@ jobs:
         with:
           version: 9.15.4
           run_install: false
+
+      - name: Validate generated lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Validate migration ordering against target branch
         run: >-
@@ -133,10 +120,6 @@ jobs:
           PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
-      # Each lane resolves a stale lockfile inline; this early check still
-      # fails fast when the merge tree cannot resolve at all.
-      - name: Validate dependency resolution
-        run: pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
 
       - name: Upload CI profile timings
         continue-on-error: true
@@ -189,37 +172,8 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Restore materialized dependencies and shared builds
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') != ''
         uses: ./.github/actions/setup-ci-dependencies
 
-      - name: Locate pnpm store
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        id: pnpm_store
-        run: |
-          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store (read only)
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm_store.outputs.path }}
-          key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
-
-      - name: Install dependencies
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
-        # stale for the merge tree. Resolve it inline instead of waiting on a
-        # policy-job artifact: that dependency put the policy job's queue and
-        # runtime (~60s) on every lane's critical path, and policy still
-        # validates resolution as a required check in parallel.
-        run: |
-          if ! pnpm install --frozen-lockfile; then
-            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
-            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-            pnpm install --frozen-lockfile
-          fi
 
       # typecheck:build-gaps builds @paperclipai/server, whose build script
       # rebuilds the Runner release binary; without the shared Rust cache that
@@ -477,37 +431,8 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Restore materialized dependencies and shared builds
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') != ''
         uses: ./.github/actions/setup-ci-dependencies
 
-      - name: Locate pnpm store
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        id: pnpm_store
-        run: |
-          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store (read only)
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm_store.outputs.path }}
-          key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
-
-      - name: Install dependencies
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
-        # stale for the merge tree. Resolve it inline instead of waiting on a
-        # policy-job artifact: that dependency put the policy job's queue and
-        # runtime (~60s) on every lane's critical path, and policy still
-        # validates resolution as a required check in parallel.
-        run: |
-          if ! pnpm install --frozen-lockfile; then
-            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
-            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-            pnpm install --frozen-lockfile
-          fi
 
       - name: Run grouped general test suites
         run: |
@@ -692,37 +617,8 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Restore materialized dependencies and shared builds
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') != ''
         uses: ./.github/actions/setup-ci-dependencies
 
-      - name: Locate pnpm store
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        id: pnpm_store
-        run: |
-          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store (read only)
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm_store.outputs.path }}
-          key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
-
-      - name: Install dependencies
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
-        # stale for the merge tree. Resolve it inline instead of waiting on a
-        # policy-job artifact: that dependency put the policy job's queue and
-        # runtime (~60s) on every lane's critical path, and policy still
-        # validates resolution as a required check in parallel.
-        run: |
-          if ! pnpm install --frozen-lockfile; then
-            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
-            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-            pnpm install --frozen-lockfile
-          fi
 
       # Same restore-only contract as the pnpm store above, for the Rust
       # dependency tree: master's post-merge verification is the sole writer
@@ -900,37 +796,8 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Restore materialized dependencies and shared builds
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') != ''
         uses: ./.github/actions/setup-ci-dependencies
 
-      - name: Locate pnpm store
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        id: pnpm_store
-        run: |
-          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store (read only)
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm_store.outputs.path }}
-          key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
-
-      - name: Install dependencies
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
-        # stale for the merge tree. Resolve it inline instead of waiting on a
-        # policy-job artifact: that dependency put the policy job's queue and
-        # runtime (~60s) on every lane's critical path, and policy still
-        # validates resolution as a required check in parallel.
-        run: |
-          if ! pnpm install --frozen-lockfile; then
-            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
-            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-            pnpm install --frozen-lockfile
-          fi
 
       # The public-install verifier at the end of this lane downloads the whole
       # public registry graph into an empty npm cache: its consumer install
@@ -1191,37 +1058,8 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Restore materialized dependencies and shared builds
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') != ''
         uses: ./.github/actions/setup-ci-dependencies
 
-      - name: Locate pnpm store
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        id: pnpm_store
-        run: |
-          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store (read only)
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm_store.outputs.path }}
-          key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
-
-      - name: Install dependencies
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
-        # stale for the merge tree. Resolve it inline instead of waiting on a
-        # policy-job artifact: that dependency put the policy job's queue and
-        # runtime (~60s) on every lane's critical path, and policy still
-        # validates resolution as a required check in parallel.
-        run: |
-          if ! pnpm install --frozen-lockfile; then
-            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
-            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-            pnpm install --frozen-lockfile
-          fi
 
       - name: Run serialized server test shard
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
@@ -1277,37 +1115,8 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Restore materialized dependencies and shared builds
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') != ''
         uses: ./.github/actions/setup-ci-dependencies
 
-      - name: Locate pnpm store
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        id: pnpm_store
-        run: |
-          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store (read only)
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm_store.outputs.path }}
-          key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
-
-      - name: Install dependencies
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
-        # stale for the merge tree. Resolve it inline instead of waiting on a
-        # policy-job artifact: that dependency put the policy job's queue and
-        # runtime (~60s) on every lane's critical path, and policy still
-        # validates resolution as a required check in parallel.
-        run: |
-          if ! pnpm install --frozen-lockfile; then
-            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
-            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-            pnpm install --frozen-lockfile
-          fi
 
       # release.sh's Step 2/7 workspace build reaches the Runner package's
       # build:binary step; without the shared Rust cache that is a ~3m40s cold
@@ -1531,37 +1340,8 @@ jobs:
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
       - name: Restore materialized dependencies and shared builds
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') != ''
         uses: ./.github/actions/setup-ci-dependencies
 
-      - name: Locate pnpm store
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        id: pnpm_store
-        run: |
-          echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-          echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore pnpm store (read only)
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm_store.outputs.path }}
-          key: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm_store.outputs.arch }}-pnpm-
-
-      - name: Install dependencies
-        if: hashFiles('.github/actions/setup-ci-dependencies/action.yml') == ''
-        # Manifest-changing and stacked PRs can hold a pnpm-lock.yaml that is
-        # stale for the merge tree. Resolve it inline instead of waiting on a
-        # policy-job artifact: that dependency put the policy job's queue and
-        # runtime (~60s) on every lane's critical path, and policy still
-        # validates resolution as a required check in parallel.
-        run: |
-          if ! pnpm install --frozen-lockfile; then
-            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
-            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-            pnpm install --frozen-lockfile
-          fi
 
       - name: Verify runner Chrome
         # GitHub's Ubuntu runner image already ships Google Chrome, so use that

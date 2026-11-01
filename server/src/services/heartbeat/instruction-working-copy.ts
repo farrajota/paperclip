@@ -7,7 +7,7 @@ import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "../agent-directory-working-copies.js";
 import { collectStoppedInstructionCopyWithRetries, instructionWorkingCopyGuidance, type agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
-import { claimWarmNativeInstructionCopy, nativeSessionWorkspaceScope, reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
+import type * as NativeSessionExecutor from "../native-runtime/native-session-executor.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { supportsNativeWarmFiles } from "../native-runtime/native-warm-capability.js";
 import type { HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
@@ -76,18 +76,11 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
   const { taskSession, taskSessionForRun, sessionConfigMetadata } = input.session;
   const { executionTarget, executionWorkspace, persistedExecutionWorkspace } = input.workspace;
   let releaseWarmInstructionPreparation: (() => Promise<void>) | null = null;
-  let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
+  let nativeInstructionReservation: Awaited<ReturnType<typeof NativeSessionExecutor.reserveWarmNativeInstructionDirectory>> = null;
   let instructionCopy: Awaited<ReturnType<typeof instructionCopies.prepare>> = null;
+  let instructionPreparationKey: string | null = null;
   let instructionSave: Record<string, unknown> | null = null;
   const task = executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? executionTarget.runnerTask : undefined;
-  const instructionPreparationKey = createHash("sha256").update(JSON.stringify({
-    adapterType: agent.adapterType, adapterConfig: agent.adapterConfig, runtimeConfig: agent.runtimeConfig, sessionConfigMetadata,
-    duplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(executionTarget),
-    workspace: nativeSessionWorkspaceScope({
-      binding: { runId: readRun().id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? readRun().id },
-      workspace: executionWorkspace,
-    }), cwd: executionWorkspace.cwd,
-  })).digest("hex");
   const recordInstructionSave = async (saved: NonNullable<Awaited<ReturnType<typeof instructionCopies.get>>>) => {
     const receipt = parseObject(saved.receipt);
     const storageWarning = readNonEmptyString(receipt.storageWarning);
@@ -111,7 +104,7 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
     if (saved.state !== "superseded") await recordInstructionSave(saved);
   };
   const nativeInstructionWorkingCopy = () => instructionCopy ? {
-    ...(isAgentDirectoryCopy(instructionCopy) ? { runId: readRun().id, preparationKey: instructionPreparationKey } : {}),
+    ...(isAgentDirectoryCopy(instructionCopy) ? { runId: readRun().id, preparationKey: instructionPreparationKey ?? undefined } : {}),
     root: instructionCopy.executionRoot,
     ...(instructionCopy.receipt?.warm === true ? { checkpointWarm: async () => {
       const saved = await instructionCopies.checkpointWarm({ companyId: agent.companyId, runId: readRun().id, target: executionTarget });
@@ -128,6 +121,8 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
     nativeRuntimeResolution: Selection["nativeRuntimeResolution"];
     hasInstructionFilesystem: boolean;
   }) {
+    instructionPreparationKey = null;
+
     if (hasInstructionFilesystem && !task) {
       try {
         // Missing contract fields on a restored session mean the deployed
@@ -144,19 +139,34 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
           (executionTarget?.kind === "remote" && executionTarget.transport === "sandbox"
             ? executionTarget.runnerLifecyclePolicy?.mode === "warm"
             : parseObject(agent.adapterConfig).lifecycleMode === "warm");
+        // Load warm-ownership helpers only for native preparations; a static import defeats source-mode laziness.
+        const nativeSessionExecutor = nativeRuntimeResolution.kind === "native"
+          ? await import("../native-runtime/native-session-executor.js")
+          : null;
+        const preparationKey = nativeSessionExecutor
+          ? createHash("sha256").update(JSON.stringify({
+              adapterType: agent.adapterType, adapterConfig: agent.adapterConfig, runtimeConfig: agent.runtimeConfig, sessionConfigMetadata,
+              duplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(executionTarget),
+              workspace: nativeSessionExecutor.nativeSessionWorkspaceScope({
+                binding: { runId: readRun().id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? readRun().id },
+                workspace: executionWorkspace,
+              }), cwd: executionWorkspace.cwd,
+            })).digest("hex")
+          : null;
+        instructionPreparationKey = preparationKey;
         if (warmFiles && taskSessionForRun?.lastRunId) {
-          nativeInstructionReservation = await reserveWarmNativeInstructionDirectory({ companyId: agent.companyId, agentId: agent.id,
+          nativeInstructionReservation = await nativeSessionExecutor!.reserveWarmNativeInstructionDirectory({ companyId: agent.companyId, agentId: agent.id,
             previousRunId: taskSessionForRun.lastRunId, runId: readRun().id, target: executionTarget,
             observabilityCompatibilityKey: input.observabilityCompatibilityKey,
             canReuse: () => instructionCopies.canReuseWarm(agent.companyId, agent.id, taskSessionForRun!.lastRunId!),
           });
         }
-        if (!warmFiles && nativeRuntimeResolution.kind === "native" && priorWorkingCopy.kind === "agent_files" && taskSession) {
-          releaseWarmInstructionPreparation = await claimWarmNativeInstructionCopy({
+        if (!warmFiles && nativeSessionExecutor && preparationKey !== null && priorWorkingCopy.kind === "agent_files" && taskSession) {
+          releaseWarmInstructionPreparation = await nativeSessionExecutor.claimWarmNativeInstructionCopy({
             observabilityCompatibilityKey: input.observabilityCompatibilityKey,
             priorExecution: parseNativeExecutionInput(priorFileInput), companyId: agent.companyId, agentId: agent.id,
             executionWorkspaceId: persistedExecutionWorkspace?.id ?? readRun().id, workspace: executionWorkspace,
-            environmentId: executionTarget?.environmentId ?? null, runId: readRun().id, preparationKey: instructionPreparationKey, forceRetirement: !taskSessionForRun,
+            environmentId: executionTarget?.environmentId ?? null, runId: readRun().id, preparationKey, forceRetirement: !taskSessionForRun,
             adopt: async previousRunId => {
               instructionCopy = await instructionCopies.adopt({ companyId: agent.companyId, agentId: agent.id,
                 runId: readRun().id, previousRunId, target: executionTarget, cwd: executionWorkspace.cwd, allowRetirementHandoff: true });

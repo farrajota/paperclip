@@ -1416,7 +1416,9 @@ export function builtInAgentService(db: Db) {
 
   async function createOrResetRoutine(agent: Agent, definition: BuiltInAgentDefinition, existing: Routine | null, mode: "reconcile" | "reset") {
     const routine = definition.bundle!.routine;
-    const actor = { agentId: null, userId: "built-in-bundles" };
+    // Leave automated creation unattributed; routineSvc.create resolves the
+    // company's configured responsible user or oldest active owner itself.
+    const actor = { agentId: null, userId: null };
     const nextRoutine = existing
       ? await routineSvc.update(existing.id, {
         title: routine.title,

@@ -44,6 +44,16 @@ These almost always get merged quickly when they're clean.
 
 PRs that follow this path are **much** more likely to be accepted, even when they're large.
 
+### CI Workflows and Dependency Lockfiles
+
+Pull-request CI uses this fork's reviewed workflows and GitHub-hosted runners. Main PR lanes keep their existing check names and run the complete matrix; do not skip a required lane to work around a failure. Dependency installs use Node 24, pnpm 9.15.4, and the checked-in `pnpm-lock.yaml` with frozen-lockfile installs.
+
+When a dependency change requires a lockfile update, use the pinned repository pnpm version and commit the generated lockfile with the manifest change. CI accepts lockfile changes only when the frozen install succeeds; it does not silently resolve a stale lockfile. The `Refresh Lockfile` workflow can generate an update for `zay/main`.
+
+The `commitperclip PR Review` workflow runs on `pull_request_target`, which executes the workflow definition from the PR's target branch. It checks out the event's trusted base SHA for metadata checks and never executes PR-controlled code with its privileged `GITHUB_TOKEN`. Its dependency review requires an authorized repository owner to enable **Settings → Advanced Security → Dependency Graph**. If that capability is unavailable, the blocking check must fail; do not replace it with a success placeholder or disable the check.
+
+Workflow edits on a PR head do not change an already-existing `pull_request_target` workflow on the target branch. Activating a new trusted review workflow therefore requires an authorized maintainer to bootstrap that workflow onto the target branch through the repository's normal reviewed process before the PR event can use it. Do not push directly to the target branch or treat a head-only workflow edit as activation. Keep the required check identities, including `ci / policy` and `commitperclip PR Review / review`, unchanged.
+
 ## PR Requirements (all PRs)
 
 - Do not submit a PR that moves a code file from less than 1,000 lines of code to more than 1,000 lines of code.

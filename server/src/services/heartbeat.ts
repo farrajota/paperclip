@@ -10,6 +10,7 @@ import { dotRunnerBroker } from "./dot-runner-broker.js";
 import { withRunExecutionTiming, measureRunPhase, measureWorkspaceSyncPhase, isWorkspaceSyncDetailPhase } from "./execution-preparation-timing.js";
 import { createHeartbeatPreparationTiming } from "./heartbeat/preparation-timing.js";
 import { createHeartbeatInstructionCopyRelease, createHeartbeatInstructionWorkingCopy } from "./heartbeat/instruction-working-copy.js";
+import { authorizeInstructionCommit } from "./agent-instruction-authorization.js";
 import { prepareHeartbeatRuntimeServiceIntents, startHeartbeatRuntimeServices, recordHeartbeatAdapterRuntimeServices } from "./heartbeat/runtime-services.js";
 import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration } from "./heartbeat/execution-configuration.js";
 import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
@@ -342,14 +343,14 @@ import {
   queuedCommentIdsFromRunContext,
 } from "./issue-queued-comment-queue.js";
 
+import { dispatchNativeSessionResumptions } from "./native-runtime/native-finalization-reconciler.js";
+import { prepareNativeWorkspaceSync } from "./native-runtime/native-workspace-sync.js";
+import { resolveHeartbeatNativeRuntimeMode } from "./native-runtime/runtime-mode.js";
+import type { NativeRestartRecoveryClaim } from "./native-runtime/native-restart-recovery.js";
 import {
-  dispatchNativeSessionResumptions,
   NativeCancellationPendingRecoveryError,
   NativeControllerDetachedForRestartError,
-  prepareNativeWorkspaceSync,
-  type NativeRestartRecoveryClaim,
-  resolveHeartbeatNativeRuntimeMode,
-} from "./native-runtime/index.js";
+} from "./native-runtime/native-session-errors.js";
 
 import { nativeChatWorkspaceCwd } from "./native-runtime/native-chat-workspace.js";
 import {
@@ -928,6 +929,27 @@ export function heartbeatService(
       pluginWorkerManager: options.pluginWorkerManager,
     });
   const instructionCopies = agentInstructionWorkingCopyService(db, { environmentRuntime });
+  const instructionCopiesWithEditAuthorization = {
+    ...instructionCopies,
+    prepare: async (copyInput: Parameters<typeof instructionCopies.prepare>[0]) => {
+      await authorizeInstructionCommit(db, {
+        type: "agent",
+        companyId: copyInput.companyId,
+        agentId: copyInput.agentId,
+        runId: copyInput.runId,
+      }, { companyId: copyInput.companyId, id: copyInput.agentId });
+      return instructionCopies.prepare(copyInput);
+    },
+    adopt: async (copyInput: Parameters<typeof instructionCopies.adopt>[0]) => {
+      await authorizeInstructionCommit(db, {
+        type: "agent",
+        companyId: copyInput.companyId,
+        agentId: copyInput.agentId,
+        runId: copyInput.runId,
+      }, { companyId: copyInput.companyId, id: copyInput.agentId });
+      return instructionCopies.adopt(copyInput);
+    },
+  };
   const envOrchestrator = environmentRunOrchestrator(db, {
     pluginWorkerManager: options.pluginWorkerManager,
     environmentRuntime,
@@ -2736,7 +2758,7 @@ export function heartbeatService(
       }));
       const preparedInstructions = instructionWorkingCopy = createHeartbeatInstructionWorkingCopy({
         observabilityCompatibilityKey: observability?.compatibilityKey,
-        db, instructionCopies, readRun: () => run!, agent, context,
+        db, instructionCopies: instructionCopiesWithEditAuthorization, readRun: () => run!, agent, context,
         session: { taskSession, taskSessionForRun, sessionConfigMetadata },
         workspace: { executionTarget, executionWorkspace, persistedExecutionWorkspace },
         appendRunEvent,

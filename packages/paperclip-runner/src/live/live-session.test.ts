@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { setTimeout as realDelay } from "node:timers/promises";
+import { setImmediate as realImmediate, setTimeout as realDelay } from "node:timers/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -96,6 +96,8 @@ interface FakeProviderState {
   assistantReply?: string;
   onTurnStart?: () => Promise<void>;
   onUsage?: (queue: AsyncNotifications, turnId: string) => void | Promise<void>;
+  /** Overrides the fake provider's post-start yield for clock-isolated scenarios. */
+  turnYield?: () => Promise<void>;
   /** Delays the fake `turn/interrupt` reply, to model a slow transport round trip. */
   interruptDelayMs: number;
 }
@@ -221,7 +223,13 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
       method: "turn/started",
       params: { threadId: this.state.threadId, turn: { id: turnId, status: "inProgress" } },
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (this.state.turnYield === undefined) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, 0);
+      await promise;
+    } else {
+      await this.state.turnYield();
+    }
     let assistantText: string;
     if (message.includes("progress")) {
       const idempotencyKey = message.includes("idempotent")
@@ -1769,6 +1777,8 @@ describe("Capability live runnerd and Codex session", () => {
 
   it.each([0, 650])("durably resumes a distinct attempt, preserves partial usage, and deduplicates the semantic effect (%i ms persistence delay)", async persistenceDelayMs => {
     const state = providerState();
+    // Keep provider I/O on a real event-loop handoff, not the session's fake deadlines.
+    state.turnYield = () => realImmediate();
     const directory = await mkdtemp(join(tmpdir(), "capability-live-durable-"));
     const binding = {
       sessionId: "session-governed-resume",
@@ -1807,6 +1817,10 @@ describe("Capability live runnerd and Codex session", () => {
       return error;
     });
     try {
+      // Turn admission's bounded workspace preflight also uses setTimeout. Let
+      // its existing 100ms deadline settle before polling under the fake clock;
+      // otherwise repeated zero-time advances leave turn/start unissued.
+      await vi.advanceTimersByTimeAsync(100);
       const deadline = performance.now() + 5_000;
       while (true) {
         await vi.advanceTimersByTimeAsync(0);

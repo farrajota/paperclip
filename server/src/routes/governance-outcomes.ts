@@ -5,7 +5,7 @@ import type { OutcomeCapabilities } from "@paperclipai/shared/governance-outcome
 import { validate } from "../middleware/validate.js";
 import { governanceOutcomeService } from "../services/governance-outcomes.js";
 import type { OutcomeActorContext } from "../services/governance-outcomes.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, getAccessibleResource, getActorInfo } from "./authz.js";
 import { goalService } from "../services/goals.js";
 
 function outcomeActorContext(req: Request): OutcomeActorContext {
@@ -46,21 +46,18 @@ export function governanceOutcomeRoutes(db: Db) {
   router.post("/goals/:id/outcomes/targets", validate(createOutcomeTargetSchema), async (req, res) => {
     const goal = await getAccessibleResource(req, res, goals.getById(req.params.id as string), "Goal not found");
     if (!goal) return;
-    assertCompanyAccess(req, goal.companyId);
     assertBoard(req);
     res.status(201).json(await service.createTarget(goal.companyId, goal.id, req.body, outcomeActorContext(req)));
   });
   router.post("/goals/:id/outcomes/observations", validate(createOutcomeObservationSchema), async (req, res) => {
     const goal = await getAccessibleResource(req, res, goals.getById(req.params.id as string), "Goal not found");
     if (!goal) return;
-    assertCompanyAccess(req, goal.companyId);
     const result = await service.addObservation(goal.companyId, goal.id, req.body, outcomeActorContext(req));
     res.status(result.reused ? 200 : 201).json(result);
   });
   router.post("/goals/:id/outcomes/observations/corrections", validate(correctOutcomeObservationSchema), async (req, res) => {
     const goal = await getAccessibleResource(req, res, goals.getById(req.params.id as string), "Goal not found");
     if (!goal) return;
-    assertCompanyAccess(req, goal.companyId);
     const { supersedesId, correctionReason, ...input } = req.body;
     const result = await service.addObservation(goal.companyId, goal.id, input, outcomeActorContext(req), { supersedesId, correctionReason });
     res.status(result.reused ? 200 : 201).json(result);
@@ -68,7 +65,6 @@ export function governanceOutcomeRoutes(db: Db) {
   router.post("/goals/:id/outcomes/checkins", validate(createOutcomeCheckinSchema), async (req, res) => {
     const goal = await getAccessibleResource(req, res, goals.getById(req.params.id as string), "Goal not found");
     if (!goal) return;
-    assertCompanyAccess(req, goal.companyId);
     res.status(201).json(await service.addCheckin(goal.companyId, goal.id, req.body, outcomeActorContext(req)));
   });
   return router;

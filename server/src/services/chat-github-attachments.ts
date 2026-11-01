@@ -1,6 +1,6 @@
 import type { Attachment, Message } from "chat";
 import { createHash } from "node:crypto";
-import { JSDOM } from "jsdom";
+import { getJSDOM } from "../lib/dom-runtime.js";
 import {
   isAllowedContentType,
   MAX_ATTACHMENT_BYTES,
@@ -649,7 +649,7 @@ function resolveCanonicalAttachmentTargetOrThrow(
       ? target
       : null;
   };
-  const fragment = JSDOM.fragment(row.body_html);
+  const fragment = getJSDOM().fragment(row.body_html);
   const candidates: URL[] = [];
   for (const anchor of fragment.querySelectorAll("a[href]")) {
     const href = anchor.getAttribute("href")!;

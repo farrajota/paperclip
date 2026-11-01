@@ -35,26 +35,28 @@ import { getStartupTracer } from "../../instrumentation.js";
 import { documentService } from "../documents.js";
 import { managedAgentProfileService } from "../managed-agent-profiles.js";
 import { remoteAgentProfileService } from "../remote-agent-profiles.js";
+import { buildNativeExecutionInput } from "../native-runtime/native-execution-input.js";
+import { buildNativeRuntimeContext } from "../native-runtime/runtime-context.js";
 import {
-  buildNativeExecutionInput,
   buildNativeExecutionWithCheckpoint,
-  buildNativeRuntimeContext,
-  ensureNativeCompletionContract,
   findNativeSessionResumeRun,
   isNativeSessionId,
   isUnusedNativeSessionBootstrap,
   isUnusedLegacyNativeRetryReplacement,
-  materializeNativeInteractionResponses,
+  nativeToolContractFingerprintForTarget,
+  prepareNativeSessionBootstrapPersistence,
+  rebindNativeSessionCheckpoint,
+} from "../native-runtime/native-session-resume.js";
+import {
+  ensureNativeCompletionContract,
   nativeCompletionRequestsWithSources,
   nativeCompletionSource,
   nativeImmediateObjectiveSource,
-  nativeToolContractFingerprintForTarget,
-  prepareNativeSessionBootstrapPersistence,
-  prepareNativeWorkspaceSync,
-  type NativeRestartRecoveryClaim,
-  rebindNativeSessionCheckpoint,
-  type resolveHeartbeatNativeRuntimeMode,
-} from "../native-runtime/index.js";
+} from "../native-runtime/completion-contracts.js";
+import { materializeNativeInteractionResponses } from "../native-runtime/native-interaction-bridge.js";
+import { prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
+import type { NativeRestartRecoveryClaim } from "../native-runtime/native-restart-recovery.js";
+import type { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
 import {
   assertAgentCoreProfileRecoveryBinding,
   assertManagedProfileRecoveryBinding,

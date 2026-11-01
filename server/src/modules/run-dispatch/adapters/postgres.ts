@@ -1,5 +1,6 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
+import { HEARTBEAT_RUN_TERMINAL_STATUSES } from "../../../services/heartbeat/recovery.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { getIssuePlanningGate } from "../../../services/governance-planning.js";
@@ -1271,10 +1272,20 @@ export function createPostgresRunDispatchAdapter(
       });
     }
     if (facts.issueCheckoutRunId && facts.issueCheckoutRunId !== run.id) {
-      return reject("issue_execution_lock_changed", "Cancelled because another run owns the task workspace before provider dispatch", {
-        issueId,
-        currentCheckoutRunId: facts.issueCheckoutRunId,
-      });
+      const [checkoutOwner] = await tx.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, facts.issueCheckoutRunId), eq(heartbeatRuns.companyId, run.companyId),
+      )).limit(1);
+      // A terminal checkout owner is reusable only once its durable cleanup has
+      // settled. The executionRunId check above still owns current admission.
+      const priorCheckoutIsReleased = checkoutOwner !== undefined
+        && HEARTBEAT_RUN_TERMINAL_STATUSES.some(status => status === checkoutOwner.status)
+        && !(await hasPendingRunCleanup(tx, run.companyId, facts.issueCheckoutRunId));
+      if (!priorCheckoutIsReleased) {
+        return reject("issue_execution_lock_changed", "Cancelled because another run owns the task workspace before provider dispatch", {
+          issueId,
+          currentCheckoutRunId: facts.issueCheckoutRunId,
+        });
+      }
     }
 
     const terminalBypass = facts.resumeIntent || facts.wakeCommentIdPresent

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import postgres from "postgres";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { inspectMigrations } from "./client.js";
 import {
   __embeddedPostgresStartMaxAttemptsForTests as MAX_ATTEMPTS,
@@ -12,6 +12,7 @@ import {
   __resetEmbeddedPostgresTemplateStateForTests as resetTemplateState,
   __setEmbeddedPostgresCtorProviderForTests,
   __startEmbeddedPostgresWithRetryForTests as startWithRetry,
+  __waitForEmbeddedPostgresCleanupForTests as waitForCleanup,
   computeEmbeddedPostgresTemplateKey,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   getEmbeddedPostgresTestSupport,
@@ -39,7 +40,7 @@ type FakeOptions = {
 
 const BIND_CONFLICT_LOG = 'could not bind IPv4 address "127.0.0.1": Address already in use';
 
-function makeFakeCtor(failFirst: number) {
+function makeFakeCtor(failFirst: number, stop?: (options: FakeOptions) => Promise<void>) {
   const constructed: FakeOptions[] = [];
   let started = 0;
 
@@ -59,7 +60,9 @@ function makeFakeCtor(failFirst: number) {
         throw new Error();
       }
     }
-    async stop(): Promise<void> {}
+    async stop(): Promise<void> {
+      await stop?.(this.options);
+    }
   }
 
   return { ctor: FakeEmbeddedPostgres, constructed };
@@ -124,6 +127,54 @@ describe("startEmbeddedPostgresWithRetry", () => {
     // The thrown message carries the captured Postgres output, not only the
     // generic "embedded Postgres startup failed" text.
     expect((error as Error).message).toContain("Address already in use");
+  });
+
+  it("retains a scratch root until a timed-out child stop and directory cleanup finish", async () => {
+    const scratch = useScratchTmpdir("paperclip-retry-slow-stop-");
+    let releaseStop!: () => void;
+    let signalStopRequested!: () => void;
+    const rawStop = new Promise<void>((resolve) => { releaseStop = resolve; });
+    const stopRequested = new Promise<void>((resolve) => { signalStopRequested = resolve; });
+    const { ctor, constructed } = makeFakeCtor(1, async (options) => {
+      if (options === constructed[0]) {
+        signalStopRequested();
+        await rawStop;
+      }
+    });
+    let restoring: Promise<void> | undefined;
+    vi.useFakeTimers();
+    try {
+      __setEmbeddedPostgresCtorProviderForTests(async () => ctor);
+      const startup = startWithRetry("paperclip-retry-slow-stop-cluster-");
+      await stopRequested;
+      // Preserve the existing five-second stop bound: startup can continue
+      // while the failed attempt's actual child stop is still pending.
+      await vi.advanceTimersByTimeAsync(5_000);
+      const started = await startup;
+      expect(constructed).toHaveLength(2);
+      await started.instance.stop();
+      fs.rmSync(started.dataDir, { recursive: true, force: true });
+
+      const failedDataDir = constructed[0].databaseDir;
+      let restored = false;
+      restoring = scratch.restore().then(() => { restored = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(restored).toBe(false);
+      expect(fs.existsSync(failedDataDir)).toBe(true);
+
+      releaseStop();
+      await restoring;
+      expect(restored).toBe(true);
+      expect(fs.existsSync(failedDataDir)).toBe(false);
+      expect(fs.existsSync(scratch.scratch)).toBe(false);
+    } finally {
+      releaseStop();
+      try {
+        await (restoring ?? scratch.restore());
+      } finally {
+        vi.useRealTimers();
+      }
+    }
   });
 });
 
@@ -282,21 +333,23 @@ const describeWithPostgres = support.supported ? describe : describe.skip;
 // cache root from an empty state. `os.tmpdir()` reads the environment on every
 // call: TMPDIR on POSIX, TEMP and then TMP on Windows, so all three are set.
 // Returns the scratch directory; `restore` puts the environment and the
-// fixture's cached state back.
+// fixture's cached state back, then reclaims the root only after its child
+// clusters' actual stops and directory cleanups have finished.
 const TMPDIR_VARIABLES = ["TMPDIR", "TEMP", "TMP"] as const;
 
-function useScratchTmpdir(prefix: string): { scratch: string; restore(): void } {
+function useScratchTmpdir(prefix: string): { scratch: string; restore(): Promise<void> } {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const previous = new Map(TMPDIR_VARIABLES.map((name) => [name, process.env[name]] as const));
   for (const name of TMPDIR_VARIABLES) process.env[name] = scratch;
   return {
     scratch,
-    restore() {
+    async restore() {
       for (const [name, value] of previous) {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
       resetTemplateState();
+      await waitForCleanup(scratch);
       fs.rmSync(scratch, { recursive: true, force: true });
     },
   };
@@ -410,7 +463,7 @@ describeWithPostgres("startEmbeddedPostgresTestDatabase template path", () => {
       expect(lastStartMode()).toBe("template");
       expect(isUsableTemplate(templateDir)).toBe(true);
     } finally {
-      scratch.restore();
+      await scratch.restore();
     }
   });
 
@@ -460,7 +513,7 @@ describeWithPostgres("startEmbeddedPostgresTestDatabase template path", () => {
         expect(await getEmbeddedPostgresTestSupport()).toEqual({ supported: true });
       } finally {
         console.warn = warn;
-        scratch.restore();
+        await scratch.restore();
       }
     });
 
@@ -484,7 +537,7 @@ describeWithPostgres("startEmbeddedPostgresTestDatabase template path", () => {
         expect(fs.readdirSync(target)).toEqual([]);
       } finally {
         console.warn = warn;
-        scratch.restore();
+        await scratch.restore();
       }
     });
   });
@@ -529,7 +582,7 @@ describe("support probe when the template cannot be built", () => {
       expect(fs.existsSync(rootDir) ? fs.readdirSync(rootDir) : []).toEqual([]);
     } finally {
       console.warn = warn;
-      scratch.restore();
+      await scratch.restore();
       if (originalTemplateSetting === undefined) delete process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE;
       else process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE = originalTemplateSetting;
     }

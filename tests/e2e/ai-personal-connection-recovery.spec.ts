@@ -68,6 +68,8 @@ test("a ready agent with a missing personal key offers Claude setup in chat and 
     expect(resumed.contextSnapshot.aiConnection).toMatchObject({ connectionId: accounts[0].id, responsibleUserId: "local-board" });
     await expect.poll(async () => (await json(await request.get(`/api/issues/${chat.id}`))).status).toBe("in_review");
     await page.reload();
+    // Cold conversation history is deliberately concealed until the issue, comments, runs, and transcript data hydrate.
+    await expect(page.getByTestId("task-chat-history-content")).toBeVisible();
     await expect(page.getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible();
     await expect(page.getByRole("button", { name: "Connect Claude", exact: true })).toHaveCount(0);
     await test.info().attach("personal-ai-repair-resumed", { body: await page.screenshot(), contentType: "image/png" });

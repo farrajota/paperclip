@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+// Production execute initializes server-utils before copyback teardown.
+import "@paperclipai/adapter-utils/server-utils";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 
 // The copy-out module reuses the direction-agnostic decision predicate

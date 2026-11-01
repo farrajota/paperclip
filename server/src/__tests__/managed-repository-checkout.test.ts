@@ -53,6 +53,12 @@ describe("atomic managed repository publication", () => {
     vi.stubEnv("PATH", path.join(root, "missing-git"));
     await expect(ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true })).rejects.toMatchObject({ code: "ENOENT" });
   });
+  it("retains absence errors when Git environment overrides are explicit", async () => {
+    const { root, target } = await fixture();
+    await mkdir(path.join(target, ".git"), { recursive: true });
+    vi.stubEnv("GIT_DIR", path.join(root, "missing-git-dir"));
+    await expect(ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true })).rejects.toMatchObject({ code: 128 });
+  });
   it("rejects linked Git metadata even for a declared plain task directory", async () => {
     const { source, target } = await fixture();
     await mkdir(target);

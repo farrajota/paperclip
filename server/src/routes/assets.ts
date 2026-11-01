@@ -1,8 +1,8 @@
 import { canActorReadAssetContent } from "../services/asset-content-access.js";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
-import createDOMPurify from "dompurify";
-import { JSDOM } from "jsdom";
+import type { JSDOM } from "jsdom";
+import { getDOMPurify, getJSDOM } from "../lib/dom-runtime.js";
 import type { Db } from "@paperclipai/db";
 import { ASSET_NAMESPACE_RULE, createAssetImageMetadataSchema } from "@paperclipai/shared";
 import type { StorageService } from "../storage/types.js";
@@ -28,6 +28,8 @@ function sanitizeSvgBuffer(input: Buffer): Buffer | null {
   const raw = input.toString("utf8").trim();
   if (!raw) return null;
 
+  const createDOMPurify = getDOMPurify();
+  const JSDOM = getJSDOM();
   const baseDom = new JSDOM("");
   const domPurify = createDOMPurify(
     baseDom.window as unknown as Parameters<typeof createDOMPurify>[0],

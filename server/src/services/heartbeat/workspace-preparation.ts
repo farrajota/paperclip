@@ -36,7 +36,7 @@ import { createHostDuplexObservabilityRecorder } from "../duplex-observability-r
 import { incrementToolRuntimeMetricCounter } from "../tool-runtime-metrics.js";
 import { logger } from "../../middleware/logger.js";
 import { createGitRemoteAuthProvider } from "../git-credentials.js";
-import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd } from "../native-runtime/index.js";
+import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd } from "../native-runtime/native-workspace-sync.js";
 import { parseObject } from "../../adapters/utils.js";
 import { materializeNativeChatTaskRoot } from "../native-runtime/native-chat-workspace.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
@@ -67,7 +67,7 @@ import type {
 } from "@paperclipai/shared";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import type { NativeRunHistoricalSpan } from "../native-runtime/native-run-trace.js";
-import type { NativeRestartRecoveryClaim } from "../native-runtime/index.js";
+import type { NativeRestartRecoveryClaim } from "../native-runtime/native-restart-recovery.js";
 import type { NativeChatWorkspaceScope } from "../native-runtime/native-chat-workspace.js";
 import type { TrustPresetResolution } from "../trust-preset-resolver.js";
 import type { environmentRunOrchestrator } from "../environment-run-orchestrator.js";

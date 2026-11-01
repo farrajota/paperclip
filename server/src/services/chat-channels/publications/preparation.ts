@@ -19,10 +19,7 @@ import type {
   SafeChatPublicationPayload,
 } from "@paperclipai/shared";
 
-import {
-  renderPublicationTransportText,
-  splitNativePublicationText,
-} from "../../chat-publication-text-parts.js";
+import { renderPublicationTransportText } from "../../chat-publication-text-parts.js";
 
 type PublicationPreparationOptions = {
   runPublicationToReplace: ReturnType<typeof createChatPublicationReplacement>["runPublicationToReplace"];
@@ -70,6 +67,10 @@ export function createChatPublicationPreparation(db: Db, options: PublicationPre
         persisted.attachmentIds?.length
       )
         return publication;
+      // Keep converter modules out of startup; this operation already awaits provider lookup.
+      const { splitNativePublicationText } = await import(
+        "../../chat-publication-text-splitting.js"
+      );
       const parts = splitNativePublicationText(provider, persisted.text);
       if (parts.length === 1) return publication;
       return db.transaction(async (tx) => {

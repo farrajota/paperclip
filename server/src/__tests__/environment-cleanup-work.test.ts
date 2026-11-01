@@ -7,7 +7,7 @@ import { idleWorkSnapshot } from "../services/task-admission.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import { companies, createDb, environmentLeases, environments, type Db } from "@paperclipai/db";
+import { companies, createDb, databaseWorkPending, environmentLeases, environments, subscribeDatabaseWork, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerEnvironmentCleanupWork } from "../services/environment-cleanup-work.js";
@@ -23,6 +23,7 @@ describe.skipIf(!support.supported)("environment cleanup scheduling", () => {
   let companyId: string, environmentId: string, draining: boolean, failing: boolean;
   let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
   let worker: ReturnType<typeof registerEnvironmentCleanupWork> | undefined;
+  let intentHolds = new Set<string>();
   let releases: ReturnType<typeof vi.fn>, inspections: ReturnType<typeof vi.fn>, reads: ReturnType<typeof vi.spyOn>;
   const errors: unknown[] = [], disposers: Array<() => void> = [];
   beforeAll(async () => {
@@ -52,6 +53,21 @@ describe.skipIf(!support.supported)("environment cleanup scheduling", () => {
     const heartbeat = heartbeatService(db, { environmentRuntime: runtime });
     coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => !draining, canReconcile: () => true,
       onError: error => errors.push(error) });
+    // Notifications retain an idle token for future retries independently of
+    // the token for a running batch. Observe those holds for this coordinator.
+    const holds = intentHolds = new Set<string>();
+    const register = coordinator.register.bind(coordinator);
+    vi.spyOn(coordinator, "register").mockImplementation((queue, task) => {
+      const registered = register(queue, { ...task, hasPending: async () => {
+        const pending = await task.hasPending();
+        if (!pending && !databaseWorkPending(db, queue)) holds.delete(queue);
+        return pending;
+      } });
+      disposers.push(subscribeDatabaseWork(db, queue, () => {
+        if (databaseWorkPending(db, queue)) holds.add(queue);
+      }));
+      return registered;
+    });
     const history = historical && historicalCleanupVerificationService(db, { inspectLease: inspections, inspectSetup: inspections });
     let historySettled = !history;
     worker = registerEnvironmentCleanupWork(db, coordinator, {
@@ -62,13 +78,16 @@ describe.skipIf(!support.supported)("environment cleanup scheduling", () => {
     });
     await worker.ready;
     await vi.waitFor(() => expect(historySettled).toBe(true));
+    // The sweep flag is raised before the coordinator finalizes pending/deadline state.
+    if (history) await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(intentHolds.size));
   }
   async function settle(ms = 30_000, wait = true) {
     await vi.advanceTimersByTimeAsync(ms);
     if (wait && !draining) {
-      await vi.waitFor(() => expect(idleWorkSnapshot().active === 0 || coordinator!.nextWakeAt() !== null).toBe(true), { timeout: 5000 });
+      // Future retry intents can remain held after the current batch completes.
+      await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(intentHolds.size), { timeout: 5000 });
       await vi.advanceTimersByTimeAsync(1);
-      await vi.waitFor(() => expect(idleWorkSnapshot().active === 0 || coordinator!.nextWakeAt() !== null).toBe(true), { timeout: 5000 });
+      await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(intentHolds.size), { timeout: 5000 });
     }
   }
   const pending = (executor: Db = db) => environmentService(executor).insertPendingCleanupLease({ companyId, environmentId,
@@ -225,7 +244,8 @@ describe.skipIf(!support.supported)("environment cleanup scheduling", () => {
     for (let i = 0; i < 33; i++) {
       const lease = await pending(); await environmentService(db).releaseLease(lease.id, "failed", { cleanupStatus: "success" });
     }
-    await start(true); await settle(300_000); await settle(300_000); expect(inspections).toHaveBeenCalledTimes(33); await quiet();
+    await start(true); await settle(300_000); await settle(300_000);
+    expect(inspections).toHaveBeenCalledTimes(33); await quiet();
   });
   it("keeps unknown historical resources scheduled until provider confirmation", async () => {
     const lease = await pending(); await environmentService(db).releaseLease(lease.id, "failed", { cleanupStatus: "success" });

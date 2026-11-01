@@ -1,7 +1,6 @@
 import { SPEKO_SKILL } from "./voice/speko-skill.js";
 import { spekoAssignedResources } from "./voice/speko-agent-tools.js";
 import { SLACK_TOOLS } from "@paperclipai/shared";
-import { slackAssignedResource, executeGovernedSlackTool } from "./connectors/slack.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -79,8 +78,14 @@ const connectors: ConnectorDefinition[] = [
   },
   { key: "slack", resolvePhase: "connectors.slack.resolve", label: "Slack", skillName: "slack",
     tools: SLACK_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
-    resolve: slackAssignedResource,
-    execute: executeGovernedSlackTool,
+    async resolve(db, binding) {
+      const { slackAssignedResource } = await import("./connectors/slack.js");
+      return slackAssignedResource(db, binding);
+    },
+    async execute(db, binding, name, value) {
+      const { executeGovernedSlackTool } = await import("./connectors/slack.js");
+      return executeGovernedSlackTool(db, binding, name, value);
+    },
   },
   {
     key: "agentmail",

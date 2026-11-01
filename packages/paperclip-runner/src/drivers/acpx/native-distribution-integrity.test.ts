@@ -627,7 +627,14 @@ describe("native ACPX execution closure", () => {
     const rejected = expect(creating).rejects.toThrow("changed while read");
     try {
       await entered.promise;
-      await writeFile(join(declaration.distributionRoot, "file-00"), Buffer.alloc(101, 7));
+      const sourcePath = join(declaration.distributionRoot, "file-00");
+      const replacementPath = join(declaration.distributionRoot, "file-00.mutation-replacement");
+      try {
+        // Atomic replacement guarantees a distinct inode while the admitted
+        // descriptor remains open, independent of filesystem timestamp precision.
+        await writeFile(replacementPath, Buffer.alloc(101, 7), { mode: 0o600 });
+        await rename(replacementPath, sourcePath);
+      } finally { await rm(replacementPath, { force: true }); }
     } finally { hold.release(); }
     await rejected;
   });

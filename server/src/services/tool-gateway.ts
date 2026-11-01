@@ -20,7 +20,6 @@ import { resolveSlackTaskAuthority } from "./connectors/slack-authority.js";
 import { SLACK_TOOLS } from "@paperclipai/shared";
 import { slackToolsForSession } from "./connectors/slack-catalog.js";
 import { boundRunIssueIdSql } from "./run-task-binding.js";
-import { executeSlackTool } from "./connectors/slack.js";
 import { githubGuestBotConnectionForSession, githubBotToolsForSession } from "./chat-github-tools.js";
 import { githubChatReviewService } from "./chat-github-reviews.js";
 import { runIdentityContexts } from "@paperclipai/db";
@@ -3212,6 +3211,7 @@ export function createToolGatewayService(
     if (tool.providerType === "paperclip_slack_chat") {
       if (!session.agentId || !session.runId || !session.issueId) throw new ToolGatewayHttpError(403, "Slack task binding required", "slack_task_required");
       try {
+        const { executeSlackTool } = await import("./connectors/slack.js");
       const data = await executeSlackTool(db, { companyId: session.companyId, agentId: session.agentId, runId: session.runId, issueId: session.issueId, endpointId: String(asRecord(tool.providerMetadata)?.endpointId ?? ""), identityContextId: session.identityContextId, approvedInvocationId: session.approvedSlackInvocationId }, tool.upstreamToolName ?? "", parameters, fetch, invocationId);
       return { content: JSON.stringify(data), data };
       } catch (error) {

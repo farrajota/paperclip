@@ -2647,6 +2647,13 @@
       "when": 1793067717865,
       "tag": "0379_autonomous_governance",
       "breakpoints": true
+    },
+    {
+      "idx": 380,
+      "version": "7",
+      "when": 1793130000000,
+      "tag": "0380_builtin_routine_responsibility",
+      "breakpoints": true
     }
   ]
 }

@@ -11,9 +11,6 @@ import {
 import type {
   SafeChatPublicationPayload,
 } from "@paperclipai/shared";
-import {
-  discordMarkdownRequiresAttachment,
-} from "../../chat-discord.js";
 
 type PublicationPreparationOptions = {
   runPublicationToReplace: ReturnType<typeof createChatPublicationReplacement>["runPublicationToReplace"];
@@ -24,9 +21,16 @@ export function createDiscordPublicationPreparation(db: Db, options: Publication
       if (
         persisted.transportPart ||
         persisted.card ||
-        persisted.interactionId ||
-        !discordMarkdownRequiresAttachment(persisted.text)
+        persisted.interactionId
       ) {
+        return publication;
+      }
+
+      // Static import would load the Discord adapter during no-endpoint startup.
+      const { discordMarkdownRequiresAttachment } = await import(
+        "../../chat-discord-publication-format.js"
+      );
+      if (!discordMarkdownRequiresAttachment(persisted.text)) {
         return publication;
       }
 

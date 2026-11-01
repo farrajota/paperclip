@@ -12,7 +12,6 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
 import { nativeHarnessStateBase } from "./native-harness-backup-stamp.js";
-import { nativeSessionScopeDigestIsBusy } from "./native-session-executor.js";
 
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS = 60 * 60 * 1000;
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS = 2 * 60 * 1000;
@@ -64,7 +63,7 @@ export type NativeHarnessBackupExpirationResult = {
 
 type EvidenceContext = {
   dryRun: boolean;
-  isSessionBusy: (scopeDigest: string) => boolean;
+  isSessionBusy: ((scopeDigest: string) => boolean) | null;
   now: number;
   retentionMs: number;
   retainedBefore: number;
@@ -271,7 +270,9 @@ export function nativeHarnessBackupExpirationService(
   async function expireSession(
     root: string,
     scopeDigest: string,
-    options: Required<Pick<NativeHarnessBackupExpirationOptions, "dryRun" | "isSessionBusy">> & {
+    options: {
+      dryRun: boolean;
+      isSessionBusy?: ((scopeDigest: string) => boolean) | null;
       closedBefore: Date;
     },
     result: NativeHarnessBackupExpirationResult,
@@ -286,11 +287,12 @@ export function nativeHarnessBackupExpirationService(
     if (await fs.lstat(path.join(root, "cleanup-activation.json")).then(() => true, () => false)) {
       return skip("cleanup_active");
     }
-    if (options.isSessionBusy(scopeDigest)) return skip("session_active");
     const backupStat = await fs.stat(current);
     if (backupStat.mtime >= options.closedBefore) return skip("recent_backup");
     const identity = await readSessionIdentity(root);
     if (!identity) return skip("identity_unknown");
+    const isSessionBusy = options.isSessionBusy ?? (await import("./native-session-executor.js")).nativeSessionScopeDigestIsBusy;
+    if (isSessionBusy(scopeDigest)) return skip("session_active");
 
     const decision = await db.transaction(async (tx) => {
       const blocker = await sessionRetentionBlocker(tx, {
@@ -319,7 +321,7 @@ export function nativeHarnessBackupExpirationService(
     result.candidateBytes += bytes;
     if (options.dryRun) return;
     result.clearedTaskSessions += decision.cleared;
-    if (options.isSessionBusy(scopeDigest)) return skip("session_active");
+    if (isSessionBusy(scopeDigest)) return skip("session_active");
     const id = randomUUID();
     const retiring = path.join(backupRoot, `${RETIRING_PREFIX}${id}`);
     const trash = path.join(backupRoot, `${EXPIRED_PREFIX}${id}`);
@@ -374,7 +376,8 @@ export function nativeHarnessBackupExpirationService(
       context.dueAt(createdAt + context.retentionMs);
       return skip("recent_evidence");
     }
-    if (context.isSessionBusy(scopeDigest)) {
+    const isSessionBusy = context.isSessionBusy ?? (await import("./native-session-executor.js")).nativeSessionScopeDigestIsBusy;
+    if (isSessionBusy(scopeDigest)) {
       context.dueAt(context.now);
       return skip("session_active");
     }
@@ -382,7 +385,7 @@ export function nativeHarnessBackupExpirationService(
     result.evidenceCandidates++;
     result.evidenceCandidateBytes += bytes;
     if (context.dryRun) return;
-    if (context.isSessionBusy(scopeDigest)) {
+    if (isSessionBusy(scopeDigest)) {
       context.dueAt(context.now);
       return skip("session_active");
     }
@@ -487,7 +490,7 @@ export function nativeHarnessBackupExpirationService(
     const maxEntries = Math.max(1, options.maxEntries ?? defaults.maxEntries ?? 200);
     const maxRemovals = Math.max(1, options.maxRemovals ?? defaults.maxRemovals ?? 50);
     const shouldContinue = options.shouldContinue ?? defaults.shouldContinue ?? (() => true);
-    const isSessionBusy = options.isSessionBusy ?? defaults.isSessionBusy ?? nativeSessionScopeDigestIsBusy;
+    const isSessionBusy = options.isSessionBusy ?? defaults.isSessionBusy ?? null;
     const base = path.resolve(options.stateBase ?? defaults.stateBase ?? nativeHarnessStateBase());
     const now = (options.now ?? defaults.now ?? new Date()).getTime();
     const closedBefore = new Date(now - closedForDays * DAY_MS);

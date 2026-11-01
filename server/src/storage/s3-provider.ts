@@ -1,10 +1,4 @@
-import {
-  S3Client,
-  DeleteObjectCommand,
-  GetObjectCommand,
-  HeadObjectCommand,
-  PutObjectCommand,
-} from "@aws-sdk/client-s3";
+import { getS3Sdk } from "../lib/aws-s3-runtime.js";
 import { putS3Multipart } from "./s3-multipart.js";
 import { withS3FailureDiagnostics } from "./s3-failure.js";
 import { addAbortSignal, Readable } from "node:stream";
@@ -72,6 +66,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
   if (!region) throw unprocessable("S3 storage region is required");
 
   const prefix = normalizePrefix(config.prefix);
+  const { S3Client, DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand } = getS3Sdk();
   const client = new S3Client({
     region,
     endpoint: config.endpoint,

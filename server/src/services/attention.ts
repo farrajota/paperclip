@@ -1105,10 +1105,23 @@ const FAILED_RUN_PROBE_BATCH_SIZE = 1000;
 
 async function listFailedRunsWithNewerRun(db: Db, companyId: string, failedRuns: FailedRunProbe[]) {
   const withNewerRun = new Set<string>();
-  const keyed = failedRuns.filter(run => run.issueId !== null);
-  for (let start = 0; start < keyed.length; start += FAILED_RUN_PROBE_BATCH_SIZE) {
-    const batch = keyed.slice(start, start + FAILED_RUN_PROBE_BATCH_SIZE);
-    for (const id of await listFailedRunBatchWithNewerRun(db, companyId, batch)) withNewerRun.add(id);
+  const keyedGroups = new Map<string, FailedRunProbe[]>();
+  for (const run of failedRuns) {
+    if (run.issueId === null) continue;
+    const key = JSON.stringify([run.agentId, run.issueId, run.createdAt.getTime()]);
+    const group = keyedGroups.get(key);
+    if (group) group.push(run);
+    else keyedGroups.set(key, [run]);
+  }
+  const keyedRepresentatives = [...keyedGroups.values()].map((group) => group[0]!);
+  const runsByRepresentativeId = new Map(
+    [...keyedGroups.values()].map((group) => [group[0]!.id, group] as const),
+  );
+  for (let start = 0; start < keyedRepresentatives.length; start += FAILED_RUN_PROBE_BATCH_SIZE) {
+    const batch = keyedRepresentatives.slice(start, start + FAILED_RUN_PROBE_BATCH_SIZE);
+    for (const id of await listFailedRunBatchWithNewerRun(db, companyId, batch)) {
+      for (const run of runsByRepresentativeId.get(id) ?? []) withNewerRun.add(run.id);
+    }
   }
   const unkeyed = failedRuns.filter(run => run.issueId === null);
   if (unkeyed.length === 0) return withNewerRun;

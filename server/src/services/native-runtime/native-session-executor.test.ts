@@ -344,10 +344,6 @@ import {
   createRunnerdBackend,
   executePaperclipNativeSession,
   detachNativeSessionsForRestart,
-  NativeControllerDetachedForRestartError,
-  NativeCancellationPendingRecoveryError,
-  getNativeSessionSteeringState,
-  NativeSessionSteeringError,
   assertRemoteRunnerBuildMetadata,
   nativeSessionFailureDisposition,
   nativeFailedRunRetryStateIsSafe,
@@ -389,11 +385,13 @@ import {
   semanticProviderPlanMarkdown,
   sha256DirectoryTree,
   stageRemoteRunnerDirectory,
+  getNativeSessionSteeringState,
   steerNativeSession,
   syncRemoteRunnerDirectoryOut,
   verifyNativeHarnessBackup,
   shouldRestoreNativeHarnessBackupIntoSandbox,
 } from "./native-session-executor.js";
+import { NativeCancellationPendingRecoveryError, NativeControllerDetachedForRestartError, NativeSessionSteeringError } from "./native-session-errors.js";
 import { onNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 
 beforeEach(() => {
