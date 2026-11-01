@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   constants as fsConstants,
   createReadStream,
+  lstat as lstatCallback,
   promises as fs,
   type Stats,
 } from "node:fs";
@@ -984,6 +985,48 @@ async function captureWorkspaceSourceRoot(localDir: string): Promise<WorkspaceSo
   return { sourceDir, dev: stats.dev, ino: stats.ino };
 }
 
+function assertWorkspaceOverlayParentDirectory(input: {
+  relative: string;
+  sourceDir: string;
+  segments: readonly string[];
+  ancestorPaths: readonly string[];
+}): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let index = 0;
+    let parentPath = input.sourceDir;
+    const inspectNext = () => {
+      if (index === input.segments.length) {
+        resolve();
+        return;
+      }
+      const segment = input.segments[index]!;
+      if (segment === "..") {
+        reject(new Error(`Workspace overlay directory escapes its root: ${input.relative}`));
+        return;
+      }
+      parentPath = input.ancestorPaths[index] ?? path.join(parentPath, segment);
+      try {
+        lstatCallback(parentPath, (error, stats) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          if (!stats.isDirectory()) {
+            reject(new Error(`Workspace overlay ancestor is not a directory: ${input.relative}`));
+            return;
+          }
+          index++;
+          if (index === input.segments.length) resolve();
+          else queueMicrotask(inspectNext);
+        });
+      } catch (error) {
+        reject(error);
+      }
+    };
+    inspectNext();
+  });
+}
+
 async function copySelectedWorkspaceEntries(input: {
   sourceRoot: WorkspaceSourceRoot;
   targetDir: string;
@@ -1092,21 +1135,13 @@ async function copySelectedWorkspaceEntries(input: {
     // Capture immutable references before another in-flight copy changes the cache.
     const parentSegments = parent.segments;
     const ancestorPaths = parent.ancestors;
-    const assertParentDirectory = async () => {
-      // Git selected this path before staging. A replaced ancestor must not
-      // redirect the copy through a symlink, even to another workspace folder.
-      // Inspect types instead of comparing realpath spelling: case-insensitive
-      // filesystems can resolve Git's indexed casing to a renamed directory.
-      let parentPath = sourceDir;
-      for (let index = 0; index < parentSegments.length; index++) {
-        const segment = parentSegments[index]!;
-        if (segment === "..") throw new Error(`Workspace overlay directory escapes its root: ${relative}`);
-        parentPath = ancestorPaths[index] ?? path.join(parentPath, segment);
-        if (!(await fs.lstat(parentPath)).isDirectory()) {
-          throw new Error(`Workspace overlay ancestor is not a directory: ${relative}`);
-        }
-      }
-    };
+    // Git-selected ancestry must be freshly inspected for each entry and pass.
+    const assertParentDirectory = () => assertWorkspaceOverlayParentDirectory({
+      relative,
+      sourceDir,
+      segments: parentSegments,
+      ancestorPaths,
+    });
     let sourceStats: Stats;
     try {
       await assertParentDirectory();
@@ -1422,10 +1457,6 @@ export async function prepareSandboxManagedRuntime(input: {
         }),
       )))
     : null;
-
-  // Every inbound staging step delegates to the provider through `client.syncIn`:
-  // the orchestrator no longer inlines `writeFile`+`run` or chooses a transport,
-  // and there is no `usesCustomProvision` native-diversion gate. `syncIn` is
   // ALWAYS present in production — the command-managed client exposes a native
   // transport (Daytona/Kubernetes `uploadFiles` + provider-executed post-upload
   // commands) or a byte-identical base64-tar fallback that reproduces the prior

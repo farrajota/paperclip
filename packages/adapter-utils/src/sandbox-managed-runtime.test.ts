@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { promises as fsPromises } from "node:fs";
+import { lstat as lstatCallback, promises as fsPromises } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -178,6 +178,7 @@ vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
+    lstat: vi.fn(actual.lstat),
     promises: {
       ...actual.promises,
       chmod: vi.fn(actual.promises.chmod),
@@ -1360,7 +1361,7 @@ describe("sandbox managed runtime", () => {
     }
   });
 
-  it.each(["symlink", "root_symlink", "root_alias", "root_alias_retarget", "case_alias", "EACCES", "EIO", "ENOENT"])("handles an overlay source changed after the snapshot: %s", async (change) => {
+  it.each(["symlink", "root_symlink", "root_alias", "root_alias_retarget", "case_alias", "EACCES", "EIO", "ancestor_callback_error", "ENOENT"])("handles an overlay source changed after the snapshot: %s", async (change) => {
     // The runtime pins a realpath root before staging. Match that spelling so
     // injected I/O errors also reach the selected file on macOS's /var alias.
     const rootDir = await fsPromises.realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-overlay-source-")));
@@ -1368,8 +1369,10 @@ describe("sandbox managed runtime", () => {
     const workspaceLocalDir = path.join(rootDir, "workspace");
     await initGitRepo(workspaceLocalDir);
     const draftsDir = path.join(workspaceLocalDir, "drafts");
-    const selectedPath = path.join(change === "root_symlink" ? workspaceLocalDir : draftsDir, "report.md");
+    const selectedPath = path.join(change === "root_symlink" ? workspaceLocalDir : draftsDir,
+      ...(change === "ancestor_callback_error" ? ["nested", "report.md"] : ["report.md"]));
     await mkdir(draftsDir);
+    if (change === "ancestor_callback_error") await mkdir(path.join(draftsDir, "nested"));
     await writeFile(selectedPath, "selected work\n");
     const siblings = ["a-sibling.txt", "b-sibling.txt", "c-sibling.txt"];
     for (const name of siblings) await writeFile(path.join(workspaceLocalDir, name), `allowed ${name}\n`);
@@ -1410,7 +1413,9 @@ describe("sandbox managed runtime", () => {
     };
     const realLstat = fsPromises.lstat.bind(fsPromises);
     const realRealpath = fsPromises.realpath.bind(fsPromises);
-    const failure = Object.assign(new Error(`Cannot inspect overlay: ${change}`), { code: change });
+    const failure = Object.assign(new Error(`Cannot inspect overlay: ${change}`), {
+      code: change === "ancestor_callback_error" ? "EACCES" : change,
+    });
     let statSpy: ReturnType<typeof vi.spyOn> | undefined;
     let realpathSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
@@ -1450,6 +1455,18 @@ describe("sandbox managed runtime", () => {
             // The root was captured with the snapshot, before config_sync.
             await fsPromises.rename(workspaceLocalDir, path.join(rootDir, "original-workspace"));
             await symlink(outsideDir, workspaceLocalDir);
+          } else if (change === "ancestor_callback_error") {
+            vi.mocked(lstatCallback).mockClear();
+            vi.mocked(lstatCallback).mockImplementationOnce((...args) => {
+              expect(args[0]).toBe(draftsDir);
+              const callback = args.find((argument) => typeof argument === "function");
+              if (typeof callback !== "function") {
+                throw new Error("Expected an lstat callback");
+              }
+              // Node supplies no stats on error, despite the callback's declared stats type.
+              callback(failure, undefined as unknown as Parameters<typeof callback>[1]);
+            });
+            statSpy = vi.spyOn(fsPromises, "lstat");
           } else {
             statSpy = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof fsPromises.lstat>) => {
               if (args[0] === selectedPath) throw failure;
@@ -1463,7 +1480,13 @@ describe("sandbox managed runtime", () => {
         expect(syncIn).toHaveBeenCalledOnce();
       } else {
         await expect(preparing).rejects.toThrow(change.endsWith("symlink") ? /overlay.*directory/i : failure.message);
-        if (statSpy) expect(statSpy).toHaveBeenCalledWith(selectedPath);
+        if (change === "ancestor_callback_error") {
+          await expect(preparing).rejects.toBe(failure);
+          expect(lstatCallback).toHaveBeenCalledTimes(1);
+          expect(lstatCallback).toHaveBeenCalledWith(draftsDir, expect.any(Function));
+          expect(statSpy).not.toHaveBeenCalledWith(selectedPath);
+        }
+        if (statSpy && change !== "ancestor_callback_error") expect(statSpy).toHaveBeenCalledWith(selectedPath);
         expect(syncIn).not.toHaveBeenCalled();
       }
     } finally {
