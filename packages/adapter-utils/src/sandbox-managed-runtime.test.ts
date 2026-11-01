@@ -1297,6 +1297,20 @@ describe("sandbox managed runtime", () => {
       expect(ancestorCalls.filter((call) => call[1] === args[1]).map((call) => call[0]))
         .toEqual(expectedAncestors);
     }
+    // Different in-flight entries must retain their captured parent arguments.
+    const siblingAncestors = [
+      path.join(sourceRoot, "packages"),
+      path.join(sourceRoot, "packages", "ui"),
+      path.join(sourceRoot, "packages", "ui", "literal1"),
+    ];
+    const siblingCalls = ancestorCalls.filter((args) => args[0] === siblingAncestors[2]);
+    expect(siblingCalls).toHaveLength(2);
+    expect(siblingCalls[0]![1]).not.toBe(siblingCalls[1]![1]);
+    for (const args of siblingCalls) {
+      expect(deepestCalls.every((call) => call[1] !== args[1])).toBe(true);
+      expect(ancestorCalls.filter((call) => call[1] === args[1]).map((call) => call[0]))
+        .toEqual(siblingAncestors);
+    }
 
     const workspaceUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
     expect(workspaceUpload).toBeDefined();

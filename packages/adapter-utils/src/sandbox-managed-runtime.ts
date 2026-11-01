@@ -985,26 +985,26 @@ async function captureWorkspaceSourceRoot(localDir: string): Promise<WorkspaceSo
   return { sourceDir, dev: stats.dev, ino: stats.ino };
 }
 
-function assertWorkspaceOverlayParentDirectory(input: {
-  relative: string;
-  sourceDir: string;
-  segments: readonly string[];
-  ancestorPaths: readonly string[];
-}): Promise<void> {
+function assertWorkspaceOverlayParentDirectory(
+  relative: string,
+  sourceDir: string,
+  segments: readonly string[],
+  ancestorPaths: readonly string[],
+): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    if (input.segments.length === 0) {
+    if (segments.length === 0) {
       resolve();
       return;
     }
     let index = 0;
-    let parentPath = input.sourceDir;
+    let parentPath = sourceDir;
     const inspectNext = () => {
-      const segment = input.segments[index]!;
+      const segment = segments[index]!;
       if (segment === "..") {
-        reject(new Error(`Workspace overlay directory escapes its root: ${input.relative}`));
+        reject(new Error(`Workspace overlay directory escapes its root: ${relative}`));
         return;
       }
-      parentPath = input.ancestorPaths[index] ?? path.join(parentPath, segment);
+      parentPath = ancestorPaths[index] ?? path.join(parentPath, segment);
       try {
         lstatCallback(parentPath, inspectParent);
       } catch (error) {
@@ -1018,11 +1018,11 @@ function assertWorkspaceOverlayParentDirectory(input: {
         return;
       }
       if (!stats.isDirectory()) {
-        reject(new Error(`Workspace overlay ancestor is not a directory: ${input.relative}`));
+        reject(new Error(`Workspace overlay ancestor is not a directory: ${relative}`));
         return;
       }
       index++;
-      if (index === input.segments.length) resolve();
+      if (index === segments.length) resolve();
       else queueMicrotask(inspectNext);
     };
     inspectNext();
@@ -1137,16 +1137,10 @@ async function copySelectedWorkspaceEntries(input: {
     // Capture immutable references before another in-flight copy changes the cache.
     const parentSegments = parent.segments;
     const ancestorPaths = parent.ancestors;
-    // Git-selected ancestry must be freshly inspected for each entry and pass.
-    const assertParentDirectory = () => assertWorkspaceOverlayParentDirectory({
-      relative,
-      sourceDir,
-      segments: parentSegments,
-      ancestorPaths,
-    });
     let sourceStats: Stats;
     try {
-      await assertParentDirectory();
+      // Git-selected ancestry must be freshly inspected for each entry and pass.
+      await assertWorkspaceOverlayParentDirectory(relative, sourceDir, parentSegments, ancestorPaths);
       sourceStats = await fs.lstat(sourcePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
@@ -1157,7 +1151,7 @@ async function copySelectedWorkspaceEntries(input: {
 
     // Do not upload the staged tree if an ancestor changed during the copy.
     await assertSourceRoot();
-    await assertParentDirectory();
+    await assertWorkspaceOverlayParentDirectory(relative, sourceDir, parentSegments, ancestorPaths);
   };
   const batch: string[] = [];
   const copyBatch = async (): Promise<void> => {
