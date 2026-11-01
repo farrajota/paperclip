@@ -1264,6 +1264,8 @@ describe("sandbox managed runtime", () => {
     attachFallbackSyncIn(client);
     const workspaceGitSnapshot = await gitSync.readGitWorkspaceSnapshot(localWorkspaceDir);
     if (!workspaceGitSnapshot) throw new Error("Expected a Git-backed workspace snapshot");
+    const sourceRoot = await fsPromises.realpath(localWorkspaceDir);
+    const ancestorCallsStart = vi.mocked(lstatCallback).mock.calls.length;
     const prepared = await prepareSandboxManagedRuntime({
       spec: {
         transport: "sandbox",
@@ -1279,6 +1281,22 @@ describe("sandbox managed runtime", () => {
       workspaceGitSnapshot,
       workspaceExclude: ["*/literal[1]", "literal[1]", "literal[1]/*", "*/multi/path", "packages/ui/fallback.txt"],
     });
+
+    // Each real pre/post guard traverses the full chain with its own callback.
+    const ancestorCalls = vi.mocked(lstatCallback).mock.calls.slice(ancestorCallsStart);
+    const expectedAncestors = [
+      path.join(sourceRoot, "packages"),
+      path.join(sourceRoot, "packages", "ui"),
+      path.join(sourceRoot, "packages", "ui", "multi"),
+      path.join(sourceRoot, "packages", "ui", "multi", "path-sibling"),
+    ];
+    const deepestCalls = ancestorCalls.filter((args) => args[0] === expectedAncestors[3]);
+    expect(deepestCalls).toHaveLength(2);
+    expect(deepestCalls[0]![1]).not.toBe(deepestCalls[1]![1]);
+    for (const args of deepestCalls) {
+      expect(ancestorCalls.filter((call) => call[1] === args[1]).map((call) => call[0]))
+        .toEqual(expectedAncestors);
+    }
 
     const workspaceUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
     expect(workspaceUpload).toBeDefined();

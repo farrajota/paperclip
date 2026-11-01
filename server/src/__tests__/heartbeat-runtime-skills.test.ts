@@ -65,6 +65,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     serializedRuntimeInput: string;
   }> = [];
   const cleanupDirs = new Set<string>();
+  const drainHeartbeatExecutions: Array<() => Promise<void>> = [];
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-runtime-skills-");
@@ -110,9 +111,10 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await Promise.all(drainHeartbeatExecutions.map((drain) => drain()));
+    drainHeartbeatExecutions.length = 0;
     capturedRuns.length = 0;
     await instanceSettingsService(db).updateExperimental({ enableBetaSkills: false });
-    await new Promise((resolve) => setTimeout(resolve, 100));
     await db.execute(sql.raw(`
       TRUNCATE TABLE
         "activity_log",
@@ -234,6 +236,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     await settings.updateExperimental({ enableBetaSkills: true });
 
     const heartbeat = heartbeatService(db);
+    drainHeartbeatExecutions.push(() => heartbeat.drainActiveRunExecutions());
     const firstRun = await heartbeat.invoke(firstAgentId, "on_demand", {}, "manual");
     expect(firstRun).not.toBeNull();
     expect((await waitForRunToFinish(heartbeat, firstRun!.id))?.status).toBe("succeeded");
@@ -404,6 +407,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     });
 
     const heartbeat = heartbeatService(db);
+    drainHeartbeatExecutions.push(() => heartbeat.drainActiveRunExecutions());
     const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(run).not.toBeNull();
     expect((await waitForRunToFinish(heartbeat, run!.id))?.status).toBe("succeeded");

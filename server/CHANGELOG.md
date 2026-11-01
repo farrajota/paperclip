@@ -10,6 +10,7 @@
 - Add bounded test-only timings for the existing baseline snapshot, nested pack, and workspace staging spans in the full streaming fixture, labeled for initial and deletion stages. Diagnostics retain the original phase records and do not claim isolated span cost, cause, performance improvement, or CI qualification.
 - Reuse each selected workspace overlay entry's checked `lstat` result for its staging copy, removing a duplicate source metadata lookup without changing path checks or copy semantics; no benchmark result is claimed.
 - Run workspace overlay ancestor guards through one ordered callback-`lstat` promise per pass, retaining every fresh check and a microtask boundary between ancestor submissions; no performance improvement or CI qualification is claimed.
+- Reuse one pass-local callback across workspace overlay ancestor submissions instead of allocating a callback for each ancestor, retaining serial fresh checks, per-pass state, error propagation, and microtask boundaries; no speedup, timeout cause, or CI qualification is claimed.
 - Skip the final removal request for a staged workspace file after its awaited rename succeeds; initial and failure cleanup remain unchanged, and no speedup is claimed.
 - Detect whether each deleted-path ancestor has a slash with POSIX `case` matching instead of prefix-removal expansion and string comparison; ancestor checks and per-path deletion remain ordered, with no speedup or CI qualification claimed.
 - Group disk-manifest ignore membership into category-scoped queries over up to eight exact path prefixes, preserving literal matching across deeper ancestors; for an applicable 40,000-file pass where the leaf and four ancestors miss, this can avoid 40,000 JavaScript-to-SQLite query calls by fitting those candidates in one query instead of two. This is an inferred source-operation count, not a measured speedup or CI qualification.
@@ -25,6 +26,8 @@
 
 - Observe allocated-port listener presence before looking up its owner so a stale empty result cannot discard a newly bound child. Unattributed listeners still fail closed, and attributable owners retain the 250 ms process-group stability check. All 196 affected local cases pass, including the unchanged 20-second unknown-owner regression and a synchronized startup-race regression; exact Hetzner CI qualification remains pending.
 - Confirm an empty request listing with one fresh poll when stopping, so a stale empty snapshot from an in-flight poll cannot discard queued callback requests; the original drain deadline and missed-deadline 503 behavior remain unchanged. This describes source behavior and makes no CI-cause or qualification claim.
+
+- Drain each runtime-skills fixture heartbeat service's active wakeup and run executions before resetting experimental settings or truncating fixture tables, replacing the arbitrary 100 ms teardown delay with the existing execution owner barrier. This addresses the observed teardown deadlock at the source lifecycle boundary; no test rerun or CI qualification is claimed.
 
 ## 0.3.1
 

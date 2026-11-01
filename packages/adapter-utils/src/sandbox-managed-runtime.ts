@@ -992,13 +992,13 @@ function assertWorkspaceOverlayParentDirectory(input: {
   ancestorPaths: readonly string[];
 }): Promise<void> {
   return new Promise<void>((resolve, reject) => {
+    if (input.segments.length === 0) {
+      resolve();
+      return;
+    }
     let index = 0;
     let parentPath = input.sourceDir;
     const inspectNext = () => {
-      if (index === input.segments.length) {
-        resolve();
-        return;
-      }
       const segment = input.segments[index]!;
       if (segment === "..") {
         reject(new Error(`Workspace overlay directory escapes its root: ${input.relative}`));
@@ -1006,22 +1006,24 @@ function assertWorkspaceOverlayParentDirectory(input: {
       }
       parentPath = input.ancestorPaths[index] ?? path.join(parentPath, segment);
       try {
-        lstatCallback(parentPath, (error, stats) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-          if (!stats.isDirectory()) {
-            reject(new Error(`Workspace overlay ancestor is not a directory: ${input.relative}`));
-            return;
-          }
-          index++;
-          if (index === input.segments.length) resolve();
-          else queueMicrotask(inspectNext);
-        });
+        lstatCallback(parentPath, inspectParent);
       } catch (error) {
         reject(error);
       }
+    };
+    // Only one native request is outstanding, so its callback is pass-local.
+    const inspectParent = (error: NodeJS.ErrnoException | null, stats: Stats) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (!stats.isDirectory()) {
+        reject(new Error(`Workspace overlay ancestor is not a directory: ${input.relative}`));
+        return;
+      }
+      index++;
+      if (index === input.segments.length) resolve();
+      else queueMicrotask(inspectNext);
     };
     inspectNext();
   });
