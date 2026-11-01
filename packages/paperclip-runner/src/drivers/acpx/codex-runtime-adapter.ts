@@ -1,16 +1,12 @@
 import type { ChildProcess } from "node:child_process";
 
-import {
-  createAcpRuntime,
-  createAgentRegistry,
-  createRuntimeStore,
-  encodeAcpxRuntimeHandleState,
-  type AcpAgentRegistry,
-  type AcpRuntime,
-  type AcpRuntimeHandle,
-  type AcpRuntimeOptions,
-  type AcpSessionRecord,
-  type AcpSessionStore,
+import type {
+  AcpAgentRegistry,
+  AcpRuntime,
+  AcpRuntimeHandle,
+  AcpRuntimeOptions,
+  AcpSessionRecord,
+  AcpSessionStore,
 } from "acpx/runtime";
 
 import type {
@@ -183,9 +179,32 @@ export async function openQualifiedAcpxRuntime(
     );
   }
 
-  const createRegistry = dependencies.createRegistry ?? createAgentRegistry;
-  const createStore = dependencies.createStore ?? createRuntimeStore;
-  const createRuntime = dependencies.createRuntime ?? createAcpRuntime;
+  const namespaceImport = import("acpx/runtime");
+  let acpxRuntime: Awaited<typeof namespaceImport>;
+  const signal = options.signal;
+  let onAbort: (() => void) | undefined;
+  try {
+    // Promise.race keeps the exact import rejection observed after abort wins.
+    if (signal) {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      });
+      acpxRuntime = await Promise.race([namespaceImport, aborted]);
+    } else {
+      acpxRuntime = await namespaceImport;
+    }
+    signal?.throwIfAborted();
+  } catch (error) {
+    options.retainFailedAdmissionCleanup(Promise.resolve());
+    throw signal?.aborted ? signal.reason : error;
+  } finally {
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+  const createRegistry = dependencies.createRegistry ?? acpxRuntime.createAgentRegistry;
+  const createStore = dependencies.createStore ?? acpxRuntime.createRuntimeStore;
+  const createRuntime = dependencies.createRuntime ?? acpxRuntime.createAcpRuntime;
   const runtimeCloseTimeoutMs =
     dependencies.runtimeCloseTimeoutMs ?? DEFAULT_RUNTIME_CLOSE_TIMEOUT_MS;
   const retainedCleanupOwners = new WeakSet<Promise<void>>();
@@ -218,7 +237,7 @@ export async function openQualifiedAcpxRuntime(
     const rememberedHandle: AcpRuntimeHandle = {
       sessionKey: options.providerSessionKey,
       backend: "acpx",
-      runtimeSessionName: encodeAcpxRuntimeHandleState({
+      runtimeSessionName: acpxRuntime.encodeAcpxRuntimeHandleState({
         name: runtimeSessionName,
         agent: options.profile.agent,
         cwd: record.cwd,

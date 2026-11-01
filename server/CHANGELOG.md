@@ -28,6 +28,7 @@
 - Confirm an empty request listing with one fresh poll when stopping, so a stale empty snapshot from an in-flight poll cannot discard queued callback requests; the original drain deadline and missed-deadline 503 behavior remain unchanged. This describes source behavior and makes no CI-cause or qualification claim.
 
 - Drain each runtime-skills fixture heartbeat service's active wakeup and run executions before resetting experimental settings or truncating fixture tables, replacing the arbitrary 100 ms teardown delay with the existing execution owner barrier. This addresses the observed teardown deadlock at the source lifecycle boundary; no test rerun or CI qualification is claimed.
+- Defer canonical ACPX runtime namespace and SDK initialization until validated native runtime admission, before adapter factories or resources are constructed. Import failure and cancellation now reject admission with their original reason and an already-complete no-resource cleanup proof; cancellation does not wait for a pending import to settle. Cold admission now bears this initialization work, with no measured saving, exclusive-cause or sufficient-remedy claim, or CI qualification.
 
 ## 0.3.1
 

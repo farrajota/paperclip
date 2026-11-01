@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 
@@ -9,7 +11,7 @@ import type {
   AcpSessionStore,
 } from "acpx/runtime";
 import { decodeAcpxRuntimeHandleState } from "acpx/runtime";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { VerifiedAcpxCommandLease } from "./installation-integrity.js";
 import { openCodexAcpxRuntime } from "./codex-runtime-adapter.js";
@@ -28,6 +30,10 @@ const HANDLE: AcpRuntimeHandle = {
 };
 
 describe("Codex ACPX runtime adapter", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("rejects forged permission session identifiers before delegating or applying full-auto policy", async () => {
     const pending = pendingExtensionTurn("turn-1");
     const runtime = fakeRuntime(); vi.mocked(runtime.startTurn).mockReturnValue(pending.turn);
@@ -235,6 +241,201 @@ describe("Codex ACPX runtime adapter", () => {
     expect(createRuntime).not.toHaveBeenCalled();
     expect(command.spawn).not.toHaveBeenCalled();
   });
+
+  it("publishes no-resource cleanup while preserving the canonical namespace acquisition rejection", async () => {
+    const importFailure = new Error("canonical ACPX namespace unavailable");
+    const { promise: factoryEntered, resolve: enterFactory } = Promise.withResolvers<void>();
+    vi.doMock("acpx/runtime", () => {
+      enterFactory();
+      // Vitest inspects then outside its factory-error wrapper. This is the
+      // actual rejection object delivered at the import boundary, not a cause
+      // reconstructed from Vitest's wrapped factory failure.
+      return Object.defineProperty({}, "then", { get: () => { throw importFailure; } });
+    });
+    const createRegistry = vi.fn();
+    const createStore = vi.fn();
+    const createRuntime = vi.fn();
+    const acquisitionEvents: string[] = [];
+    const cleanupProofs: Promise<void>[] = [];
+    const options = {
+      ...openOptions(fakeCommand()),
+      retainFailedAdmissionCleanup: vi.fn((cleanup: Promise<void>) => {
+        acquisitionEvents.push("cleanup");
+        cleanupProofs.push(cleanup);
+      }),
+    };
+
+    try {
+      const admissionRejection = openCodexAcpxRuntime(
+        options,
+        { createRegistry, createStore, createRuntime },
+      ).then(
+        () => {
+          throw new Error("namespace acquisition unexpectedly resolved");
+        },
+        (error: unknown) => {
+          acquisitionEvents.push("rejection");
+          return error;
+        },
+      );
+      await factoryEntered;
+      expect(await admissionRejection).toBe(importFailure);
+      expect(acquisitionEvents).toEqual(["cleanup", "rejection"]);
+      expect(options.retainFailedAdmissionCleanup).toHaveBeenCalledOnce();
+      expect(cleanupProofs).toHaveLength(1);
+      await expect(cleanupProofs[0]).resolves.toBeUndefined();
+      expect(createRegistry).not.toHaveBeenCalled();
+      expect(createStore).not.toHaveBeenCalled();
+      expect(createRuntime).not.toHaveBeenCalled();
+      expect(options.command.spawn).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock("acpx/runtime");
+    }
+  });
+
+  it("cancels pending namespace acquisition promptly, observes late rejection, and removes its listener", async () => {
+    const importFailure = new Error("late canonical ACPX import failure");
+    const { promise: factoryEntered, resolve: enterFactory } = Promise.withResolvers<void>();
+    const { promise: pendingImport, reject: rejectImport } = Promise.withResolvers<never>();
+    vi.doMock("acpx/runtime", () => {
+      enterFactory();
+      return pendingImport;
+    });
+    const cancellation = new Error("runtime admission cancelled during import");
+    const controller = new AbortController();
+    const addListener = vi.spyOn(controller.signal, "addEventListener");
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    const createRegistry = vi.fn();
+    const createStore = vi.fn();
+    const createRuntime = vi.fn();
+    const acquisitionEvents: string[] = [];
+    const cleanupProofs: Promise<void>[] = [];
+    const options = {
+      ...openOptions(fakeCommand()),
+      signal: controller.signal,
+      retainFailedAdmissionCleanup: vi.fn((cleanup: Promise<void>) => {
+        acquisitionEvents.push("cleanup");
+        cleanupProofs.push(cleanup);
+      }),
+    };
+
+    try {
+      const admissionRejection = openCodexAcpxRuntime(
+        options,
+        { createRegistry, createStore, createRuntime },
+      ).then(
+        () => {
+          throw new Error("aborted namespace acquisition unexpectedly resolved");
+        },
+        (error: unknown) => {
+          acquisitionEvents.push("rejection");
+          return error;
+        },
+      );
+      await factoryEntered;
+      const lateImportSettlement = pendingImport.then(
+        () => undefined,
+        () => undefined,
+      );
+      controller.abort(cancellation);
+      expect(await admissionRejection).toBe(cancellation);
+      expect(acquisitionEvents).toEqual(["cleanup", "rejection"]);
+      expect(options.retainFailedAdmissionCleanup).toHaveBeenCalledOnce();
+      expect(cleanupProofs).toHaveLength(1);
+      await expect(cleanupProofs[0]).resolves.toBeUndefined();
+      expect(createRegistry).not.toHaveBeenCalled();
+      expect(createStore).not.toHaveBeenCalled();
+      expect(createRuntime).not.toHaveBeenCalled();
+      expect(options.command.spawn).not.toHaveBeenCalled();
+      expect(addListener).toHaveBeenCalledWith(
+        "abort",
+        expect.any(Function),
+        expect.objectContaining({ once: true }),
+      );
+      expect(removeListener).toHaveBeenCalledOnce();
+      expect(removeListener).toHaveBeenCalledWith("abort", addListener.mock.calls[0]?.[1]);
+
+      rejectImport(importFailure);
+      await lateImportSettlement;
+    } finally {
+      vi.doUnmock("acpx/runtime");
+    }
+  });
+
+  it("does not construct resources when namespace settlement and abort occur in the same turn", async () => {
+    const { promise: factoryEntered, resolve: enterFactory } = Promise.withResolvers<void>();
+    const { promise: pendingImport, resolve: resolveImport } = Promise.withResolvers<unknown>();
+    vi.doMock("acpx/runtime", () => {
+      enterFactory();
+      return pendingImport;
+    });
+    const cancellation = new Error("same-turn runtime admission cancellation");
+    const controller = new AbortController();
+    const createRegistry = vi.fn();
+    const createStore = vi.fn();
+    const createRuntime = vi.fn();
+    const acquisitionEvents: string[] = [];
+    const cleanupProofs: Promise<void>[] = [];
+    const options = {
+      ...openOptions(fakeCommand()),
+      signal: controller.signal,
+      retainFailedAdmissionCleanup: vi.fn((cleanup: Promise<void>) => {
+        acquisitionEvents.push("cleanup");
+        cleanupProofs.push(cleanup);
+      }),
+    };
+
+    try {
+      const admissionRejection = openCodexAcpxRuntime(
+        options,
+        { createRegistry, createStore, createRuntime },
+      ).then(
+        () => {
+          throw new Error("same-turn aborted namespace acquisition unexpectedly resolved");
+        },
+        (error: unknown) => {
+          acquisitionEvents.push("rejection");
+          return error;
+        },
+      );
+      await factoryEntered;
+      const importSettlement = pendingImport.then(() => undefined);
+      resolveImport({});
+      controller.abort(cancellation);
+      expect(await admissionRejection).toBe(cancellation);
+      expect(acquisitionEvents).toEqual(["cleanup", "rejection"]);
+      expect(options.retainFailedAdmissionCleanup).toHaveBeenCalledOnce();
+      expect(cleanupProofs).toHaveLength(1);
+      await expect(cleanupProofs[0]).resolves.toBeUndefined();
+      expect(createRegistry).not.toHaveBeenCalled();
+      expect(createStore).not.toHaveBeenCalled();
+      expect(createRuntime).not.toHaveBeenCalled();
+      expect(options.command.spawn).not.toHaveBeenCalled();
+      await importSettlement;
+    } finally {
+      vi.doUnmock("acpx/runtime");
+    }
+  });
+
+  it("admits and recovers a persisted identity through the cold default ACPX runtime in fresh processes", () => {
+    const fixture = fileURLToPath(new URL("../../../test/fixtures/fake-cold-acpx-runtime.mjs", import.meta.url));
+    const result = spawnSync(process.execPath, [fixture], { encoding: "utf8" });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const outcome = JSON.parse(result.stdout) as {
+      first: { identity: AcpRuntimeHandle };
+      reopened: { identity: AcpRuntimeHandle };
+      recoveredByLoad: boolean;
+      fixtureBoundary: string;
+    };
+    expect(outcome.first.identity).toEqual(outcome.reopened.identity);
+    expect(outcome.first.identity.acpxRecordId).toBeTruthy();
+    expect(outcome.first.identity.backendSessionId).toBe("cold-fixture-session");
+    expect(outcome.recoveredByLoad).toBe(true);
+    expect(outcome.fixtureBoundary).toBe("fixture-only command lease/process boundary; not executable or guardian qualification");
+  });
+
 
   it("opens a persistent Codex session without persisting launch secrets", async () => {
     const runtime = fakeRuntime();
@@ -1849,9 +2050,11 @@ describe("Codex ACPX runtime adapter", () => {
         backendSessionId: undefined,
         agentSessionId: undefined,
       });
-      vi.mocked(runtime.close).mockImplementation(
-        () => new Promise<void>(() => undefined),
-      );
+      const { promise: cleanupEntered, resolve: enterCleanup } = Promise.withResolvers<void>();
+      vi.mocked(runtime.close).mockImplementation(() => {
+        enterCleanup();
+        return new Promise<void>(() => undefined);
+      });
       const child = fakeChild();
       const command = fakeCommand();
       vi.mocked(command.spawn).mockReturnValue(child);
@@ -1879,6 +2082,7 @@ describe("Codex ACPX runtime adapter", () => {
         "identity validation and cleanup failed",
       );
 
+      await cleanupEntered;
       await vi.advanceTimersByTimeAsync(2_000);
       await rejected;
       expect(child.kill).toHaveBeenCalledWith("SIGTERM");
