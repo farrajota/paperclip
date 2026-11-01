@@ -1,7 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import pc from "picocolors";
 import type { Agent, HeartbeatRun, HeartbeatRunEvent, HeartbeatRunStatus } from "@paperclipai/shared";
-import { getCLIAdapter } from "../adapters/index.js";
 import { resolveCommandContext } from "./client/common.js";
 
 const HEARTBEAT_SOURCES = ["timer", "assignment", "on_demand", "automation"] as const;
@@ -54,8 +53,9 @@ function asErrorText(value: unknown): string {
 }
 
 type AdapterType = string;
-
 export async function heartbeatRun(opts: HeartbeatRunOptions): Promise<void> {
+  // Keep the registry out of unrelated CLI startup; acquire it before this command can make API requests.
+  const { getCLIAdapter } = await import("../adapters/index.js");
   const debug = Boolean(opts.debug);
   const parsedTimeout = Number.parseInt(opts.timeoutMs, 10);
   const timeoutMs = Number.isFinite(parsedTimeout) ? parsedTimeout : 0;
