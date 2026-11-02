@@ -594,7 +594,33 @@ describe("sandbox managed runtime", () => {
     expect(chmodMock.mock.calls[0]?.[0]).toContain(".paperclip-copy.");
     expect(chmodMock.mock.calls[0]?.[0]).not.toBe(targetPath);
     expect(chmodMock.mock.invocationCallOrder[0]).toBeLessThan(renameMock.mock.invocationCallOrder[0]);
+    const nativePublicationCandidate = Reflect.get(sandboxParentGuard, "publishNativeWorkspaceOverlayEntry");
+    const nativePublication = typeof nativePublicationCandidate === "function"
+      ? nativePublicationCandidate as (stagedPath: string, destinationPath: string, mode: number) => Promise<boolean>
+      : undefined;
+    expect(nativePublication).toBeDefined();
+    const unsupportedStagedPath = path.join(path.dirname(targetPath), "unsupported\\stage");
+    const unsupportedTargetPath = path.join(path.dirname(targetPath), "unsupported-target");
+    await writeFile(unsupportedStagedPath, "unsupported bytes\n", { mode: 0o600 });
+    expect(await nativePublication!(unsupportedStagedPath, unsupportedTargetPath, 0o755)).toBe(false);
+    await expect(readFile(unsupportedStagedPath, "utf8")).resolves.toBe("unsupported bytes\n");
+    expect((await stat(unsupportedStagedPath)).mode & 0o777).toBe(0o600);
+    await expect(readFile(unsupportedTargetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+    const nativeMetadata = await sandboxParentGuard.inspectNativeWorkspaceOverlayEntry(
+      sourcePath, path.dirname(sourcePath), relativePath.split(path.sep).join("/"), 2,
+    );
+    if (nativeMetadata) {
+      const nativeStagedPath = `${targetPath}.native-publication-stage`;
+      await mkdir(path.dirname(nativeStagedPath), { recursive: true });
+      await fsPromises.copyFile(sourcePath, nativeStagedPath);
+      expect(await nativePublication!(nativeStagedPath, targetPath, nativeMetadata.mode)).toBe(true);
+      await expect(readFile(targetPath, "utf8")).resolves.toBe("#!/bin/sh\necho hello\n");
+      expect((await stat(targetPath)).mode & 0o777).toBe(nativeMetadata.mode & 0o777);
+      await expect(readFile(nativeStagedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
+
 
   it("cleans up a staged sibling when chmod fails before rename", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-copy-cleanup-"));
@@ -624,6 +650,42 @@ describe("sandbox managed runtime", () => {
     expect(stagedPath).toContain(".paperclip-copy.");
     await expect(readFile(stagedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(targetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    const nativePublicationCandidate = Reflect.get(sandboxParentGuard, "publishNativeWorkspaceOverlayEntry");
+    const nativePublication = typeof nativePublicationCandidate === "function"
+      ? nativePublicationCandidate as (stagedPath: string, destinationPath: string, mode: number) => Promise<boolean>
+      : undefined;
+    expect(nativePublication).toBeDefined();
+    const nativeMetadata = await sandboxParentGuard.inspectNativeWorkspaceOverlayEntry(
+      sourcePath, path.dirname(sourcePath), relativePath.split(path.sep).join("/"), 2,
+    );
+    if (nativeMetadata) {
+      const missingStagedPath = path.join(rootDir, "missing-native-stage.sh");
+      const chmodTargetPath = path.join(rootDir, "native-target.sh");
+      await expect(nativePublication!(missingStagedPath, chmodTargetPath, 0o755)).rejects.toMatchObject({
+        errno: -2,
+        code: "ENOENT",
+        syscall: "chmod",
+        path: missingStagedPath,
+        message: `ENOENT: no such file or directory, chmod '${missingStagedPath}'`,
+      });
+      await expect(readFile(missingStagedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(chmodTargetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+      const renameStagedPath = path.join(rootDir, "native-rename-staged.sh");
+      const renameTargetPath = path.join(rootDir, "missing-rename-parent", "native-target.sh");
+      await writeFile(renameStagedPath, "native rename failure\n", { mode: 0o600 });
+      await expect(nativePublication!(renameStagedPath, renameTargetPath, 0o755)).rejects.toMatchObject({
+        errno: -2,
+        code: "ENOENT",
+        syscall: "rename",
+        path: renameStagedPath,
+        dest: renameTargetPath,
+        message: `ENOENT: no such file or directory, rename '${renameStagedPath}' -> '${renameTargetPath}'`,
+      });
+      await expect(readFile(renameStagedPath, "utf8")).resolves.toBe("native rename failure\n");
+      expect((await stat(renameStagedPath)).mode & 0o777).toBe(0o755);
+      await expect(readFile(renameTargetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("syncs workspace and assets through a provider-neutral sandbox client", async () => {
@@ -1573,7 +1635,7 @@ describe("sandbox managed runtime", () => {
             selectedPath, path.join(draftsDir, "nested"), "drafts/nested/report.md", 2,
           );
           expect(statSpy).not.toHaveBeenCalledWith(selectedPath);
-          const boundaryResults = await Promise.allSettled(nativePreSpy!.mock.results.map((result) => result.value));
+          const boundaryResults = await Promise.allSettled(nativePreSpy!.mock.results.map((result: { value: unknown }) => result.value));
           if (boundaryResults[0]?.status === "rejected" && boundaryResults[0].reason !== null &&
               typeof boundaryResults[0].reason === "object" && "guardPhase" in boundaryResults[0].reason) {
             expect(boundaryResults[0].reason.guardPhase).toBe("ancestor");
@@ -1582,7 +1644,7 @@ describe("sandbox managed runtime", () => {
         if (change === "EACCES" || change === "EIO") {
           await expect(preparing).rejects.toBe(failure);
           expect(nativePreSpy).toHaveBeenCalledWith(selectedPath, draftsDir, "drafts/report.md", 1);
-          const boundaryResults = await Promise.allSettled(nativePreSpy!.mock.results.map((result) => result.value));
+          const boundaryResults = await Promise.allSettled(nativePreSpy!.mock.results.map((result: { value: unknown }) => result.value));
           if (boundaryResults[0]?.status === "fulfilled") expect(statSpy).toHaveBeenCalledWith(selectedPath);
         }
         if (change === "deep_fallback_callback_error") {

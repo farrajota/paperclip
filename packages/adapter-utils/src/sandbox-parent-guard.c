@@ -459,6 +459,232 @@ static napi_value guard_post_copy(napi_env env, napi_callback_info info) {
   return start_guard(env, info, GUARD_POST_COPY);
 }
 
+#define MAX_PUBLICATION_PATH_BYTES 12289
+
+typedef enum {
+  PUBLICATION_PHASE_SUCCESS,
+  PUBLICATION_PHASE_CHMOD,
+  PUBLICATION_PHASE_RENAME,
+  PUBLICATION_PHASE_COMPLETION,
+} publication_phase;
+
+typedef struct {
+  napi_async_work work;
+  napi_deferred deferred;
+  char *staged_path;
+  char *target_path;
+  publication_phase phase;
+  int status;
+  int mode;
+} publication_work;
+
+static int publication_path_is_canonical(const char *path, size_t length) {
+  if (length == 0 || path[0] != '/' || path[length - 1] == '/') return 0;
+  size_t component_start = 1;
+  for (size_t index = 1; index <= length; index++) {
+    if (path[index - 1] == '\\') return 0;
+    if (index != length && path[index] != '/') continue;
+    size_t component_length = index - component_start;
+    if (component_length == 0 ||
+        (component_length == 1 && path[component_start] == '.') ||
+        (component_length == 2 && path[component_start] == '.' && path[component_start + 1] == '.')) return 0;
+    component_start = index + 1;
+  }
+  return 1;
+}
+
+static int copy_publication_path(napi_env env, napi_value value, char **output) {
+  size_t utf16_length = 0;
+  napi_status status = napi_get_value_string_utf16(env, value, NULL, 0, &utf16_length);
+  if (status != napi_ok) {
+    throw_error_if_clear(env, "sandbox workspace publication UTF-16 path inspection failed");
+    return 0;
+  }
+  if (utf16_length == 0 || utf16_length > 4096) {
+    throw_range_error_if_clear(env, "sandbox workspace publication path is outside its bound");
+    return 0;
+  }
+  size_t length = 0;
+  status = napi_get_value_string_utf8(env, value, NULL, 0, &length);
+  if (status != napi_ok) {
+    throw_error_if_clear(env, "sandbox workspace publication path inspection failed");
+    return 0;
+  }
+  if (length == 0 || length >= MAX_PUBLICATION_PATH_BYTES) {
+    throw_range_error_if_clear(env, "sandbox workspace publication path is outside its bound");
+    return 0;
+  }
+  char *path = (char *)malloc(length + 1);
+  if (path == NULL) {
+    throw_error_if_clear(env, "sandbox workspace publication path allocation failed");
+    return 0;
+  }
+  size_t copied = 0;
+  status = napi_get_value_string_utf8(env, value, path, length + 1, &copied);
+  if (status != napi_ok || copied != length) {
+    free(path);
+    throw_type_error_if_clear(env, "sandbox workspace publication path encoding failed");
+    return 0;
+  }
+  if (memchr(path, '\0', length) != NULL || !publication_path_is_canonical(path, length)) {
+    free(path);
+    throw_type_error_if_clear(env, "sandbox workspace publication path is not canonical");
+    return 0;
+  }
+  *output = path;
+  return 1;
+}
+
+static void free_publication_work(publication_work *request) {
+  free(request->staged_path);
+  free(request->target_path);
+  free(request);
+}
+
+static napi_value reject_publication_prequeue_failure(
+    napi_env env, publication_work *request, napi_value promise, const char *message, bool has_work) {
+  napi_value reason = NULL;
+  if (!take_pending_exception(env, &reason)) {
+    napi_value text = NULL;
+    napi_status status = napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &text);
+    if (status == napi_ok) status = napi_create_error(env, NULL, text, &reason);
+    if (status != napi_ok && !make_failure_reason(env, &reason)) {
+      abort_napi_failure("unable to construct sandbox workspace publication rejection");
+    }
+  }
+  if (has_work) delete_async_work_or_fatal(env, request->work);
+  reject_deferred_or_fatal(env, request->deferred, reason);
+  free_publication_work(request);
+  return promise;
+}
+
+static void execute_publication(napi_env env, void *data) {
+  (void)env;
+  publication_work *request = (publication_work *)data;
+  request->phase = PUBLICATION_PHASE_COMPLETION;
+  request->status = UV_ECANCELED;
+
+  uv_fs_t fs_request;
+  memset(&fs_request, 0, sizeof(fs_request));
+  int result = uv_fs_chmod(uv_default_loop(), &fs_request, request->staged_path, request->mode, NULL);
+  uv_fs_req_cleanup(&fs_request);
+  if (result < 0) {
+    request->phase = PUBLICATION_PHASE_CHMOD;
+    request->status = result;
+    return;
+  }
+
+  memset(&fs_request, 0, sizeof(fs_request));
+  result = uv_fs_rename(uv_default_loop(), &fs_request, request->staged_path, request->target_path, NULL);
+  uv_fs_req_cleanup(&fs_request);
+  if (result < 0) {
+    request->phase = PUBLICATION_PHASE_RENAME;
+    request->status = result;
+    return;
+  }
+
+  request->phase = PUBLICATION_PHASE_SUCCESS;
+  request->status = 0;
+}
+
+static napi_status make_publication_result(napi_env env, publication_work *request, napi_value *output) {
+  napi_value result = NULL;
+  napi_value value = NULL;
+  napi_status status = napi_create_object(env, &result);
+  if (status != napi_ok) return status;
+  const char *phase = request->phase == PUBLICATION_PHASE_CHMOD ? "chmod" :
+      request->phase == PUBLICATION_PHASE_RENAME ? "rename" :
+      request->phase == PUBLICATION_PHASE_COMPLETION ? "completion" : "success";
+  status = napi_create_string_utf8(env, phase, NAPI_AUTO_LENGTH, &value);
+  if (status != napi_ok || (status = set_named(env, result, "phase", value)) != napi_ok) return status;
+  status = napi_create_int32(env, request->status, &value);
+  if (status != napi_ok || (status = set_named(env, result, "status", value)) != napi_ok) return status;
+  if (request->status < 0) {
+    status = napi_create_string_utf8(env, uv_err_name(request->status), NAPI_AUTO_LENGTH, &value);
+    if (status != napi_ok || (status = set_named(env, result, "code", value)) != napi_ok) return status;
+    status = napi_create_string_utf8(env, uv_strerror(request->status), NAPI_AUTO_LENGTH, &value);
+    if (status != napi_ok || (status = set_named(env, result, "message", value)) != napi_ok) return status;
+  }
+  *output = result;
+  return napi_ok;
+}
+
+static void finish_publication(napi_env env, napi_status completion_status, void *data) {
+  publication_work *request = (publication_work *)data;
+  if (completion_status != napi_ok) {
+    request->phase = PUBLICATION_PHASE_COMPLETION;
+    request->status = UV_ECANCELED;
+  }
+
+  napi_value result = NULL;
+  napi_status status = make_publication_result(env, request, &result);
+  if (status == napi_ok) status = napi_resolve_deferred(env, request->deferred, result);
+  if (status != napi_ok) {
+    napi_value reason = NULL;
+    if (!make_failure_reason(env, &reason)) abort_napi_failure("unable to construct sandbox workspace publication rejection");
+    reject_deferred_or_fatal(env, request->deferred, reason);
+  }
+
+  delete_async_work_or_fatal(env, request->work);
+  free_publication_work(request);
+}
+ 
+static napi_value publish_staged_copy(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_status status = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  if (status != napi_ok || argc != 3) return throw_type_error_if_clear(env, "sandbox workspace publication received malformed arguments");
+
+  napi_valuetype staged_type, target_type, mode_type;
+  status = napi_typeof(env, argv[0], &staged_type);
+  if (status != napi_ok) return throw_error_if_clear(env, "sandbox workspace publication staged path inspection failed");
+  status = napi_typeof(env, argv[1], &target_type);
+  if (status != napi_ok) return throw_error_if_clear(env, "sandbox workspace publication target path inspection failed");
+  status = napi_typeof(env, argv[2], &mode_type);
+  if (status != napi_ok) return throw_error_if_clear(env, "sandbox workspace publication mode inspection failed");
+  if (staged_type != napi_string || target_type != napi_string || mode_type != napi_number) {
+    return throw_type_error_if_clear(env, "sandbox workspace publication received malformed arguments");
+  }
+
+  double numeric_mode = 0;
+  status = napi_get_value_double(env, argv[2], &numeric_mode);
+  if (status != napi_ok) return throw_error_if_clear(env, "sandbox workspace publication mode conversion failed");
+  if (!(numeric_mode >= 0 && numeric_mode <= 65535) || (double)(uint32_t)numeric_mode != numeric_mode) {
+    return throw_range_error_if_clear(env, "sandbox workspace publication mode is outside its bound");
+  }
+
+  publication_work *request = (publication_work *)calloc(1, sizeof(*request));
+  if (request == NULL) return throw_error_if_clear(env, "sandbox workspace publication allocation failed");
+  if (!copy_publication_path(env, argv[0], &request->staged_path)) {
+    free_publication_work(request);
+    return NULL;
+  }
+  if (!copy_publication_path(env, argv[1], &request->target_path)) {
+    free_publication_work(request);
+    return NULL;
+  }
+  request->mode = (int)numeric_mode;
+  request->phase = PUBLICATION_PHASE_COMPLETION;
+  request->status = UV_ECANCELED;
+
+  napi_value promise = NULL;
+  napi_value resource_name = NULL;
+  napi_value async_resource = NULL;
+  status = napi_create_promise(env, &request->deferred, &promise);
+  if (status != napi_ok) {
+    free_publication_work(request);
+    return throw_error_if_clear(env, "sandbox workspace publication promise creation failed");
+  }
+  status = napi_create_string_utf8(env, "sandbox-workspace-publication", NAPI_AUTO_LENGTH, &resource_name);
+  if (status != napi_ok) return reject_publication_prequeue_failure(env, request, promise, "sandbox workspace publication resource name creation failed", false);
+  status = napi_create_object(env, &async_resource);
+  if (status != napi_ok) return reject_publication_prequeue_failure(env, request, promise, "sandbox workspace publication async resource creation failed", false);
+  status = napi_create_async_work(env, async_resource, resource_name, execute_publication, finish_publication, request, &request->work);
+  if (status != napi_ok) return reject_publication_prequeue_failure(env, request, promise, "sandbox workspace publication async work creation failed", false);
+  status = napi_queue_async_work(env, request->work);
+  if (status != napi_ok) return reject_publication_prequeue_failure(env, request, promise, "sandbox workspace publication async work queue failed", true);
+  return promise;
+}
 static napi_value initialize(napi_env env, napi_value exports) {
   napi_value function = NULL;
   napi_status status = napi_create_function(env, "guardPreCopy", NAPI_AUTO_LENGTH, guard_pre_copy, NULL, &function);
@@ -468,6 +694,10 @@ static napi_value initialize(napi_env env, napi_value exports) {
   status = napi_create_function(env, "guardPostCopy", NAPI_AUTO_LENGTH, guard_post_copy, NULL, &function);
   if (status != napi_ok) return throw_error_if_clear(env, "sandbox parent guard initialization failed");
   status = napi_set_named_property(env, exports, "guardPostCopy", function);
+  if (status != napi_ok) return throw_error_if_clear(env, "sandbox parent guard export failed");
+  status = napi_create_function(env, "publishStagedCopy", NAPI_AUTO_LENGTH, publish_staged_copy, NULL, &function);
+  if (status != napi_ok) return throw_error_if_clear(env, "sandbox parent guard initialization failed");
+  status = napi_set_named_property(env, exports, "publishStagedCopy", function);
   if (status != napi_ok) return throw_error_if_clear(env, "sandbox parent guard export failed");
   return exports;
 }

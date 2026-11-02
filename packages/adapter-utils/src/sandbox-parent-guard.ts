@@ -20,9 +20,16 @@ type NativeResult = {
   nonDirectory: boolean;
   rootChanged: boolean;
 };
+type NativePublicationResult = {
+  phase: "success" | "chmod" | "rename" | "completion";
+  status: number;
+  code?: string;
+  message?: string;
+};
 type NativeGuard = {
   guardPreCopy(sourcePath: string, depth: number): Promise<NativeResult>;
   guardPostCopy(lastAncestorPath: string, depth: number, sourceDev: number, sourceIno: number): Promise<NativeResult>;
+  publishStagedCopy?(stagedPath: string, targetPath: string, mode: number): Promise<NativePublicationResult>;
 };
 
 export type NativeWorkspaceEntryMetadata = { mode: number; kind: 0 | 1 | 2 };
@@ -190,6 +197,47 @@ export async function inspectNativeWorkspaceOverlayEntry(
   const result = await selected.guardPreCopy(sourcePath, depth);
   if (result.phase !== "success") throwNativeFailure(result, relative);
   return { mode: result.mode, kind: result.kind };
+}
+
+export async function publishNativeWorkspaceOverlayEntry(
+  stagedPath: string,
+  targetPath: string,
+  mode: number,
+): Promise<boolean> {
+  if (typeof stagedPath !== "string" || typeof targetPath !== "string" ||
+      stagedPath.length > 4096 || targetPath.length > 4096 ||
+      !hasCanonicalPosixComponents(stagedPath) || !hasCanonicalPosixComponents(targetPath) ||
+      hasStrictUnpairedSurrogate(stagedPath) || hasStrictUnpairedSurrogate(targetPath) ||
+      !Number.isInteger(mode) || mode < 0 || mode > 65535 || "permission" in process || !selected) {
+    return false;
+  }
+
+  const publish = selected.publishStagedCopy;
+  if (typeof publish !== "function") return false;
+
+  const result = await publish(stagedPath, targetPath, mode);
+  if (result.phase === "success") {
+    if (result.status !== 0) throw new Error("sandbox workspace publication returned an invalid success result");
+    return true;
+  }
+  if (result.phase === "completion") throw new Error("sandbox workspace publication completion failed");
+  if (!Number.isInteger(result.status) || result.status >= 0 ||
+      typeof result.code !== "string" || typeof result.message !== "string") {
+    throw new Error("sandbox workspace publication returned an invalid operation failure");
+  }
+  if (result.phase === "chmod") {
+    throw Object.assign(
+      new Error(`${result.code}: ${result.message}, chmod '${stagedPath}'`),
+      { errno: result.status, code: result.code, syscall: "chmod", path: stagedPath },
+    );
+  }
+  if (result.phase === "rename") {
+    throw Object.assign(
+      new Error(`${result.code}: ${result.message}, rename '${stagedPath}' -> '${targetPath}'`),
+      { errno: result.status, code: result.code, syscall: "rename", path: stagedPath, dest: targetPath },
+    );
+  }
+  throw new Error("sandbox workspace publication returned an invalid result");
 }
 
 export async function assertNativeWorkspaceOverlayPostCopy(

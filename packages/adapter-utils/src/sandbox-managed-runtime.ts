@@ -59,6 +59,7 @@ import {
 import {
   assertNativeWorkspaceOverlayPostCopy,
   inspectNativeWorkspaceOverlayEntry,
+  publishNativeWorkspaceOverlayEntry,
   type NativeWorkspaceEntryMetadata,
 } from "./sandbox-parent-guard.js";
 
@@ -948,8 +949,14 @@ async function copyWorkspaceEntry(
     await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, stagedTargetPath);
     });
-    await fs.chmod(stagedTargetPath, stats.mode);
-    await fs.rename(stagedTargetPath, targetPath);
+    let nativePublished = false;
+    if ("kind" in stats && stats.kind === 0) {
+      nativePublished = await publishNativeWorkspaceOverlayEntry(stagedTargetPath, targetPath, stats.mode);
+    }
+    if (!nativePublished) {
+      await fs.chmod(stagedTargetPath, stats.mode);
+      await fs.rename(stagedTargetPath, targetPath);
+    }
     published = true;
   } finally {
     if (!published) {
