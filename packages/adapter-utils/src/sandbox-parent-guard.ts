@@ -119,13 +119,19 @@ function hasCanonicalPosixComponents(value: string): boolean {
   return true;
 }
 
+// Retain only bounded spelling eligibility, never a filesystem pass result.
+let lastEligibleAncestorPath: string | undefined;
+
 export async function assertNativeWorkspaceOverlayAncestors(
   lastAncestorPath: string,
   relative: string,
   depth: number,
 ): Promise<boolean> {
-  if (depth < 1 || depth > 8 || lastAncestorPath.length > 4096 ||
-      !hasCanonicalPosixComponents(lastAncestorPath) || hasUnpairedSurrogate(lastAncestorPath)) return false;
+  if (depth < 1 || depth > 8 || lastAncestorPath.length > 4096) return false;
+  if (lastAncestorPath !== lastEligibleAncestorPath) {
+    if (!hasCanonicalPosixComponents(lastAncestorPath) || hasUnpairedSurrogate(lastAncestorPath)) return false;
+    lastEligibleAncestorPath = lastAncestorPath;
+  }
   if (selected === undefined) selected = selectNativeGuard();
   if (!selected) return false;
   const result = await selected.guardAncestors(lastAncestorPath, depth);
