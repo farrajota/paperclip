@@ -14,6 +14,8 @@ session and issue-thread surfaces, a public browser/React SDK, a standalone
 adapter demo, and a deterministic mock control plane. None of these surfaces
 imports or starts Paperclip's server, UI, CLI, or production database.
 
+**2026-11-02:** The native Codex driver now loads its actual session implementation at asynchronous open or recovery admission. Session initialization failures therefore surface at that admission point rather than during driver-module import; cancellation while loading remains authoritative and prevents transport admission. This deliberately relocates load-error timing and does not establish a measured startup improvement or a sufficient A0 remedy.
+
 Connection continuations inspect the harness descriptor's optional
 `toolRefreshOnResume` capability. Native Codex, Claude Managed Agents, AgentCore,
 OpenCode, and qualified Claude/Codex/Grok ACPX profiles expose it; unqualified

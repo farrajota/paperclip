@@ -49,7 +49,7 @@ import {
   codexThreadStatus as threadStatus,
   parseCodexThreadGoal as parseThreadGoal,
 } from "./codex-thread-normalization.js";
-import { CodexHarnessSession } from "./codex-harness-session.js";
+import type { CodexHarnessSession } from "./codex-harness-session.js";
 import type {
   CodexAppServerDriverOptions,
   CodexCapabilities,
@@ -66,6 +66,7 @@ import {
   text,
 } from "./codex-driver-values.js";
 
+type CodexHarnessSessionConstructor = typeof CodexHarnessSession;
 const DRIVER_KIND = "codex_app_server";
 const DRIVER_VERSION = "codex-v2";
 
@@ -121,6 +122,31 @@ function bootstrapCancellation(
       return result;
     },
   };
+}
+
+async function acquireCodexHarnessSessionConstructor(
+  signal: AbortSignal | undefined,
+): Promise<CodexHarnessSessionConstructor> {
+  signal?.throwIfAborted();
+  const namespaceImport = import("./codex-harness-session.js");
+  if (signal === undefined)
+    return (await namespaceImport).CodexHarnessSession;
+
+  let onAbort: (() => void) | undefined;
+  try {
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+    const namespace = await Promise.race([namespaceImport, aborted]);
+    signal.throwIfAborted();
+    return namespace.CodexHarnessSession;
+  } catch (error) {
+    throw signal.aborted ? signal.reason : error;
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
 }
 
 export class CodexAppServerDriver implements HarnessDriver {
@@ -269,6 +295,14 @@ export class CodexAppServerDriver implements HarnessDriver {
       this.#options.environment,
       this.#options.workingDirectoryAuthority,
     );
+    let sessionConstructor: CodexHarnessSessionConstructor;
+    try {
+      sessionConstructor = await acquireCodexHarnessSessionConstructor(
+        input.signal,
+      );
+    } finally {
+      input.signal?.throwIfAborted();
+    }
     const transport = this.#transport({ workingDirectory });
     const cancellation = bootstrapCancellation(transport, input.signal);
     try {
@@ -322,6 +356,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       if (opened.context.liveConsole)
         opened.context.liveConsole.goals = this.#caps.goals;
       return this.#session({
+        sessionConstructor,
         transport,
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
@@ -372,6 +407,14 @@ export class CodexAppServerDriver implements HarnessDriver {
         recovered: false,
         reason: "persisted session identity is incomplete",
       };
+    }
+    let sessionConstructor: CodexHarnessSessionConstructor;
+    try {
+      sessionConstructor = await acquireCodexHarnessSessionConstructor(
+        options.signal,
+      );
+    } finally {
+      options.signal.throwIfAborted();
     }
     const transport = this.#transport({
       workingDirectory: snapshot.workingDirectory
@@ -612,6 +655,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       if (opened.context.liveConsole)
         opened.context.liveConsole.goals = this.#caps.goals;
       const session = this.#session({
+        sessionConstructor,
         transport,
         runId: snapshot.runId,
         normalizedSessionId: snapshot.normalizedSessionId,
@@ -930,9 +974,11 @@ export class CodexAppServerDriver implements HarnessDriver {
     stalePendingRuntimeRequests?: HarnessRuntimeRequest[];
     lineage?: HarnessThreadLineageEntry[];
     sourceSequence: number;
-  }): CodexHarnessSession {
-    return new CodexHarnessSession({
-      ...input,
+    sessionConstructor: CodexHarnessSessionConstructor;
+  }): InstanceType<CodexHarnessSessionConstructor> {
+    const { sessionConstructor, ...sessionInput } = input;
+    return new sessionConstructor({
+      ...sessionInput,
       taskEnvelope: this.#options.taskEnvelope,
       conversationMode: this.#prepared()
         ? "prepared"
