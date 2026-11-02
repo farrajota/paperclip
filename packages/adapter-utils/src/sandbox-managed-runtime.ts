@@ -56,7 +56,16 @@ import {
   type WorkspaceRestoreDiagnostic,
 } from "./workspace-restore-diagnostics.js";
 
-import { assertNativeWorkspaceOverlayAncestors } from "./sandbox-parent-guard.js";
+import {
+  assertNativeWorkspaceOverlayPostCopy,
+  inspectNativeWorkspaceOverlayEntry,
+  type NativeWorkspaceEntryMetadata,
+} from "./sandbox-parent-guard.js";
+
+function isNativePreGuardNotFound(error: unknown): boolean {
+  if (error === null || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") return false;
+  return "guardPhase" in error && (error.guardPhase === "ancestor" || error.guardPhase === "leaf");
+}
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
   "node_modules",
@@ -912,19 +921,21 @@ async function copyWorkspaceEntry(
   sourceRoot: string,
   targetRoot: string,
   relative: string,
-  sourceStats?: Stats,
+  sourceStats?: Stats | NativeWorkspaceEntryMetadata,
 ): Promise<void> {
   const sourcePath = path.join(sourceRoot, relative);
   const targetPath = path.join(targetRoot, relative);
   const stats = sourceStats ?? await fs.lstat(sourcePath);
-  if (stats.isDirectory()) {
+  const isDirectory = "kind" in stats ? stats.kind === 1 : stats.isDirectory();
+  const isSymbolicLink = "kind" in stats ? stats.kind === 2 : stats.isSymbolicLink();
+  if (isDirectory) {
     await fs.mkdir(targetPath, { recursive: true });
     return;
   }
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
-  if (stats.isSymbolicLink()) {
+  if (isSymbolicLink) {
     const linkTarget = await fs.readlink(sourcePath);
     await fs.symlink(linkTarget, targetPath);
     return;
@@ -993,8 +1004,6 @@ async function assertWorkspaceOverlayParentDirectory(
   ancestorPaths: readonly string[],
 ): Promise<void> {
   if (segments.length === 0) return;
-  if (ancestorPaths.length === segments.length &&
-      await assertNativeWorkspaceOverlayAncestors(ancestorPaths[ancestorPaths.length - 1]!, relative, segments.length)) return;
   return new Promise<void>((resolve, reject) => {
     let index = 0;
     let parentPath = sourceDir;
@@ -1136,19 +1145,40 @@ async function copySelectedWorkspaceEntries(input: {
     // Capture immutable references before another in-flight copy changes the cache.
     const parentSegments = parent.segments;
     const ancestorPaths = parent.ancestors;
-    let sourceStats: Stats;
-    try {
-      // Git-selected ancestry must be freshly inspected for each entry and pass.
-      await assertWorkspaceOverlayParentDirectory(relative, sourceDir, parentSegments, ancestorPaths);
-      sourceStats = await fs.lstat(sourcePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
+    let nativeStats: NativeWorkspaceEntryMetadata | undefined = undefined;
+    if (parentSegments.length > 0 && ancestorPaths.length === parentSegments.length) {
+      try {
+        nativeStats = await inspectNativeWorkspaceOverlayEntry(
+          sourcePath,
+          ancestorPaths[ancestorPaths.length - 1]!,
+          relative,
+          parentSegments.length,
+        );
+      } catch (error) {
+        if (isNativePreGuardNotFound(error)) return;
+        throw error;
+      }
     }
-    // Reuse the checked metadata for the copy's file/symlink branch.
+    let sourceStats: Stats | NativeWorkspaceEntryMetadata;
+    if (nativeStats) {
+      sourceStats = nativeStats;
+    } else {
+      try {
+        // Git-selected ancestry and leaf metadata remain fresh on explicit JS fallback.
+        await assertWorkspaceOverlayParentDirectory(relative, sourceDir, parentSegments, ancestorPaths);
+        sourceStats = await fs.lstat(sourcePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+    }
     await copyWorkspaceEntry(sourceDir, input.targetDir, relative, sourceStats);
 
     // Do not upload the staged tree if an ancestor changed during the copy.
+    if (nativeStats && ancestorPaths.length === parentSegments.length &&
+        await assertNativeWorkspaceOverlayPostCopy(
+          ancestorPaths[ancestorPaths.length - 1]!, relative, parentSegments.length, dev, ino,
+        )) return;
     await assertSourceRoot();
     await assertWorkspaceOverlayParentDirectory(relative, sourceDir, parentSegments, ancestorPaths);
   };

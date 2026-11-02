@@ -8,14 +8,24 @@ const METADATA_NAME = "sandbox-parent-guard-compatibility.json";
 const require = createRequire(import.meta.url);
 
 type NativeResult = {
+  phase: "success" | "ancestor" | "leaf" | "root" | "completion";
   status: number;
-  index: number;
-  nonDirectory: boolean;
+  kind: 0 | 1 | 2;
+  mode: number;
+  pathOffset: number;
+  pathLength: number;
   path?: string;
   code?: string;
   message?: string;
+  nonDirectory: boolean;
+  rootChanged: boolean;
 };
-type NativeGuard = { guardAncestors(path: string, depth: number): Promise<NativeResult> };
+type NativeGuard = {
+  guardPreCopy(sourcePath: string, depth: number): Promise<NativeResult>;
+  guardPostCopy(lastAncestorPath: string, depth: number, sourceDev: number, sourceIno: number): Promise<NativeResult>;
+};
+
+export type NativeWorkspaceEntryMetadata = { mode: number; kind: 0 | 1 | 2 };
 
 let selected: NativeGuard | null | undefined;
 type Compatibility = {
@@ -122,19 +132,31 @@ function hasCanonicalPosixComponents(value: string): boolean {
 // Retain only bounded spelling eligibility, never a filesystem pass result.
 let lastEligibleAncestorPath: string | undefined;
 
-export async function assertNativeWorkspaceOverlayAncestors(
-  lastAncestorPath: string,
-  relative: string,
-  depth: number,
-): Promise<boolean> {
+function hasStrictUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index++;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parentEligible(lastAncestorPath: string, depth: number): boolean {
   if (depth < 1 || depth > 8 || lastAncestorPath.length > 4096) return false;
   if (lastAncestorPath !== lastEligibleAncestorPath) {
     if (!hasCanonicalPosixComponents(lastAncestorPath) || hasUnpairedSurrogate(lastAncestorPath)) return false;
     lastEligibleAncestorPath = lastAncestorPath;
   }
-  if (selected === undefined) selected = selectNativeGuard();
-  if (!selected) return false;
-  const result = await selected.guardAncestors(lastAncestorPath, depth);
+  return true;
+}
+
+function throwNativeFailure(result: NativeResult, relative: string): never {
+  if (result.phase === "completion") throw new Error("sandbox parent guard completion failed");
   if (result.status < 0) {
     const error = Object.assign(new Error(`${result.code}: ${result.message}, lstat '${result.path}'`), {
       errno: result.status,
@@ -142,8 +164,45 @@ export async function assertNativeWorkspaceOverlayAncestors(
       syscall: "lstat",
       path: result.path,
     });
+    Object.defineProperty(error, "guardPhase", { value: result.phase });
     throw error;
   }
-  if (result.nonDirectory) throw new Error(`Workspace overlay ancestor is not a directory: ${relative}`);
+  if (result.phase === "ancestor" && result.nonDirectory) {
+    throw new Error(`Workspace overlay ancestor is not a directory: ${relative}`);
+  }
+  if (result.phase === "root" && result.rootChanged) {
+    throw new Error("Workspace overlay root directory changed during staging");
+  }
+  throw new Error("sandbox parent guard returned an invalid result");
+}
+
+export async function inspectNativeWorkspaceOverlayEntry(
+  sourcePath: string,
+  lastAncestorPath: string,
+  relative: string,
+  depth: number,
+): Promise<NativeWorkspaceEntryMetadata | undefined> {
+  if (!parentEligible(lastAncestorPath, depth)) return undefined;
+  if (selected === undefined) selected = selectNativeGuard();
+  if (!selected) return undefined;
+  if (sourcePath.length > 4096 || !hasCanonicalPosixComponents(sourcePath) || hasStrictUnpairedSurrogate(sourcePath)) return undefined;
+
+  const result = await selected.guardPreCopy(sourcePath, depth);
+  if (result.phase !== "success") throwNativeFailure(result, relative);
+  return { mode: result.mode, kind: result.kind };
+}
+
+export async function assertNativeWorkspaceOverlayPostCopy(
+  lastAncestorPath: string,
+  relative: string,
+  depth: number,
+  sourceDev: number,
+  sourceIno: number,
+): Promise<boolean> {
+  if (!parentEligible(lastAncestorPath, depth)) return false;
+  if (selected === undefined) selected = selectNativeGuard();
+  if (!selected) return false;
+  const result = await selected.guardPostCopy(lastAncestorPath, depth, sourceDev, sourceIno);
+  if (result.phase !== "success") throwNativeFailure(result, relative);
   return true;
 }

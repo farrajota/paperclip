@@ -485,6 +485,8 @@ Source-mode development needs the private workspace-overlay native asset before 
 On Linux x64/glibc, installed glibc headers must also match the runtime. The generated compatibility metadata records the actual Node, libuv, platform, architecture and glibc floor; native loading requires an exact Node/libuv match on Linux x64/glibc with runtime glibc at or above that floor. Other or explicitly unsupported targets use the complete JavaScript path.
 The adapter binary and metadata are prepared in `packages/adapter-utils/dist/`; the existing CLI build hook prepares and copies both assets beside its bundle. Missing compatibility metadata or a required binary on a declared matching target is an error, not a JavaScript fallback.
 
+For eligible bounded workspace-overlay entries, the native helper performs read-only pre-copy ancestor and leaf checks plus post-copy root-identity and ancestor checks. Copying, replacement, and cleanup remain in JavaScript, and unsupported or ineligible inputs retain the complete JavaScript path.
+
 `pnpm test` does not run Playwright. Browser suites stay separate and are typically run only when working on those flows or in CI.
 
 See [doc/DEVELOPING.md](doc/DEVELOPING.md) for the full development guide.
