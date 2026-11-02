@@ -1,3 +1,4 @@
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { connect } from "node:net";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,8 +11,9 @@ import {
 
 import {
   canonicalRunnerToolName,
-  startRunnerToolBridge,
+  startRunnerToolBridge as startRunnerToolBridgeWithCompiler,
   type RunnerToolBridge,
+  type RunnerToolBridgeOptions,
 } from "./runner-tool-bridge.js";
 
 const bridges: RunnerToolBridge[] = [];
@@ -447,6 +449,12 @@ describe("runner semantic MCP bridge", () => {
     );
   });
 });
+
+function startRunnerToolBridge(
+  options: Omit<RunnerToolBridgeOptions, "ajvConstructor">,
+): Promise<RunnerToolBridge> {
+  return startRunnerToolBridgeWithCompiler({ ...options, ajvConstructor: Ajv2020 });
+}
 
 function tool(name: string): Readonly<Record<string, unknown>> {
   return { name, inputSchema: { type: "object" } };

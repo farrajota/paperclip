@@ -38,9 +38,9 @@
     "acpx"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node ../../scripts/build-sandbox-parent-guard.mjs",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "node ../../scripts/build-sandbox-parent-guard.mjs && tsc --noEmit"
   },
   "dependencies": {
     "@paperclipai/shared": "workspace:*",

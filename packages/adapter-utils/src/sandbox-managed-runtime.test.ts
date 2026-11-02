@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as gitSync from "./git-workspace-sync.js";
 import * as restoreMerge from "./workspace-restore-merge.js";
 import { getWorkspaceRestoreDiagnostic } from "./workspace-restore-diagnostics.js";
+import * as sandboxParentGuard from "./sandbox-parent-guard.js";
 import {
   resetLocalGitIndexToHead,
   runLocalGit,
@@ -1265,7 +1266,7 @@ describe("sandbox managed runtime", () => {
     const workspaceGitSnapshot = await gitSync.readGitWorkspaceSnapshot(localWorkspaceDir);
     if (!workspaceGitSnapshot) throw new Error("Expected a Git-backed workspace snapshot");
     const sourceRoot = await fsPromises.realpath(localWorkspaceDir);
-    const ancestorCallsStart = vi.mocked(lstatCallback).mock.calls.length;
+    const ancestorGuard = vi.spyOn(sandboxParentGuard, "assertNativeWorkspaceOverlayAncestors");
     const prepared = await prepareSandboxManagedRuntime({
       spec: {
         transport: "sandbox",
@@ -1282,8 +1283,8 @@ describe("sandbox managed runtime", () => {
       workspaceExclude: ["*/literal[1]", "literal[1]", "literal[1]/*", "*/multi/path", "packages/ui/fallback.txt"],
     });
 
-    // Each real pre/post guard traverses the full chain with its own callback.
-    const ancestorCalls = vi.mocked(lstatCallback).mock.calls.slice(ancestorCallsStart);
+    // Pre- and post-copy guards enter the same private complete-pass boundary.
+    const ancestorCalls = ancestorGuard.mock.calls;
     const expectedAncestors = [
       path.join(sourceRoot, "packages"),
       path.join(sourceRoot, "packages", "ui"),
@@ -1292,12 +1293,10 @@ describe("sandbox managed runtime", () => {
     ];
     const deepestCalls = ancestorCalls.filter((args) => args[0] === expectedAncestors[3]);
     expect(deepestCalls).toHaveLength(2);
-    expect(deepestCalls[0]![1]).not.toBe(deepestCalls[1]![1]);
     for (const args of deepestCalls) {
-      expect(ancestorCalls.filter((call) => call[1] === args[1]).map((call) => call[0]))
-        .toEqual(expectedAncestors);
+      expect(args[2]).toBe(expectedAncestors.length);
+      expect(args[1]).toBe("packages/ui/multi/path-sibling/keep.txt");
     }
-    // Different in-flight entries must retain their captured parent arguments.
     const siblingAncestors = [
       path.join(sourceRoot, "packages"),
       path.join(sourceRoot, "packages", "ui"),
@@ -1305,12 +1304,37 @@ describe("sandbox managed runtime", () => {
     ];
     const siblingCalls = ancestorCalls.filter((args) => args[0] === siblingAncestors[2]);
     expect(siblingCalls).toHaveLength(2);
-    expect(siblingCalls[0]![1]).not.toBe(siblingCalls[1]![1]);
     for (const args of siblingCalls) {
-      expect(deepestCalls.every((call) => call[1] !== args[1])).toBe(true);
-      expect(ancestorCalls.filter((call) => call[1] === args[1]).map((call) => call[0]))
-        .toEqual(siblingAncestors);
+      expect(args[2]).toBe(siblingAncestors.length);
+      expect(args[1]).toBe("packages/ui/literal1/keep.txt");
     }
+    expect(deepestCalls.every((call) => siblingCalls.every((sibling) => call[0] !== sibling[0]))).toBe(true);
+    const passResults = await Promise.all(ancestorGuard.mock.results.map((result) => result.value));
+    const compatibility = JSON.parse(await readFile(new URL("../dist/sandbox-parent-guard-compatibility.json", import.meta.url), "utf8")) as {
+      schemaVersion: 1;
+      targets: Array<{ platform: string; arch: string; libc: string; node: string; uv: string; glibcFloor: string }>;
+    };
+    const report: unknown = process.report.getReport();
+    let runtimeGlibc: string | undefined;
+    if (report !== null && typeof report === "object" && "header" in report) {
+      const header = report.header;
+      if (header !== null && typeof header === "object" && "glibcVersionRuntime" in header &&
+          typeof header.glibcVersionRuntime === "string") runtimeGlibc = header.glibcVersionRuntime;
+    }
+    const runtimeGlibcParts = runtimeGlibc && /^\d+\.\d+$/.test(runtimeGlibc)
+      ? runtimeGlibc.split(".").map(Number)
+      : [];
+    const nativeTargetAvailable = compatibility.schemaVersion === 1 && process.platform === "linux" && process.arch === "x64" &&
+      runtimeGlibcParts.length === 2 && compatibility.targets.some((target) => {
+        if (target.platform !== "linux" || target.arch !== "x64" || target.libc !== "glibc" ||
+            target.node !== process.versions.node || target.uv !== process.versions.uv) return false;
+        const [runtimeMajor, runtimeMinor] = runtimeGlibcParts;
+        const [floorMajor, floorMinor] = target.glibcFloor.split(".").map(Number);
+        return Number.isInteger(floorMajor) && Number.isInteger(floorMinor) &&
+          (runtimeMajor! > floorMajor! || (runtimeMajor === floorMajor && runtimeMinor! >= floorMinor!));
+      });
+    expect(passResults.every(Boolean)).toBe(nativeTargetAvailable);
+    ancestorGuard.mockRestore();
 
     const workspaceUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
     expect(workspaceUpload).toBeDefined();
@@ -1393,7 +1417,7 @@ describe("sandbox managed runtime", () => {
     }
   });
 
-  it.each(["symlink", "root_symlink", "root_alias", "root_alias_retarget", "case_alias", "EACCES", "EIO", "ancestor_callback_error", "ENOENT"])("handles an overlay source changed after the snapshot: %s", async (change) => {
+  it.each(["symlink", "root_symlink", "root_alias", "root_alias_retarget", "case_alias", "EACCES", "EIO", "ancestor_non_directory", "deep_fallback_callback_error", "ENOENT"])("handles an overlay source changed after the snapshot: %s", async (change) => {
     // The runtime pins a realpath root before staging. Match that spelling so
     // injected I/O errors also reach the selected file on macOS's /var alias.
     const rootDir = await fsPromises.realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-overlay-source-")));
@@ -1402,9 +1426,12 @@ describe("sandbox managed runtime", () => {
     await initGitRepo(workspaceLocalDir);
     const draftsDir = path.join(workspaceLocalDir, "drafts");
     const selectedPath = path.join(change === "root_symlink" ? workspaceLocalDir : draftsDir,
-      ...(change === "ancestor_callback_error" ? ["nested", "report.md"] : ["report.md"]));
+      ...(change === "ancestor_non_directory" ? ["nested", "report.md"] :
+        change === "deep_fallback_callback_error" ? ["deep-1", "deep-2", "deep-3", "deep-4", "deep-5", "deep-6", "deep-7", "deep-8", "deep-9", "report.md"] : ["report.md"]));
     await mkdir(draftsDir);
-    if (change === "ancestor_callback_error") await mkdir(path.join(draftsDir, "nested"));
+    if (change === "ancestor_non_directory" || change === "deep_fallback_callback_error") {
+      await mkdir(path.dirname(selectedPath), { recursive: true });
+    }
     await writeFile(selectedPath, "selected work\n");
     const siblings = ["a-sibling.txt", "b-sibling.txt", "c-sibling.txt"];
     for (const name of siblings) await writeFile(path.join(workspaceLocalDir, name), `allowed ${name}\n`);
@@ -1446,7 +1473,7 @@ describe("sandbox managed runtime", () => {
     const realLstat = fsPromises.lstat.bind(fsPromises);
     const realRealpath = fsPromises.realpath.bind(fsPromises);
     const failure = Object.assign(new Error(`Cannot inspect overlay: ${change}`), {
-      code: change === "ancestor_callback_error" ? "EACCES" : change,
+      code: change === "deep_fallback_callback_error" ? "EACCES" : change,
     });
     let statSpy: ReturnType<typeof vi.spyOn> | undefined;
     let realpathSpy: ReturnType<typeof vi.spyOn> | undefined;
@@ -1487,15 +1514,16 @@ describe("sandbox managed runtime", () => {
             // The root was captured with the snapshot, before config_sync.
             await fsPromises.rename(workspaceLocalDir, path.join(rootDir, "original-workspace"));
             await symlink(outsideDir, workspaceLocalDir);
-          } else if (change === "ancestor_callback_error") {
+          } else if (change === "ancestor_non_directory") {
+            await rm(path.join(draftsDir, "nested"), { recursive: true });
+            await writeFile(path.join(draftsDir, "nested"), "not a directory\n");
+            statSpy = vi.spyOn(fsPromises, "lstat");
+          } else if (change === "deep_fallback_callback_error") {
             vi.mocked(lstatCallback).mockClear();
             vi.mocked(lstatCallback).mockImplementationOnce((...args) => {
               expect(args[0]).toBe(draftsDir);
               const callback = args.find((argument) => typeof argument === "function");
-              if (typeof callback !== "function") {
-                throw new Error("Expected an lstat callback");
-              }
-              // Node supplies no stats on error, despite the callback's declared stats type.
+              if (typeof callback !== "function") throw new Error("Expected an lstat callback");
               callback(failure, undefined as unknown as Parameters<typeof callback>[1]);
             });
             statSpy = vi.spyOn(fsPromises, "lstat");
@@ -1511,14 +1539,18 @@ describe("sandbox managed runtime", () => {
         await preparing;
         expect(syncIn).toHaveBeenCalledOnce();
       } else {
-        await expect(preparing).rejects.toThrow(change.endsWith("symlink") ? /overlay.*directory/i : failure.message);
-        if (change === "ancestor_callback_error") {
+        const expectedError = change === "ancestor_non_directory"
+          ? /Workspace overlay ancestor is not a directory: drafts\/nested\/report\.md/
+          : change.endsWith("symlink") ? /overlay.*directory/i : failure.message;
+        await expect(preparing).rejects.toThrow(expectedError);
+        if (change === "ancestor_non_directory") expect(statSpy).not.toHaveBeenCalledWith(selectedPath);
+        if (change === "deep_fallback_callback_error") {
           await expect(preparing).rejects.toBe(failure);
           expect(lstatCallback).toHaveBeenCalledTimes(1);
           expect(lstatCallback).toHaveBeenCalledWith(draftsDir, expect.any(Function));
           expect(statSpy).not.toHaveBeenCalledWith(selectedPath);
         }
-        if (statSpy && change !== "ancestor_callback_error") expect(statSpy).toHaveBeenCalledWith(selectedPath);
+        if (statSpy && change !== "ancestor_non_directory" && change !== "deep_fallback_callback_error") expect(statSpy).toHaveBeenCalledWith(selectedPath);
         expect(syncIn).not.toHaveBeenCalled();
       }
     } finally {

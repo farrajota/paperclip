@@ -410,6 +410,7 @@ Or manually:
 git clone https://github.com/paperclipai/paperclip.git
 cd paperclip
 pnpm install
+pnpm run native:prepare
 pnpm dev
 ```
 
@@ -478,7 +479,11 @@ pnpm test:watch       # Vitest watch mode
 pnpm test:e2e         # Playwright browser suite
 pnpm db:generate      # Generate DB migration
 pnpm db:migrate       # Apply migrations
+
 ```
+Source-mode development needs the private workspace-overlay native asset before the server starts. Run `pnpm run native:prepare` after `pnpm install` (as in the quickstart) and again after changing the native C source or Node/libuv/glibc build environment. The helper uses existing `gcc` and public Node-API plus the running Node executable's bundled libuv headers under its `include/node` directory; the Node and libuv header versions must match the running versions.
+On Linux x64/glibc, installed glibc headers must also match the runtime. The generated compatibility metadata records the actual Node, libuv, platform, architecture and glibc floor; native loading requires an exact Node/libuv match on Linux x64/glibc with runtime glibc at or above that floor. Other or explicitly unsupported targets use the complete JavaScript path.
+The adapter binary and metadata are prepared in `packages/adapter-utils/dist/`; the existing CLI build hook prepares and copies both assets beside its bundle. Missing compatibility metadata or a required binary on a declared matching target is an error, not a JavaScript fallback.
 
 `pnpm test` does not run Playwright. Browser suites stay separate and are typically run only when working on those flows or in CI.
 

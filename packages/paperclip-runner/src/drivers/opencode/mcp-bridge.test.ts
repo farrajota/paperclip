@@ -1,3 +1,4 @@
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
@@ -6,7 +7,7 @@ import {
   PRP_COMPLETION_TOOL_DESCRIPTION,
 } from "../../contracts/completion-result.js";
 
-import { canonicalOpenCodeMcpToolName, startOpenCodeMcpBridge, type OpenCodeMcpBridge } from "./mcp-bridge.js";
+import { canonicalOpenCodeMcpToolName, startOpenCodeMcpBridge as startOpenCodeMcpBridgeWithCompiler, type OpenCodeMcpBridge, type OpenCodeMcpBridgeOptions } from "./mcp-bridge.js";
 
 const bridges: OpenCodeMcpBridge[] = [];
 
@@ -186,3 +187,8 @@ describe("OpenCode MCP bridge", () => {
     });
   });
 });
+function startOpenCodeMcpBridge(
+  options: Omit<OpenCodeMcpBridgeOptions, "ajvConstructor">,
+): Promise<OpenCodeMcpBridge> {
+  return startOpenCodeMcpBridgeWithCompiler({ ...options, ajvConstructor: Ajv2020 });
+}

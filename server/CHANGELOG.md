@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Patch Changes
+- Batch each eligible bounded workspace-overlay parent validation pass through one private first-party Node-API worker operation, preserving fresh ordered `lstat` checks and the same-result directory predicate. Native loading is limited to an exact generated Node/libuv Linux x64 glibc compatibility target; other inputs use the existing JavaScript path, and source development prepares the artifact with `pnpm run native:prepare`. No measured speedup or CI qualification is claimed.
+- Correct OpenCode final-response selection when native terminal-tool events and controller acceptance arrive in either order, preserving delayed same-message answers and the existing fallback for ambiguous attempts or identities.
 - Load the source-mode server runner shim from its canonical required modules instead of the aggregate runner entry, preserving existing exports and canonical operation validation. Compiled runner vendoring is unchanged; no startup timing or CI qualification is claimed.
 - Hash files observed at 64 KiB or smaller with sequential reads into one fixed 8 KiB buffer through actual EOF, while larger files retain streaming; no size-based allocation or read limit is introduced, and no speedup is claimed.
 - Admit small-file snapshot hashes through an ordered rolling queue of at most four capture-local 8 KiB slots; consume only the head and reuse its slot after awaited close and consumer resumption, while draining owned work before failures or traversal boundaries. No speedup or CI qualification is claimed.
@@ -30,6 +32,7 @@
 
 - Drain each runtime-skills fixture heartbeat service's active wakeup and run executions before resetting experimental settings or truncating fixture tables, replacing the arbitrary 100 ms teardown delay with the existing execution owner barrier. This addresses the observed teardown deadlock at the source lifecycle boundary; no test rerun or CI qualification is claimed.
 - Defer canonical ACPX runtime namespace and SDK initialization until validated native runtime admission, before adapter factories or resources are constructed. Import failure and cancellation now reject admission with their original reason and an already-complete no-resource cleanup proof; cancellation does not wait for a pending import to settle. Cold admission now bears this initialization work, with no measured saving, exclusive-cause or sufficient-remedy claim, or CI qualification.
+- Acquire each provider's canonical JSON Schema 2020 compiler during ACPX/OpenCode admission and pass its constructor into the bridge, while compiling validators at the existing bridge-start position. OpenCode open and recovery bind their operation signals around acquisition before filesystem admission; OpenCode recovery now requires `HarnessSessionRecoveryOptions.signal`, and the supervised CLI proxy passes inert `AbortSignal.any([])` because it has no cooperative operation signal, leaving its process-group/SIGTERM shutdown unchanged. Acquisition failures remain outside retries and recovery formatting. The bridge start API now requires `ajvConstructor`; the server's ordinary eager Ajv usage is unchanged. No performance or sufficiency claim is made.
 
 ## 0.3.1
 

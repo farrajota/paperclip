@@ -24,10 +24,11 @@ import type {
   HarnessDriver,
   HarnessDriverConfigValidation,
   HarnessDriverDescriptor,
+  OpenHarnessSessionInput,
   HarnessSession,
   HarnessSessionRecoveryResult,
   HarnessTranscriptSnapshot,
-  OpenHarnessSessionInput,
+  HarnessSessionRecoveryOptions,
   PersistedHarnessSession,
   HarnessRuntimeRequest,
   HarnessRuntimeRequestHandoff,
@@ -67,6 +68,7 @@ import {
 import {
   canonicalOpenCodeMcpToolName,
   startOpenCodeMcpBridge,
+  type Ajv2020Constructor,
   type OpenCodeMcpBridge,
 } from "./mcp-bridge.js";
 import { nativeMcpLaunchBinding } from "../native-mcp.js";
@@ -229,11 +231,14 @@ export class OpenCodeServerDriver implements HarnessDriver {
   }
 
   async openSession(input: OpenHarnessSessionInput): Promise<HarnessSession> {
-    return this.#open(input, null);
+    const ajvConstructor = await acquireOpenCodeAjv2020(input.signal);
+    input.signal?.throwIfAborted();
+    return this.#open(input, null, ajvConstructor);
   }
 
   async recoverSession(
     snapshot: PersistedHarnessSession,
+    options: HarnessSessionRecoveryOptions,
   ): Promise<HarnessSessionRecoveryResult> {
     if (
       snapshot.driverKind !== OPENCODE_SERVER_DRIVER_KIND ||
@@ -245,16 +250,21 @@ export class OpenCodeServerDriver implements HarnessDriver {
         recovered: false,
         reason: "persisted OpenCode session identity is incomplete",
       };
+    const ajvConstructor = await acquireOpenCodeAjv2020(options.signal);
+    options.signal.throwIfAborted();
     try {
+      const workingDirectory = await this.#readWorkspace(
+        snapshot.normalizedSessionId,
+      );
       const session = await this.#open(
         {
           runId: snapshot.runId,
           normalizedSessionId: snapshot.normalizedSessionId,
-          workingDirectory: await this.#readWorkspace(
-            snapshot.normalizedSessionId,
-          ),
+          workingDirectory,
+          signal: options.signal,
         },
         snapshot,
+        ajvConstructor,
       );
       return { recovered: true, session };
     } catch (error) {
@@ -281,6 +291,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
   async #open(
     input: OpenHarnessSessionInput,
     snapshot: PersistedHarnessSession | null,
+    ajvConstructor: Ajv2020Constructor,
   ): Promise<HarnessSession> {
     const cwd = validateWorkspace(input.workingDirectory);
     const root = sessionRoot(
@@ -301,6 +312,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
       let runtime: OpenCodeRuntime | null = null;
       try {
         runtime = await startRuntime({
+          ajvConstructor,
           options: this.#options,
           root,
           cwd,
@@ -377,6 +389,30 @@ export class OpenCodeServerDriver implements HarnessDriver {
   }
 }
 
+async function acquireOpenCodeAjv2020(
+  signal: AbortSignal | undefined,
+): Promise<Ajv2020Constructor> {
+  signal?.throwIfAborted();
+  const namespaceImport = import("ajv/dist/2020.js");
+  if (signal === undefined) return (await namespaceImport).Ajv2020;
+
+  let onAbort: (() => void) | undefined;
+  try {
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+    const namespace = await Promise.race([namespaceImport, aborted]);
+    signal.throwIfAborted();
+    return namespace.Ajv2020;
+  } catch (error) {
+    throw signal.aborted ? signal.reason : error;
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 class OpenCodeHarnessSession implements HarnessSession {
   readonly #runtime: OpenCodeRuntime;
   readonly #fetch: typeof globalThis.fetch;
@@ -439,6 +475,9 @@ class OpenCodeHarnessSession implements HarnessSession {
   #resultTurnId: string | null;
   #semanticResultTextBoundary: number | null = null;
   #semanticResultProviderMessageId: string | null = null;
+  #nativeTerminalBoundary: { messageId: string; textBoundary: number } | null = null;
+  #nativeTerminalAmbiguous = false;
+  #terminalAttemptCount = 0;
   #lastNonTerminalToolSourceSeq = 0;
   #usage: Record<string, unknown> | null = null;
   readonly #conversationMode: "task" | "prepared";
@@ -540,6 +579,9 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#resultTurnId = null;
     this.#semanticResultTextBoundary = null;
     this.#semanticResultProviderMessageId = null;
+    this.#nativeTerminalBoundary = null;
+    this.#nativeTerminalAmbiguous = false;
+    this.#terminalAttemptCount = 0;
     this.#lastNonTerminalToolSourceSeq = 0;
     this.#completedTextPartIds.clear();
     this.#completedReasoningPartIds.clear();
@@ -574,6 +616,15 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (this.#activeTurnId !== null)
       throw new Error("OpenCode session already has an active turn");
     const turnId = `turn-${randomBytes(12).toString("hex")}`;
+    this.#semanticResultTextBoundary = null;
+    this.#semanticResultProviderMessageId = null;
+    this.#nativeTerminalBoundary = null;
+    this.#nativeTerminalAmbiguous = false;
+    this.#terminalAttemptCount = 0;
+    this.#lastNonTerminalToolSourceSeq = 0;
+    this.#completedTextPartIds.clear();
+    this.#completedReasoningPartIds.clear();
+    this.#completedTextParts.length = 0;
     this.#activeTurnId = turnId;
     this.#emit("turn.submitted", {
       envelopeSchema: this.#taskEnvelope.schema,
@@ -948,6 +999,8 @@ class OpenCodeHarnessSession implements HarnessSession {
       { turnId, itemId: call.callId },
     );
     if (tool === PRP_COMPLETION_TOOL_NAME || tool === PRP_BLOCK_TOOL_NAME) {
+      // Distinct RPC attempts cannot be associated with native parts by ID.
+      this.#terminalAttemptCount = Math.min(2, this.#terminalAttemptCount + 1);
       let settle: (() => void) | undefined;
       try {
         if (this.#closed || this.#completionSettlement)
@@ -1659,6 +1712,10 @@ class OpenCodeHarnessSession implements HarnessSession {
   }
 
   #emitAssistantPart(part: Record<string, unknown>, turnId: string): void {
+    if (turnId !== this.#activeTurnId) {
+      this.#emit("item.delta", {}, { turnId });
+      return;
+    }
     const partId = text(part.id, `${turnId}:part`);
     const partType = text(part.type, "unknown");
     const messageId = text(part.messageID, text(part.messageId)) || null;
@@ -1679,6 +1736,14 @@ class OpenCodeHarnessSession implements HarnessSession {
       // part from the same assistant message complete. Correlating by native
       // message identity selects that response while excluding both earlier
       // commentary messages and later acknowledgement-only messages.
+      if (this.#nativeTerminalBoundary === null) {
+        this.#nativeTerminalBoundary = {
+          messageId,
+          textBoundary: this.#completedTextParts.length,
+        };
+      } else if (this.#nativeTerminalBoundary.messageId !== messageId) {
+        this.#nativeTerminalAmbiguous = true;
+      }
       this.#semanticResultProviderMessageId = messageId;
     }
     for (const canonical of canonicalProviderEventsFromOpenCodePart(part)) {
@@ -1871,7 +1936,16 @@ class OpenCodeHarnessSession implements HarnessSession {
       part,
       index: this.#completedTextParts.indexOf(part),
     }));
-    const boundary = this.#semanticResultTextBoundary;
+    // Native completion order and controller acceptance order are independent.
+    // Only a single accepted attempt and one native message make association
+    // unambiguous; otherwise retain the established RPC-boundary fallback.
+    const boundary =
+      this.#resultTurnId === turnId &&
+      this.#terminalAttemptCount === 1 &&
+      !this.#nativeTerminalAmbiguous &&
+      this.#nativeTerminalBoundary !== null
+        ? this.#nativeTerminalBoundary.textBoundary
+        : this.#semanticResultTextBoundary;
     const beforeResult = indexed.filter(
       ({ index }) => boundary !== null && index < boundary,
     );
@@ -1970,6 +2044,7 @@ class OpenCodeHarnessSession implements HarnessSession {
 }
 
 async function startRuntime(input: {
+  ajvConstructor: Ajv2020Constructor;
   options: OpenCodeServerDriverOptions;
   root: string;
   cwd: string;
@@ -2009,6 +2084,7 @@ async function startRuntime(input: {
     throw error;
   }
   const bridge = await startOpenCodeMcpBridge({
+    ajvConstructor: input.ajvConstructor,
     tools: input.options.dynamicTools,
     handler: input.dispatch,
   }).catch(async (error) => {

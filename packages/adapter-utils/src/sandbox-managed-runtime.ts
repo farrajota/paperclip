@@ -56,6 +56,7 @@ import {
   type WorkspaceRestoreDiagnostic,
 } from "./workspace-restore-diagnostics.js";
 
+import { assertNativeWorkspaceOverlayAncestors } from "./sandbox-parent-guard.js";
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
   "node_modules",
@@ -985,17 +986,16 @@ async function captureWorkspaceSourceRoot(localDir: string): Promise<WorkspaceSo
   return { sourceDir, dev: stats.dev, ino: stats.ino };
 }
 
-function assertWorkspaceOverlayParentDirectory(
+async function assertWorkspaceOverlayParentDirectory(
   relative: string,
   sourceDir: string,
   segments: readonly string[],
   ancestorPaths: readonly string[],
 ): Promise<void> {
+  if (segments.length === 0) return;
+  if (ancestorPaths.length === segments.length &&
+      await assertNativeWorkspaceOverlayAncestors(ancestorPaths[ancestorPaths.length - 1]!, relative, segments.length)) return;
   return new Promise<void>((resolve, reject) => {
-    if (segments.length === 0) {
-      resolve();
-      return;
-    }
     let index = 0;
     let parentPath = sourceDir;
     const inspectNext = () => {
@@ -1011,7 +1011,6 @@ function assertWorkspaceOverlayParentDirectory(
         reject(error);
       }
     };
-    // Only one native request is outstanding, so its callback is pass-local.
     const inspectParent = (error: NodeJS.ErrnoException | null, stats: Stats) => {
       if (error) {
         reject(error);
