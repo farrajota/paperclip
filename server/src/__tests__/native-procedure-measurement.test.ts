@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { afterAll, describe, expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
@@ -112,7 +113,7 @@ describe("production native procedure instruction measurement", () => {
   });
 
   it("preserves the full catalog through the actual OpenCode MCP tools/list bridge", async () => {
-    const bridge = await startOpenCodeMcpBridge({ tools, handler: async () => { throw new Error("No tool execution in measurement"); } });
+    const bridge = await startOpenCodeMcpBridge({ ajvConstructor: Ajv2020, tools, handler: async () => { throw new Error("No tool execution in measurement"); } });
     try {
       const response = await fetch(bridge.url, { method: "POST", headers: { authorization: `Bearer ${bridge.secret}`, "content-type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }) });
