@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import * as gitSync from "./git-workspace-sync.js";
 import * as restoreMerge from "./workspace-restore-merge.js";
 import { getWorkspaceRestoreDiagnostic } from "./workspace-restore-diagnostics.js";
@@ -415,6 +415,15 @@ function recordingFilesystemClient(
     },
   };
 }
+
+// The restore merge resolves its lock root through a deferred import of
+// server-utils (kept lazy so snapshot workers avoid adapter launcher imports).
+// Under Vitest the first case to reach that path also paid that module's cold
+// load, measured at about 2-3s, inside its own 5000ms budget. Load it once here
+// so each case's deadline measures only the runtime behavior it asserts.
+beforeAll(async () => {
+  await import("./server-utils.js");
+});
 
 describe("sandbox managed runtime", () => {
   const cleanupDirs: string[] = [];
