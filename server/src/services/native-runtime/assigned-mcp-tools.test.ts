@@ -1,3 +1,4 @@
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { ToolGatewayHttpError, type ToolGatewayDescriptor, type ToolGatewayService } from "../tool-gateway.js";
@@ -25,7 +26,7 @@ describe("assigned MCP runner tools", () => {
       ...descriptor(`large_${i}`), parametersSchema: schema,
     })));
     const assigned = await createAssignedMcpTools({ ...f, delivery: "on_demand" });
-    const bridge = await startOpenCodeMcpBridge({ tools: assigned.definitions(), handler: call => assigned.execute(call) });
+    const bridge = await startOpenCodeMcpBridge({ tools: assigned.definitions(), handler: call => assigned.execute(call), ajvConstructor: Ajv2020 });
     let id = 0;
     const search = async (args: Record<string, unknown>) => {
       const response = await fetch(bridge.url, {

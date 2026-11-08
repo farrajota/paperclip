@@ -156,7 +156,9 @@ async function open(
       activeTurnId: null,
       lastSourceSequence: 0,
     };
-    const recovered = await driver.recoverSession(snapshot);
+    const recovered = await driver.recoverSession(snapshot, {
+      signal: AbortSignal.any([]),
+    });
     if (!recovered.recovered || !recovered.session)
       throw new Error(recovered.reason ?? "OpenCode recovery failed");
     session = recovered.session;

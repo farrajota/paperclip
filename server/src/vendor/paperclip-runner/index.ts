@@ -78,103 +78,237 @@ export type DurablePrpControlPlane =
 export type PaperclipSemanticDispatcher =
   import("@paperclipai/paperclip-runner").PaperclipSemanticDispatcher;
 
-const sourceUrl = new URL(
-  "../../../../packages/paperclip-runner/src/index.ts",
+const sourceRootUrl = new URL(
+  "../../../../packages/paperclip-runner/src/",
   import.meta.url,
 );
-const runner = (await import(sourceUrl.href)) as RunnerModule;
 
-export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
-export const RUNNER_PRP_PROTOCOL_MIN = runner.RUNNER_PRP_PROTOCOL_MIN;
-export const RUNNER_PRP_PROTOCOL_MAX = runner.RUNNER_PRP_PROTOCOL_MAX;
-export const runnerCodexDynamicToolsFit = runner.runnerCodexDynamicToolsFit;
-export const inspectWarmRunTransition = runner.inspectWarmRunTransition;
-export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
-export const readLinuxProcessStartedAt = runner.readLinuxProcessStartedAt;
+function loadRunnerSource<K extends keyof RunnerModule>(
+  relativePath: string,
+): Promise<Pick<RunnerModule, K>> {
+  return import(new URL(relativePath, sourceRootUrl).href) as Promise<
+    Pick<RunnerModule, K>
+  >;
+}
+
+const [
+  controlPlane,
+  runnerdTransport,
+  backendContracts,
+  semanticDispatcher,
+  semanticCatalog,
+  harnessContracts,
+  runtimeContext,
+  acpxRecovery,
+  backendFactory,
+  codexBackend,
+  authorizedTools,
+  sessionRuntime,
+  resultNormalization,
+  codexTurnDiff,
+  executionContracts,
+  questionContracts,
+  acpxProfiles,
+  replayContracts,
+  linuxProcessStart,
+  openCodeRecovery,
+  runnerBinary,
+  providerMode,
+  claudeEffort,
+  generatedProfiles,
+  codexCommand,
+  installationIntegrity,
+  profileInstallation,
+  remoteProviderPack,
+  externalProvider,
+  semanticReceipts,
+  configuredEnvironmentSource,
+] = await Promise.all([
+  loadRunnerSource<
+    | "inspectWarmRunTransition"
+    | "DurablePrpControlPlane"
+    | "RUNNER_PRP_PROTOCOL_MIN"
+    | "RUNNER_PRP_PROTOCOL_MAX"
+  >("control-plane/durable-prp-control-plane.ts"),
+  loadRunnerSource<
+    | "readRunnerdArtifactBinding"
+    | "retainedRunnerdMaintenanceIsIdle"
+    | "drainRetainedRunnerdMaintenanceOperations"
+    | "settleRetainedRunnerdSession"
+    | "runnerCodexDynamicToolsFit"
+    | "resolveSourceCodexHome"
+    | "defaultCapabilityRunnerdBinary"
+    | "createRunnerdCodexTransport"
+    | "probeNativeRunnerEnvironment"
+  >("live/runnerd-codex-transport.ts"),
+  loadRunnerSource<
+    | "nativeRestartInterruptedTurnId"
+    | "SemanticToolOutcomeUnknownError"
+    | "NativeSessionProtocolIntegrityError"
+    | "NativeSessionCleanupQuarantinedError"
+    | "NativeProviderTerminalFailure"
+  >("contracts/native-session-backend.ts"),
+  loadRunnerSource<"PaperclipSemanticDispatcher">("semantic-tools/paperclip-dispatcher.ts"),
+  loadRunnerSource<"CAPABILITY_SEMANTIC_TOOL_CATALOG">("semantic-tools/catalog.ts"),
+  loadRunnerSource<
+    | "HarnessRuntimeRequestResolutionError"
+    | "parseHarnessRuntimeRequestResolution"
+  >("contracts/harness-driver.ts"),
+  loadRunnerSource<
+    | "NATIVE_RUNTIME_ASSET_SCHEMA"
+    | "PAPERCLIP_EXECUTION_PROMPT"
+    | "PAPERCLIP_EXECUTION_PROMPT_REVISION"
+    | "canonicalNativeRuntimeContextDigest"
+    | "nativeRuntimePromptDigest"
+    | "parseNativeRuntimeContext"
+  >("contracts/runtime-context.ts"),
+  loadRunnerSource<"acpxRuntimeSessionDirectoryName">("drivers/acpx/recovery-identity.ts"),
+  loadRunnerSource<"createNativeSessionBackend">("backends/native-backend-factory.ts"),
+  loadRunnerSource<"describeRunnerdNativeSessionBackend">("backends/codex-native-backend.ts"),
+  loadRunnerSource<"createPaperclipRunnerAuthorizedToolSet">("semantic-tools/runner-authorized-tools.ts"),
+  loadRunnerSource<
+    | "completeRetainedNativeSessionCleanup"
+    | "completeTerminatedRemoteNativeSessionCleanup"
+    | "completeTerminatedLocalNativeSessionCleanup"
+    | "applyNativeSessionGoalControl"
+    | "executeNativeSession"
+  >("native-session-runtime.ts"),
+  loadRunnerSource<"normalizePrpResultSignals">("protocol/result-normalization.ts"),
+  loadRunnerSource<"parseCodexTurnDiff">("drivers/codex/codex-turn-diff.ts"),
+  loadRunnerSource<"parseNativeExecutionInput" | "buildNativeModelEnvelope">("contracts/native-execution.ts"),
+  loadRunnerSource<
+    | "parsePaperclipQuestionSet"
+    | "parsePaperclipQuestionResponse"
+  >("contracts/question-set.ts"),
+  loadRunnerSource<
+    | "resolveQualifiedAcpxProfile"
+    | "QUALIFIED_ACPX_PROFILES"
+    | "QUALIFIED_ACPX_VERSION"
+  >("drivers/acpx/qualified-profiles.ts"),
+  loadRunnerSource<
+    | "validatePrpEvent"
+    | "validatePrpStructuredRunResult"
+  >("protocol/replay-contract.ts"),
+  loadRunnerSource<"readLinuxProcessStartedAt">("live/linux-process-start.ts"),
+  loadRunnerSource<
+    | "OPENCODE_ISOLATED_HOMES_DIRECTORY"
+    | "opencodeRuntimeSessionDirectoryName"
+  >("drivers/opencode/opencode-server-driver.ts"),
+  loadRunnerSource<"runnerBinaryTarget">("live/runner-binary.ts"),
+  loadRunnerSource<"isProviderMode">("contracts/provider-mode.ts"),
+  loadRunnerSource<"resolveClaudeEffort">("drivers/acpx/claude-effort.ts"),
+  loadRunnerSource<"CURSOR_DISTRIBUTION_PINS">("drivers/acpx/generated-profiles.ts"),
+  loadRunnerSource<"resolveCodexCommand" | "resolvePinnedCodexCommand">("drivers/codex/codex-command.ts"),
+  loadRunnerSource<"probeAcpxClaudeInstallation" | "probeAcpxGrokInstallation">("drivers/acpx/installation-integrity.ts"),
+  loadRunnerSource<"probeAcpxPiInstallation">("drivers/acpx/profile-installation.ts"),
+  loadRunnerSource<
+    | "PROVIDER_PACK_COMPATIBILITY"
+    | "bundledRemoteProviderPackManifestPath"
+    | "bundledRemoteRunnerBinary"
+  >("live/bundled-remote-provider-pack.ts"),
+  loadRunnerSource<"externalOperationDigest">("contracts/external-provider.ts"),
+  loadRunnerSource<"digestPaperclipSemanticContent">("semantic-tools/receipts.ts"),
+  loadRunnerSource<
+    | "CONFIGURED_ENVIRONMENT_KEYS"
+    | "GENERATED_RUNTIME_ENVIRONMENT_KEYS"
+    | "configuredEnvironmentProjection"
+    | "configuredEnvironment"
+  >("configured-environment.ts"),
+  // Preserve canonical operation validation without loading unused aggregate APIs.
+  import(new URL("catalog/canonical-operations.ts", sourceRootUrl).href),
+]);
+
+export const DurablePrpControlPlane = controlPlane.DurablePrpControlPlane;
+export const RUNNER_PRP_PROTOCOL_MIN = controlPlane.RUNNER_PRP_PROTOCOL_MIN;
+export const RUNNER_PRP_PROTOCOL_MAX = controlPlane.RUNNER_PRP_PROTOCOL_MAX;
+export const runnerCodexDynamicToolsFit = runnerdTransport.runnerCodexDynamicToolsFit;
+export const inspectWarmRunTransition = controlPlane.inspectWarmRunTransition;
+export const readRunnerdArtifactBinding = runnerdTransport.readRunnerdArtifactBinding;
+export const readLinuxProcessStartedAt = linuxProcessStart.readLinuxProcessStartedAt;
 export const NativeSessionCleanupQuarantinedError =
-  runner.NativeSessionCleanupQuarantinedError;
+  backendContracts.NativeSessionCleanupQuarantinedError;
 export const NativeSessionProtocolIntegrityError =
-  runner.NativeSessionProtocolIntegrityError;
-export const SemanticToolOutcomeUnknownError = runner.SemanticToolOutcomeUnknownError;
-export const PaperclipSemanticDispatcher = runner.PaperclipSemanticDispatcher;
+  backendContracts.NativeSessionProtocolIntegrityError;
+export const SemanticToolOutcomeUnknownError = backendContracts.SemanticToolOutcomeUnknownError;
+export const PaperclipSemanticDispatcher = semanticDispatcher.PaperclipSemanticDispatcher;
 export const CAPABILITY_SEMANTIC_TOOL_CATALOG =
-  runner.CAPABILITY_SEMANTIC_TOOL_CATALOG;
+  semanticCatalog.CAPABILITY_SEMANTIC_TOOL_CATALOG;
 export const HarnessRuntimeRequestResolutionError =
-  runner.HarnessRuntimeRequestResolutionError;
-export const NATIVE_RUNTIME_ASSET_SCHEMA = runner.NATIVE_RUNTIME_ASSET_SCHEMA;
-export const PAPERCLIP_EXECUTION_PROMPT = runner.PAPERCLIP_EXECUTION_PROMPT;
+  harnessContracts.HarnessRuntimeRequestResolutionError;
+export const NATIVE_RUNTIME_ASSET_SCHEMA = runtimeContext.NATIVE_RUNTIME_ASSET_SCHEMA;
+export const PAPERCLIP_EXECUTION_PROMPT = runtimeContext.PAPERCLIP_EXECUTION_PROMPT;
 export const PAPERCLIP_EXECUTION_PROMPT_REVISION =
-  runner.PAPERCLIP_EXECUTION_PROMPT_REVISION;
+  runtimeContext.PAPERCLIP_EXECUTION_PROMPT_REVISION;
 export const acpxRuntimeSessionDirectoryName =
-  runner.acpxRuntimeSessionDirectoryName;
+  acpxRecovery.acpxRuntimeSessionDirectoryName;
 export const OPENCODE_ISOLATED_HOMES_DIRECTORY =
-  runner.OPENCODE_ISOLATED_HOMES_DIRECTORY;
+  openCodeRecovery.OPENCODE_ISOLATED_HOMES_DIRECTORY;
 export const opencodeRuntimeSessionDirectoryName =
-  runner.opencodeRuntimeSessionDirectoryName;
+  openCodeRecovery.opencodeRuntimeSessionDirectoryName;
 export const canonicalNativeRuntimeContextDigest =
-  runner.canonicalNativeRuntimeContextDigest;
-export const createNativeSessionBackend = runner.createNativeSessionBackend;
-export const describeRunnerdNativeSessionBackend = runner.describeRunnerdNativeSessionBackend;
+  runtimeContext.canonicalNativeRuntimeContextDigest;
+export const createNativeSessionBackend = backendFactory.createNativeSessionBackend;
+export const describeRunnerdNativeSessionBackend = codexBackend.describeRunnerdNativeSessionBackend;
 export const createPaperclipRunnerAuthorizedToolSet =
-  runner.createPaperclipRunnerAuthorizedToolSet;
+  authorizedTools.createPaperclipRunnerAuthorizedToolSet;
 export const createRunnerdCodexTransport: (
   options?: import("@paperclipai/paperclip-runner").RunnerdCodexTransportOptions,
 ) => import("@paperclipai/paperclip-runner").RunnerdCodexTransport =
-  runner.createRunnerdCodexTransport;
+  runnerdTransport.createRunnerdCodexTransport;
 export const defaultCapabilityRunnerdBinary =
-  runner.defaultCapabilityRunnerdBinary;
-export const runnerBinaryTarget = runner.runnerBinaryTarget;
-export const executeNativeSession = runner.executeNativeSession;
+  runnerdTransport.defaultCapabilityRunnerdBinary;
+export const runnerBinaryTarget = runnerBinary.runnerBinaryTarget;
+export const executeNativeSession = sessionRuntime.executeNativeSession;
 export const applyNativeSessionGoalControl =
-  runner.applyNativeSessionGoalControl;
-export const completeRetainedNativeSessionCleanup = runner.completeRetainedNativeSessionCleanup;
-export const settleRetainedRunnerdSession = runner.settleRetainedRunnerdSession;
+  sessionRuntime.applyNativeSessionGoalControl;
+export const completeRetainedNativeSessionCleanup = sessionRuntime.completeRetainedNativeSessionCleanup;
+export const settleRetainedRunnerdSession = runnerdTransport.settleRetainedRunnerdSession;
 export const retainedRunnerdMaintenanceIsIdle =
-  runner.retainedRunnerdMaintenanceIsIdle;
+  runnerdTransport.retainedRunnerdMaintenanceIsIdle;
 export const drainRetainedRunnerdMaintenanceOperations =
-  runner.drainRetainedRunnerdMaintenanceOperations;
-export const nativeRuntimePromptDigest = runner.nativeRuntimePromptDigest;
-export const normalizePrpResultSignals = runner.normalizePrpResultSignals;
-export const parseCodexTurnDiff = runner.parseCodexTurnDiff;
+  runnerdTransport.drainRetainedRunnerdMaintenanceOperations;
+export const nativeRuntimePromptDigest = runtimeContext.nativeRuntimePromptDigest;
+export const normalizePrpResultSignals = resultNormalization.normalizePrpResultSignals;
+export const parseCodexTurnDiff = codexTurnDiff.parseCodexTurnDiff;
 export const parseHarnessRuntimeRequestResolution =
-  runner.parseHarnessRuntimeRequestResolution;
-export const parseNativeExecutionInput = runner.parseNativeExecutionInput;
-export const buildNativeModelEnvelope = runner.buildNativeModelEnvelope;
-export const isProviderMode = runner.isProviderMode;
-export const parseNativeRuntimeContext = runner.parseNativeRuntimeContext;
-export const parsePaperclipQuestionSet = runner.parsePaperclipQuestionSet;
+  harnessContracts.parseHarnessRuntimeRequestResolution;
+export const parseNativeExecutionInput = executionContracts.parseNativeExecutionInput;
+export const buildNativeModelEnvelope = executionContracts.buildNativeModelEnvelope;
+export const isProviderMode = providerMode.isProviderMode;
+export const parseNativeRuntimeContext = runtimeContext.parseNativeRuntimeContext;
+export const parsePaperclipQuestionSet = questionContracts.parsePaperclipQuestionSet;
 export const parsePaperclipQuestionResponse =
-  runner.parsePaperclipQuestionResponse;
-export const resolveQualifiedAcpxProfile = runner.resolveQualifiedAcpxProfile;
-export const resolveClaudeEffort = runner.resolveClaudeEffort;
-export const QUALIFIED_ACPX_PROFILES = runner.QUALIFIED_ACPX_PROFILES;
-export const QUALIFIED_ACPX_VERSION = runner.QUALIFIED_ACPX_VERSION;
-export const CURSOR_DISTRIBUTION_PINS = runner.CURSOR_DISTRIBUTION_PINS;
-export const resolveSourceCodexHome = runner.resolveSourceCodexHome;
-export const resolveCodexCommand = runner.resolveCodexCommand;
-export const resolvePinnedCodexCommand = runner.resolvePinnedCodexCommand;
-export const validatePrpEvent = runner.validatePrpEvent;
+  questionContracts.parsePaperclipQuestionResponse;
+export const resolveQualifiedAcpxProfile = acpxProfiles.resolveQualifiedAcpxProfile;
+export const resolveClaudeEffort = claudeEffort.resolveClaudeEffort;
+export const QUALIFIED_ACPX_PROFILES = acpxProfiles.QUALIFIED_ACPX_PROFILES;
+export const QUALIFIED_ACPX_VERSION = acpxProfiles.QUALIFIED_ACPX_VERSION;
+export const CURSOR_DISTRIBUTION_PINS = generatedProfiles.CURSOR_DISTRIBUTION_PINS;
+export const resolveSourceCodexHome = runnerdTransport.resolveSourceCodexHome;
+export const resolveCodexCommand = codexCommand.resolveCodexCommand;
+export const resolvePinnedCodexCommand = codexCommand.resolvePinnedCodexCommand;
+export const validatePrpEvent = replayContracts.validatePrpEvent;
 export const validatePrpStructuredRunResult =
-  runner.validatePrpStructuredRunResult;
+  replayContracts.validatePrpStructuredRunResult;
 
-export const NativeProviderTerminalFailure = runner.NativeProviderTerminalFailure;
-export const nativeRestartInterruptedTurnId = runner.nativeRestartInterruptedTurnId;
+export const NativeProviderTerminalFailure = backendContracts.NativeProviderTerminalFailure;
+export const nativeRestartInterruptedTurnId = backendContracts.nativeRestartInterruptedTurnId;
 
-export const completeTerminatedRemoteNativeSessionCleanup = runner.completeTerminatedRemoteNativeSessionCleanup;
-export const completeTerminatedLocalNativeSessionCleanup = runner.completeTerminatedLocalNativeSessionCleanup;
+export const completeTerminatedRemoteNativeSessionCleanup = sessionRuntime.completeTerminatedRemoteNativeSessionCleanup;
+export const completeTerminatedLocalNativeSessionCleanup = sessionRuntime.completeTerminatedLocalNativeSessionCleanup;
 
-export const probeAcpxClaudeInstallation = runner.probeAcpxClaudeInstallation;
-export const probeAcpxGrokInstallation = runner.probeAcpxGrokInstallation;
-export const probeAcpxPiInstallation = runner.probeAcpxPiInstallation;
-export const PROVIDER_PACK_COMPATIBILITY = runner.PROVIDER_PACK_COMPATIBILITY;
-export const bundledRemoteProviderPackManifestPath = runner.bundledRemoteProviderPackManifestPath;
-export const bundledRemoteRunnerBinary = runner.bundledRemoteRunnerBinary;
+export const probeAcpxClaudeInstallation = installationIntegrity.probeAcpxClaudeInstallation;
+export const probeAcpxGrokInstallation = installationIntegrity.probeAcpxGrokInstallation;
+export const probeAcpxPiInstallation = profileInstallation.probeAcpxPiInstallation;
+export const PROVIDER_PACK_COMPATIBILITY = remoteProviderPack.PROVIDER_PACK_COMPATIBILITY;
+export const bundledRemoteProviderPackManifestPath = remoteProviderPack.bundledRemoteProviderPackManifestPath;
+export const bundledRemoteRunnerBinary = remoteProviderPack.bundledRemoteRunnerBinary;
 
-export const externalOperationDigest = runner.externalOperationDigest;
-export const digestPaperclipSemanticContent = runner.digestPaperclipSemanticContent;
-export const CONFIGURED_ENVIRONMENT_KEYS = runner.CONFIGURED_ENVIRONMENT_KEYS;
-export const GENERATED_RUNTIME_ENVIRONMENT_KEYS = runner.GENERATED_RUNTIME_ENVIRONMENT_KEYS;
-export const configuredEnvironmentProjection = runner.configuredEnvironmentProjection;
-export const configuredEnvironment = runner.configuredEnvironment;
+export const externalOperationDigest = externalProvider.externalOperationDigest;
+export const digestPaperclipSemanticContent = semanticReceipts.digestPaperclipSemanticContent;
+export const CONFIGURED_ENVIRONMENT_KEYS = configuredEnvironmentSource.CONFIGURED_ENVIRONMENT_KEYS;
+export const GENERATED_RUNTIME_ENVIRONMENT_KEYS = configuredEnvironmentSource.GENERATED_RUNTIME_ENVIRONMENT_KEYS;
+export const configuredEnvironmentProjection = configuredEnvironmentSource.configuredEnvironmentProjection;
+export const configuredEnvironment = configuredEnvironmentSource.configuredEnvironment;
 
-export const probeNativeRunnerEnvironment = runner.probeNativeRunnerEnvironment;
+export const probeNativeRunnerEnvironment = runnerdTransport.probeNativeRunnerEnvironment;

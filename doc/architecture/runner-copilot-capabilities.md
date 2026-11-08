@@ -1,6 +1,15 @@
 # Copilot 1.0.88 rich ACP capability audit
 
-Current source declaration (2026-10-26): **Copilot profile v61** binds controller
+Current source declaration (2026-11-08): **Copilot profile v62** binds the
+merged Runner tool bridge, which now requires its Ajv2020 schema compiler, and
+the merged runtime host and adapter admission paths. Its digest is
+`sha256:372d646aebe76157b832c3bf81afd07ec8649e5c0b5ee2954a3956feedb25b0f`.
+The v61 declaration remains unchanged and readable as history. This source
+identity update changes no Copilot executable, arguments, permission policy,
+tool receipts, or qualification flags. Offline compatibility checks supply no
+new live qualification; prior live outcomes retain their original identities.
+
+Historical source declaration (2026-10-26): **Copilot profile v61** binds controller
 journal retirement and the historical profile decoder. Its digest is
 `sha256:956276ebee59f880249fa6955adc224af9ca7b6a9da59bcc5da4a8667550c5b3`.
 The v60 declaration remains unchanged and readable as history. This source

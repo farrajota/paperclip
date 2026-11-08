@@ -719,7 +719,8 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
     const app = createApp(companyId);
     // Filling the cache can take longer than its five-second expiry on CI.
     // Keep entries alive so this test measures capacity eviction alone.
-    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const cacheNow = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(cacheNow);
     try {
       for (let index = 0; index < ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES + 5; index += 1) {
         const res = await request(app)
@@ -733,6 +734,7 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
       clock.mockRestore();
     }
   });
+
 
   it("logs request_storm_detected for identical in-flight compact issue-list fanout without query values", async () => {
     const companyId = randomUUID();

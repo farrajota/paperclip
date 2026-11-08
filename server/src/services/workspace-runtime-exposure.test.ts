@@ -121,8 +121,73 @@ http.createServer((rq, r) => { if (health(rq, r)) return; r.statusCode = 200; r.
 const hmr = http.createServer((_, r) => { r.statusCode = 426; r.end(); });
 hmr.listen(p + 10000, () => {
   const address = hmr.address();
+  let bindAddressClass = "unknown";
+  let processGroupRelationship = "unknown";
+  let listenRow = "unknown";
+  let socketFd = "unknown";
   try {
-    fs.writeFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "wildcard-hmr-bind.json"), JSON.stringify({ bindCompleted: true, addressFamily: address && typeof address === "object" ? address.family : null, port: address && typeof address === "object" ? address.port : null }));
+    const addressText = address && typeof address === "object" ? address.address : null;
+    if (typeof addressText === "string") {
+      bindAddressClass = addressText === "0.0.0.0" || addressText === "::" ? "wildcard"
+        : addressText === "::1" || /^127\\./.test(addressText) ? "loopback" : "other";
+    }
+  } catch {}
+  try {
+    const stat = fs.readFileSync("/proc/self/stat", "utf8");
+    const close = stat.lastIndexOf(")");
+    const fields = close >= 0 ? stat.slice(close + 2).trim().split(/\\s+/) : [];
+    const selfPid = Number(stat.slice(0, stat.indexOf(" ")));
+    const parentPid = Number(fields[1]);
+    const processGroup = Number(fields[2]);
+    if ([selfPid, parentPid, processGroup].every(Number.isSafeInteger) && selfPid > 0 && parentPid >= 0 && processGroup > 0) {
+      processGroupRelationship = processGroup === selfPid ? "self" : processGroup === parentPid ? "parent" : "other";
+    }
+  } catch {}
+  try {
+    if (!address || typeof address !== "object" || !Number.isInteger(address.port) || address.port !== p + 10000
+      || (address.family !== "IPv4" && address.family !== "IPv6")) throw new Error();
+    const table = address.family === "IPv4" ? "/proc/self/net/tcp" : "/proc/self/net/tcp6";
+    const text = fs.readFileSync(table, "utf8");
+    const lines = text.split("\\n").slice(1);
+    const wantPort = address.port.toString(16).toUpperCase().padStart(4, "0");
+    const rows = [];
+    const addressDigits = address.family === "IPv4" ? 8 : 32;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const columns = line.trim().split(/\\s+/);
+      const local = columns[1]?.split(":");
+      if (columns.length < 10 || local?.length !== 2 || !new RegExp("^[0-9A-Fa-f]{" + addressDigits + "}$").test(local[0])
+        || !/^[0-9A-Fa-f]{4}$/.test(local[1]) || !/^[0-9A-Fa-f]{2}$/.test(columns[3])) {
+        listenRow = "unknown"; socketFd = "unknown"; throw new Error();
+      }
+      if (columns[3] !== "0A" || local[1].toUpperCase() !== wantPort) continue;
+      if (!/^[1-9]\\d*$/.test(columns[9])) { listenRow = "unknown"; socketFd = "unknown"; throw new Error(); }
+      rows.push(columns[9]);
+    }
+    if (rows.length === 0) { listenRow = "not_found"; socketFd = "not_found"; }
+    else if (rows.length !== 1) { listenRow = "unknown"; socketFd = "unknown"; }
+    else {
+      listenRow = "found";
+      const inode = rows[0];
+      const entries = fs.readdirSync("/proc/self/fd");
+      const bounded = entries.slice(0, 64);
+      let matched = false;
+      let unreadable = false;
+      for (const entry of bounded) {
+        try {
+          if (fs.readlinkSync(path.join("/proc/self/fd", entry)) === "socket:[" + inode + "]") { matched = true; break; }
+        } catch { unreadable = true; }
+      }
+      socketFd = matched ? "matched" : entries.length > 64 ? "truncated" : unreadable ? "unavailable" : "not_found";
+    }
+  } catch (error) {
+    if (error && ["ENOENT", "EACCES", "EPERM", "EIO", "EMFILE", "ENFILE"].includes(error.code)) {
+      if (listenRow === "found") socketFd = "unavailable";
+      else { listenRow = "unavailable"; socketFd = "unavailable"; }
+    }
+  }
+  try {
+    fs.writeFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "wildcard-hmr-bind.json"), JSON.stringify({ bindCompleted: true, addressFamily: address && typeof address === "object" ? address.family : null, port: address && typeof address === "object" ? address.port : null, bindAddressClass, processGroupRelationship, listenRow, socketFd }));
   } catch {}
 });
 setInterval(() => {}, 1000);
@@ -783,6 +848,10 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
 
     const ownerOutcomes = new Map<number, "known" | "unknown">();
     const presenceOutcomes = new Map<number, "present-loopback" | "present-nonloopback" | "absent" | "unknown">();
+    const ownerPidByPort = new Map<number, number>();
+    type ProcessOwnershipOutcome = "owned" | "not_owned" | "unknown";
+    type OwnershipFirstLast = { first: ProcessOwnershipOutcome | null; last: ProcessOwnershipOutcome | null };
+    const processOwnershipByPort = new Map<number, OwnershipFirstLast>();
     type ProcTable = "tcp" | "tcp6";
     type ErrorCategory = "ENOENT" | "EACCES" | "EPERM" | "ENOSYS" | "EIO" | "EMFILE" | "ENFILE" | "EAGAIN" | "ETIMEDOUT" | "OTHER" | "NONE";
     type TimedOutcome = { outcome: "success" | "failure" | "known" | "unknown" | "rejected"; errorCategory: ErrorCategory; reason: "not_exposed" | null; startedAtMs: number; durationMs: number };
@@ -855,6 +924,7 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
     syncBuiltinESMExports();
     const originalOwnerLookup = localServiceSupervisor.readLocalServicePortOwner;
     const originalPresenceLookup = listenerBindModule.readListenerBindFacts;
+    const originalProcessOwnershipLookup = localServiceSupervisor.isLocalServiceProcessOwnedBy;
     const ownerSpy = vi.spyOn(localServiceSupervisor, "readLocalServicePortOwner").mockImplementation(async (port) => {
       const startedAtMs = monotonicMs();
       let slots: FirstLast | undefined;
@@ -868,6 +938,7 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
       try {
         const owner = await originalOwnerLookup(port);
         if (allocatedPorts.has(port)) {
+          if (typeof owner === "number" && Number.isSafeInteger(owner) && owner > 0) ownerPidByPort.set(port, owner);
           ownerOutcomes.set(port, owner === null ? "unknown" : "known");
           observeTiming(slots!, owner === null ? "unknown" : "known", "NONE", startedAtMs, owner === null ? "not_exposed" : null);
         }
@@ -890,6 +961,27 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
         throw error;
       }
     });
+    const processOwnershipSpy = vi.spyOn(localServiceSupervisor, "isLocalServiceProcessOwnedBy").mockImplementation(async (pid, ownerProcessId) => {
+      const matchingPort = [...ownerPidByPort].find(([, ownerPid]) => ownerPid === pid)?.[0];
+      if (matchingPort === undefined) return originalProcessOwnershipLookup(pid, ownerProcessId);
+      let slots = processOwnershipByPort.get(matchingPort);
+      if (!slots) {
+        slots = { first: null, last: null };
+        processOwnershipByPort.set(matchingPort, slots);
+      }
+      try {
+        const result = await originalProcessOwnershipLookup(pid, ownerProcessId);
+        const outcome = result === true ? "owned" : result === false ? "not_owned" : "unknown";
+        if (slots.first === null) slots.first = outcome;
+        slots.last = outcome;
+        return result;
+      } catch (error) {
+        if (slots.first === null) slots.first = "unknown";
+        slots.last = "unknown";
+        throw error;
+      }
+    });
+    syncBuiltinESMExports();
     const error = await startRuntimeServicesForWorkspaceControl(startInput({
       serviceName: "paperclip-dev",
       command: `${guestCommand("dev-runner-wildcard-hmr.mjs")} --bind lan`,
@@ -897,12 +989,21 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
       port: { type: "auto", envKey: "PORT" },
     })).then(() => null, (err: unknown) => err as Error).finally(() => {
       ownerSpy.mockRestore();
+      processOwnershipSpy.mockRestore();
       presenceSpy.mockRestore();
       tableReadSpy.mockRestore();
       syncBuiltinESMExports();
     });
 
-    type GuestBindRecord = { bindCompleted: true; addressFamily: string | null; port: number | null };
+    type GuestBindRecord = {
+      bindCompleted: true;
+      addressFamily: string | null;
+      port: number | null;
+      bindAddressClass: "wildcard" | "loopback" | "other" | "unknown";
+      processGroupRelationship: "self" | "parent" | "other" | "unknown";
+      listenRow: "found" | "not_found" | "unavailable" | "unknown";
+      socketFd: "matched" | "not_found" | "unavailable" | "truncated" | "unknown";
+    };
     let guestBind: GuestBindRecord | null = null;
     try {
       guestBind = JSON.parse(await fs.readFile(path.join(guestDir, "wildcard-hmr-bind.json"), "utf8")) as GuestBindRecord;
@@ -936,6 +1037,18 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
       })),
     };
     console.log(JSON.stringify(timingRecord));
+    const subjectQualification = {
+      event: "native_hmr_subject_qualification",
+      bindAddressClass: guestBind && ["wildcard", "loopback", "other", "unknown"].includes(guestBind.bindAddressClass) ? guestBind.bindAddressClass : "unknown",
+      processGroupRelationship: guestBind && ["self", "parent", "other", "unknown"].includes(guestBind.processGroupRelationship) ? guestBind.processGroupRelationship : "unknown",
+      listenRow: guestBind && ["found", "not_found", "unavailable", "unknown"].includes(guestBind.listenRow) ? guestBind.listenRow : "unknown",
+      socketFdIdentity: guestBind && ["matched", "not_found", "unavailable", "truncated", "unknown"].includes(guestBind.socketFd) ? guestBind.socketFd : "unknown",
+      processOwnership: ports.map((port) => {
+        const outcomes = processOwnershipByPort.get(port);
+        return { first: outcomes?.first ?? "unknown", last: outcomes?.last ?? "unknown" };
+      }),
+    };
+    console.log(JSON.stringify(subjectQualification));
 
     expect(error).not.toBeNull();
     expect(error!.message).toContain("listener_ownership_mismatch");

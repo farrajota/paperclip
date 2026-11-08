@@ -179,26 +179,30 @@ async function closeLateCredentialLease(value: unknown): Promise<void> {
 }
 
 afterEach(async () => {
-  for (const controller of admissionControllers.splice(0)) {
-    if (!controller.signal.aborted) {
-      controller.abort(new Error("ACPX runtime host test cleanup"));
+  try {
+    for (const controller of admissionControllers.splice(0)) {
+      if (!controller.signal.aborted) {
+        controller.abort(new Error("ACPX runtime host test cleanup"));
+      }
     }
+    await Promise.all([...pendingAdmissionOpenings]);
+    await Promise.all([...pendingAdmissionCleanups]);
+    // Release every sealed skills tree before the plain `rm` below. `rm` does
+    // not restore write permission, so a tree still sealed at this point would
+    // otherwise fail with EACCES and hide the real test failure.
+    // Cancelled opens can reuse one home. Parallel cleanup must visit it once.
+    await Promise.all(
+      [...new Set(materializedSkillsHomes.splice(0))]
+        .map((skillsHome) => releaseMaterializedNativeRuntimeSkills(skillsHome)),
+    );
+    await Promise.all(
+      temporaryDirectories
+        .splice(0)
+        .map((directory) => rm(directory, { force: true, recursive: true })),
+    );
+  } finally {
+    vi.doUnmock("ajv/dist/2020.js");
   }
-  await Promise.all([...pendingAdmissionOpenings]);
-  await Promise.all([...pendingAdmissionCleanups]);
-  // Release every sealed skills tree before the plain `rm` below. `rm` does
-  // not restore write permission, so a tree still sealed at this point would
-  // otherwise fail with EACCES and hide the real test failure.
-  // Cancelled opens can reuse one home. Parallel cleanup must visit it once.
-  await Promise.all(
-    [...new Set(materializedSkillsHomes.splice(0))]
-      .map((skillsHome) => releaseMaterializedNativeRuntimeSkills(skillsHome)),
-  );
-  await Promise.all(
-    temporaryDirectories
-      .splice(0)
-      .map((directory) => rm(directory, { force: true, recursive: true })),
-  );
 });
 
 describe("ACPX runtime host", () => {
@@ -305,6 +309,143 @@ describe("ACPX runtime host", () => {
     expect(await readFile(auth, "utf8")).toBe('{"user_owned":true}');
   });
 
+  it("propagates canonical AJV namespace rejection before ACPX recovery binding", async () => {
+    const fixture = await hostFixture();
+    const namespaceError = new Error("canonical AJV namespace unavailable");
+    const { promise: factoryEntered, resolve: enterFactory } = Promise.withResolvers<void>();
+    vi.doMock("ajv/dist/2020.js", () => {
+      enterFactory();
+      return Object.defineProperty({}, "then", { get: () => { throw namespaceError; } });
+    });
+    const openRuntime = vi.fn();
+    const dependencies = fixture.dependencies({ openRuntime });
+    const verifyInstallation = vi.spyOn(dependencies, "verifyInstallation");
+    try {
+      const opening = AcpxRuntimeHost.open({
+        ...fixture.options,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        permissionMode: "approve-reads",
+        semanticTools: { tools: [], handler: async () => ({}) },
+      }, dependencies);
+      await factoryEntered;
+      await expect(opening).rejects.toBe(namespaceError);
+      expect(openRuntime).not.toHaveBeenCalled();
+      expect(verifyInstallation).not.toHaveBeenCalled();
+      await expect(readdir(fixture.options.runtimeDirectory)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("preserves a pre-aborted ACPX operation before compiler import", async () => {
+    const fixture = await hostFixture();
+    const abortReason = new Error("ACPX operation pre-aborted");
+    const controller = new AbortController();
+    controller.abort(abortReason);
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      throw new Error("pre-aborted admission must not import AJV");
+    });
+    const openRuntime = vi.fn();
+    const dependencies = fixture.dependencies({ openRuntime });
+    const verifyInstallation = vi.spyOn(dependencies, "verifyInstallation");
+    try {
+      await expect(AcpxRuntimeHost.open({
+        ...fixture.options,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        permissionMode: "approve-reads",
+        semanticTools: { tools: [], handler: async () => ({}) },
+        signal: controller.signal,
+      }, dependencies)).rejects.toBe(abortReason);
+      expect(factoryStarted).toBe(false);
+      expect(verifyInstallation).not.toHaveBeenCalled();
+      expect(openRuntime).not.toHaveBeenCalled();
+      await expect(readdir(fixture.options.runtimeDirectory)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("cancels pending ACPX AJV admission and observes a late namespace rejection", async () => {
+    const fixture = await hostFixture();
+    const gate = Promise.withResolvers<Record<string, unknown>>();
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const removeAbortListener = vi.spyOn(controller.signal, "removeEventListener");
+    const abortReason = new Error("ACPX compiler admission cancelled");
+    const openRuntime = vi.fn();
+    const dependencies = fixture.dependencies({ openRuntime });
+    const verifyInstallation = vi.spyOn(dependencies, "verifyInstallation");
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const opening = AcpxRuntimeHost.open({
+        ...fixture.options,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        permissionMode: "approve-reads",
+        semanticTools: { tools: [], handler: async () => ({}) },
+        signal: controller.signal,
+      }, dependencies);
+      await vi.waitFor(() => expect(factoryStarted).toBe(true));
+      controller.abort(abortReason);
+      await expect(opening).rejects.toBe(abortReason);
+      gate.reject(new Error("late ACPX AJV namespace failure"));
+      const nextTurn = Promise.withResolvers<void>();
+      setImmediate(nextTurn.resolve);
+      await nextTurn.promise;
+      expect(removeAbortListener).toHaveBeenCalledWith("abort", expect.any(Function));
+      expect(unhandledRejections).toEqual([]);
+      expect(openRuntime).not.toHaveBeenCalled();
+      expect(verifyInstallation).not.toHaveBeenCalled();
+      await expect(readdir(fixture.options.runtimeDirectory)).resolves.toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("lets same-turn ACPX cancellation win over namespace settlement", async () => {
+    const fixture = await hostFixture();
+    const gate = Promise.withResolvers<Record<string, unknown>>();
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const abortReason = new Error("ACPX same-turn admission cancelled");
+    const openRuntime = vi.fn();
+    const dependencies = fixture.dependencies({ openRuntime });
+    const verifyInstallation = vi.spyOn(dependencies, "verifyInstallation");
+    try {
+      const opening = AcpxRuntimeHost.open({
+        ...fixture.options,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        permissionMode: "approve-reads",
+        semanticTools: { tools: [], handler: async () => ({}) },
+        signal: controller.signal,
+      }, dependencies);
+      await vi.waitFor(() => expect(factoryStarted).toBe(true));
+      gate.resolve({ Ajv2020: class {} });
+      controller.abort(abortReason);
+      await expect(opening).rejects.toBe(abortReason);
+      expect(openRuntime).not.toHaveBeenCalled();
+      expect(verifyInstallation).not.toHaveBeenCalled();
+      await expect(readdir(fixture.options.runtimeDirectory)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
   it.each([
     { PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned" },
     { PAPERCLIP_NATIVE_MCP_NAME: "paperclip", PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1:3211/mcp", PAPERCLIP_NATIVE_MCP_TOKEN: "x".repeat(40) },

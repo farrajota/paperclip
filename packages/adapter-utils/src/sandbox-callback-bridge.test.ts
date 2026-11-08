@@ -178,6 +178,7 @@ describe("sandbox callback bridge", () => {
   }
 
   afterEach(async () => {
+    vi.useRealTimers();
     while (cleanupFns.length > 0) {
       const cleanup = cleanupFns.pop();
       if (!cleanup) continue;
@@ -545,21 +546,58 @@ describe("sandbox callback bridge", () => {
     });
   });
 
-  it("drains already-queued requests on stop", async () => {
+  it("drains queued requests after an idle poll completes with a stale empty listing on stop", async () => {
+    vi.useFakeTimers();
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-drain-"));
     cleanupDirs.push(rootDir);
 
     const queueDir = path.posix.join(rootDir, "queue");
     const directories = sandboxCallbackBridgeDirectories(queueDir);
     const processed: string[] = [];
-
+    let pollCount = 0;
+    let signalFirstPoll!: () => void;
+    const firstPoll = new Promise<void>((resolve) => {
+      signalFirstPoll = resolve;
+    });
+    let signalSecondPoll!: () => void;
+    const secondPoll = new Promise<void>((resolve) => {
+      signalSecondPoll = resolve;
+    });
+    let finishStalePoll!: () => void;
+    const stalePollFinished = new Promise<void>((resolve) => {
+      finishStalePoll = resolve;
+    });
+    let releaseFirstRequest!: () => void;
+    const firstRequestReleased = new Promise<void>((resolve) => {
+      releaseFirstRequest = resolve;
+    });
+    const baseClient = createFileSystemSandboxCallbackBridgeQueueClient();
     const worker = await startSandboxCallbackBridgeWorker({
-      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      client: {
+        ...baseClient,
+        listJsonFiles: async (directory) => {
+          const fileNames = await baseClient.listJsonFiles(directory);
+          pollCount += 1;
+          if (pollCount === 1) {
+            signalFirstPoll();
+          } else if (pollCount === 2) {
+            // Snapshot the empty queue before the test enqueues requests, then
+            // hold that stale listing across stop. Reaching poll two proves the
+            // worker completed its normal idle-poll wait after poll one.
+            signalSecondPoll();
+            await stalePollFinished;
+          }
+          return fileNames;
+        },
+      },
       queueDir,
+      pollIntervalMs: 1,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         processed.push(request.id);
-        await new Promise((resolve) => setTimeout(resolve, 25));
+        if (request.id === "req-a") {
+          await firstRequestReleased;
+        }
         return {
           status: 200,
           body: request.id,
@@ -567,6 +605,9 @@ describe("sandbox callback bridge", () => {
       },
     });
 
+    await firstPoll;
+    await vi.advanceTimersByTimeAsync(1);
+    await secondPoll;
     await publishBridgeRequest(
       path.posix.join(directories.requestsDir, "req-a.json"),
       `${JSON.stringify({
@@ -592,7 +633,10 @@ describe("sandbox callback bridge", () => {
       })}\n`,
     );
 
-    await worker.stop({ drainTimeoutMs: 1_000 });
+    const stopping = worker.stop({ drainTimeoutMs: 1_000 });
+    finishStalePoll();
+    releaseFirstRequest();
+    await stopping;
 
     expect(processed).toEqual(["req-a", "req-b"]);
     await expect(readFile(path.posix.join(directories.responsesDir, "req-a.json"), "utf8")).resolves.toContain("\"req-a\"");

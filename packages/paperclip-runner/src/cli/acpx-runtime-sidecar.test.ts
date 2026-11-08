@@ -2,7 +2,13 @@ import { canonicalNativeRuntimeContextDigest } from "../contracts/runtime-contex
 import { acpxProfileActivity } from "../drivers/acpx/profile-activity.js";
 import { redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import { appendSemanticToolReceipt, readNativeSemanticReceipt, semanticInputSha256 } from "../drivers/semantic-tool-receipt.js";
-import { startRunnerToolBridge, type RunnerToolCall } from "../drivers/runner-tool-bridge.js";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import {
+  startRunnerToolBridge as startRunnerToolBridgeWithCompiler,
+  type RunnerToolBridge,
+  type RunnerToolBridgeOptions,
+  type RunnerToolCall,
+} from "../drivers/runner-tool-bridge.js";
 import { validatePrpStructuredRunResult } from "../protocol/replay-contract.js";
 import { resolveCompletionContinuation } from "../drivers/completion-continuation.js";
 import { acpxUsageEstimateNotice, persistedAcpxTurnUsage, persistedCursorUsageNotice } from "../drivers/acpx/usage-accounting.js";
@@ -1479,4 +1485,10 @@ function loadActualToolCommands(tools: Map<string, unknown>): {
     };
   `)(tools, boundedIdentity, record, text, parseAcpxSidecarRequest, ACPX_SIDECAR_PROTOCOL_VERSION, redactObservabilityDiagnostic);
   return dispatcher;
+}
+
+function startRunnerToolBridge(
+  options: Omit<RunnerToolBridgeOptions, "ajvConstructor">,
+): Promise<RunnerToolBridge> {
+  return startRunnerToolBridgeWithCompiler({ ...options, ajvConstructor: Ajv2020 });
 }

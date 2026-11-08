@@ -19,7 +19,7 @@ import { EventEmitter } from "node:events";
 import { promisify } from "node:util";
 import { getCACertificates } from "node:tls";
 import { basename, dirname, join, resolve } from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   NATIVE_RUNTIME_ASSET_SCHEMA,
@@ -31,7 +31,7 @@ import {
 } from "../../contracts/runtime-context.js";
 import { createCodexTaskEnvelope } from "../../contracts/codex.js";
 import { localIntegrityBoundaryGolden } from "../../../test-support/local-integrity-boundary-golden.js";
-import type { PrpEvent } from "../../protocol/replay-contract.js";
+import type { PersistedHarnessSession } from "../../contracts/harness-driver.js";
 import {
   OpenCodeServerDriver,
   openCodeServerDriverInternals,
@@ -128,12 +128,16 @@ async function makeWritable(root: string): Promise<void> {
 }
 
 afterEach(async () => {
-  await Promise.all(
-    roots.splice(0).map(async (root) => {
-      await makeWritable(root);
-      await rm(root, { recursive: true, force: true });
-    }),
-  );
+  try {
+    await Promise.all(
+      roots.splice(0).map(async (root) => {
+        await makeWritable(root);
+        await rm(root, { recursive: true, force: true });
+      }),
+    );
+  } finally {
+    vi.doUnmock("ajv/dist/2020.js");
+  }
 });
 
 afterAll(async () => {
@@ -141,6 +145,294 @@ afterAll(async () => {
 });
 
 describe("OpenCodeServerDriver", () => {
+  it("rejects an AJV namespace failure before OpenCode creates session resources", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-ajv-rejection-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-workspace-"));
+    roots.push(root, workspace);
+    const namespaceError = new Error("canonical AJV namespace unavailable");
+    const { promise: factoryEntered, resolve: enterFactory } = Promise.withResolvers<void>();
+    vi.doMock("ajv/dist/2020.js", () => {
+      enterFactory();
+      return Object.defineProperty({}, "then", { get: () => { throw namespaceError; } });
+    });
+    const onSpawn = vi.fn();
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      onSpawn,
+    });
+    try {
+      const opening = driver.openSession({
+        runId: "rejected-ajv-admission",
+        normalizedSessionId: "rejected-ajv-admission",
+        workingDirectory: workspace,
+      });
+      await factoryEntered;
+      await expect(opening).rejects.toBe(namespaceError);
+      expect(onSpawn).not.toHaveBeenCalled();
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("cancels pending AJV admission and observes its late rejection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-ajv-cancel-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-workspace-"));
+    roots.push(root, workspace);
+    const gate = Promise.withResolvers<Record<string, unknown>>();
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const removeAbortListener = vi.spyOn(controller.signal, "removeEventListener");
+    const abortReason = new Error("OpenCode compiler admission cancelled");
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+    const onSpawn = vi.fn();
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      onSpawn,
+    });
+    try {
+      process.on("unhandledRejection", onUnhandledRejection);
+      const opening = driver.openSession({
+        runId: "cancelled-ajv-admission",
+        normalizedSessionId: "cancelled-ajv-admission",
+        workingDirectory: workspace,
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(factoryStarted).toBe(true));
+      const lateImportSettlement = gate.promise.then(() => undefined, () => undefined);
+      controller.abort(abortReason);
+      await expect(opening).rejects.toBe(abortReason);
+      gate.reject(new Error("late AJV namespace failure"));
+      await lateImportSettlement;
+      const nextTurn = Promise.withResolvers<void>();
+      setImmediate(nextTurn.resolve);
+      await nextTurn.promise;
+      expect(removeAbortListener).toHaveBeenCalledWith("abort", expect.any(Function));
+      expect(unhandledRejections).toEqual([]);
+      expect(onSpawn).not.toHaveBeenCalled();
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("lets same-turn OpenCode cancellation win over a settled namespace import", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-ajv-same-turn-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-workspace-"));
+    roots.push(root, workspace);
+    const gate = Promise.withResolvers<Record<string, unknown>>();
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const abortReason = new Error("OpenCode same-turn admission cancelled");
+    const onSpawn = vi.fn();
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      onSpawn,
+    });
+    try {
+      const opening = driver.openSession({
+        runId: "same-turn-ajv-admission",
+        normalizedSessionId: "same-turn-ajv-admission",
+        workingDirectory: workspace,
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(factoryStarted).toBe(true));
+      gate.resolve({ Ajv2020: class {} });
+      controller.abort(abortReason);
+      await expect(opening).rejects.toBe(abortReason);
+      expect(onSpawn).not.toHaveBeenCalled();
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("rejects recovery namespace failure before workspace access", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-recovery-ajv-"));
+    roots.push(root);
+    const namespaceError = new Error("canonical AJV recovery namespace unavailable");
+    const { promise: factoryEntered, resolve: enterFactory } = Promise.withResolvers<void>();
+    vi.doMock("ajv/dist/2020.js", () => {
+      enterFactory();
+      return Object.defineProperty({}, "then", { get: () => { throw namespaceError; } });
+    });
+    const onSpawn = vi.fn();
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      onSpawn,
+    });
+    try {
+      const recovery = driver.recoverSession({
+        driverKind: "opencode_server",
+        runId: "recovery-ajv-rejected",
+        normalizedSessionId: "recovery-ajv-rejected",
+        driverSessionId: "provider-session",
+      } as PersistedHarnessSession, { signal: new AbortController().signal });
+      await factoryEntered;
+      await expect(recovery).rejects.toBe(namespaceError);
+      expect(onSpawn).not.toHaveBeenCalled();
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("keeps invalid OpenCode recovery identity ahead of compiler admission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-invalid-recovery-"));
+    roots.push(root);
+    vi.doMock("ajv/dist/2020.js", () => {
+      throw new Error("invalid recovery must not load AJV");
+    });
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+    });
+    try {
+      await expect(driver.recoverSession({} as PersistedHarnessSession, {
+        signal: new AbortController().signal,
+      })).resolves.toEqual({
+        recovered: false,
+        reason: "persisted OpenCode session identity is incomplete",
+      });
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+  it("preserves a pre-aborted OpenCode recovery before compiler import", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-recovery-pre-aborted-"));
+    roots.push(root);
+    const abortReason = new Error("OpenCode recovery admission pre-aborted");
+    const controller = new AbortController();
+    controller.abort(abortReason);
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      throw new Error("pre-aborted recovery must not import AJV");
+    });
+    const onSpawn = vi.fn();
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      onSpawn,
+    });
+    try {
+      await expect(driver.recoverSession({
+        driverKind: "opencode_server",
+        runId: "pre-aborted-recovery-admission",
+        normalizedSessionId: "pre-aborted-recovery-admission",
+        driverSessionId: "provider-session",
+      } as PersistedHarnessSession, { signal: controller.signal })).rejects.toBe(abortReason);
+      expect(factoryStarted).toBe(false);
+      expect(onSpawn).not.toHaveBeenCalled();
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("lets same-turn OpenCode recovery cancellation win over namespace settlement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-recovery-same-turn-"));
+    roots.push(root);
+    const gate = Promise.withResolvers<Record<string, unknown>>();
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const abortReason = new Error("OpenCode same-turn recovery cancellation");
+    const onSpawn = vi.fn();
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      onSpawn,
+    });
+    try {
+      const recovery = driver.recoverSession({
+        driverKind: "opencode_server",
+        runId: "same-turn-recovery-admission",
+        normalizedSessionId: "same-turn-recovery-admission",
+        driverSessionId: "provider-session",
+      } as PersistedHarnessSession, { signal: controller.signal });
+      await vi.waitFor(() => expect(factoryStarted).toBe(true));
+      gate.resolve({ Ajv2020: class {} });
+      controller.abort(abortReason);
+      await expect(recovery).rejects.toBe(abortReason);
+      expect(onSpawn).not.toHaveBeenCalled();
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
+
+  it("cancels pending OpenCode recovery admission before workspace access", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-recovery-ajv-cancel-"));
+    roots.push(root);
+    const gate = Promise.withResolvers<Record<string, unknown>>();
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const removeAbortListener = vi.spyOn(controller.signal, "removeEventListener");
+    const abortReason = new Error("OpenCode recovery compiler admission cancelled");
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+    const onSpawn = vi.fn();
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      onSpawn,
+    });
+    try {
+      process.on("unhandledRejection", onUnhandledRejection);
+      const recovery = driver.recoverSession({
+        driverKind: "opencode_server",
+        runId: "cancelled-recovery-admission",
+        normalizedSessionId: "cancelled-recovery-admission",
+        driverSessionId: "provider-session",
+      } as PersistedHarnessSession, { signal: controller.signal });
+      await vi.waitFor(() => expect(factoryStarted).toBe(true));
+      const lateImportSettlement = gate.promise.then(() => undefined, () => undefined);
+      controller.abort(abortReason);
+      await expect(recovery).rejects.toBe(abortReason);
+      gate.reject(new Error("late recovery AJV namespace rejection"));
+      await lateImportSettlement;
+      const nextTurn = Promise.withResolvers<void>();
+      setImmediate(nextTurn.resolve);
+      await nextTurn.promise;
+      expect(removeAbortListener).toHaveBeenCalledWith("abort", expect.any(Function));
+      expect(unhandledRejections).toEqual([]);
+      expect(onSpawn).not.toHaveBeenCalled();
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      vi.doUnmock("ajv/dist/2020.js");
+    }
+  });
   it("advertises within-turn plans as unsupported", async () => {
     const driver = new OpenCodeServerDriver({
       model: "openrouter/deepseek/deepseek-v4-flash-0731",
@@ -860,7 +1152,7 @@ describe("OpenCodeServerDriver", () => {
       "utf8",
     );
     await session.close({ reason: "test" });
-    const recovered = await driver.recoverSession?.(snapshot);
+    const recovered = await driver.recoverSession?.(snapshot, { signal: new AbortController().signal });
     expect(recovered).toMatchObject({ recovered: true });
     await expect(recovered?.session?.read?.()).resolves.toMatchObject({
       sessionId: "ses_fake_1",
@@ -1121,6 +1413,12 @@ describe("OpenCodeServerDriver", () => {
     expect(
       secondTurnEvents.filter((event) => event.eventType === "turn.completed"),
     ).toMatchObject([{ turnId: secondTurn.turnId }]);
+    expect(
+      secondTurnEvents.filter(
+        (event) => event.eventType === "item.completed" &&
+          event.payload.kind === "agentMessage" && event.payload.channel === "final",
+      ),
+    ).toMatchObject([{ payload: { text: "done [guide](guide.md)" } }]);
     expect(
       secondTurnEvents.find(
         (event) => event.eventType === "harness.diagnostic",
@@ -1641,7 +1939,7 @@ describe("OpenCodeServerDriver", () => {
     const snapshot = await seed.snapshot();
     await seed.close({ reason: "seed complete" });
 
-    const recovered = await driver.recoverSession?.(snapshot);
+    const recovered = await driver.recoverSession?.(snapshot, { signal: new AbortController().signal });
     expect(recovered).toMatchObject({ recovered: true });
     await recovered!.session!.startTurn({
       message: {
@@ -1915,7 +2213,7 @@ describe("OpenCodeServerDriver", () => {
     const recovered = await driver.recoverSession?.({
       ...snapshot,
       activeTurnId: "turn-recovered-question",
-    });
+    }, { signal: new AbortController().signal });
     expect(recovered).toMatchObject({ recovered: true });
     const session = recovered!.session!;
     const iterator = session.events()[Symbol.asyncIterator]();
@@ -2140,7 +2438,7 @@ describe("OpenCodeServerDriver", () => {
           fingerprint: "terminal-fingerprint",
         },
       ],
-    });
+    }, { signal: new AbortController().signal });
     expect(recovery).toMatchObject({ recovered: true });
     await expect(recovery!.session!.snapshot()).resolves.toMatchObject({
       activeTurnId: null,
@@ -2473,6 +2771,21 @@ describe("OpenCodeServerDriver", () => {
       message: { role: "user", text: "final-after-tool-commentary" },
     });
     const events = await collectTurnEvents(session.events());
+    const proposedResults = events.filter(
+      (event) => event.eventType === "run.result.proposed",
+    );
+    expect(proposedResults).toHaveLength(1);
+    expect(proposedResults[0]?.payload).toMatchObject({
+      reportedWorkDisposition: "done",
+      completionClaim: {
+        contractRevision: "codex-demo-v1",
+        objectiveSatisfied: true,
+        criteria: [{ criterionId: "objective", status: "satisfied" }],
+      },
+    });
+    expect((await session.snapshot()).semanticResult?.result).toMatchObject(
+      proposedResults[0]!.payload,
+    );
     const finalMessages = events.filter(
       (event) =>
         event.eventType === "item.completed" &&
@@ -2485,6 +2798,341 @@ describe("OpenCodeServerDriver", () => {
     );
     await session.close({ reason: "test" });
   });
+  it.each(["rpc-before-sse", "sse-before-rpc", "ambiguous-native", "ambiguous-attempt"] as const)(
+    "uses native structure or legacy fallback when %s occurs",
+    async (ordering) => {
+      await chmod(fixture, 0o755);
+      const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-final-order-"));
+      const workspace = await mkdtemp(
+        join(tmpdir(), "paperclip-opencode-final-order-workspace-"),
+      );
+      roots.push(root, workspace);
+
+      let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+      const { promise: feedbackGate, resolve: releaseFeedback } =
+        Promise.withResolvers<void>();
+      const { promise: feedbackStarted, resolve: markFeedbackStarted } =
+        Promise.withResolvers<void>();
+      const feedback = "Accepted. Keep the exact saved document link in the final response.";
+      const taskEnvelope = createCodexTaskEnvelope({ objective: "Complete the supplied task." });
+      const driver = new OpenCodeServerDriver({
+        model: "openrouter/deepseek/deepseek-v4-flash-0731",
+        runtimeDirectory: root,
+        command: fixture,
+        taskEnvelope,
+        environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+        fetch: async (input, init) =>
+          String(input).endsWith("/event")
+            ? new Response(
+                new ReadableStream<Uint8Array>({
+                  start(controller) {
+                    stream = controller;
+                  },
+                  cancel() {
+                    stream = undefined;
+                  },
+                }),
+                { headers: { "Content-Type": "text/event-stream" } },
+              )
+            : fetch(input, init),
+        completionFeedback: async () => {
+          markFeedbackStarted();
+          await feedbackGate;
+          return feedback;
+        },
+      });
+      const session = await driver.openSession({
+        runId: `final-order-${ordering}`,
+        normalizedSessionId: `final-order-${ordering}`,
+        workingDirectory: workspace,
+      });
+      const observed: PrpEvent[] = [];
+      let wakeObserver = () => {};
+      let observerStopped = false;
+      let observerError: unknown;
+      let observerFailed = false;
+      const events = (async () => {
+        try {
+          for await (const event of session.events()) {
+            observed.push(event);
+            wakeObserver();
+            if (TURN_TERMINAL_EVENT_TYPES.has(event.eventType)) break;
+          }
+        } catch (error) {
+          observerFailed = true;
+          observerError = error;
+        } finally {
+          observerStopped = true;
+          wakeObserver();
+        }
+      })();
+      let secondObserver: Promise<void> | undefined;
+      const waitForEvent = async (predicate: (event: PrpEvent) => boolean) => {
+        while (true) {
+          const event = observed.find(predicate);
+          if (event) return event;
+          if (observerStopped) {
+            if (observerFailed) throw observerError;
+            throw new Error(
+              "Turn event stream ended before the expected event was observed",
+            );
+          }
+          const { promise, resolve } = Promise.withResolvers<void>();
+          wakeObserver = resolve;
+          await promise;
+          wakeObserver = () => {};
+        }
+      };
+      const sendNative = (event: Record<string, unknown>) => {
+        stream!.enqueue(
+          new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`),
+        );
+      };
+      const message = (messageId: string) =>
+        sendNative({
+          type: "message.updated",
+          id: `role-${messageId}`,
+          properties: {
+            info: {
+              id: messageId,
+              sessionID: session.ids().providerSessionId,
+              role: "assistant",
+            },
+          },
+        });
+      const textPart = (partId: string, messageId: string, text: string, complete = true) =>
+        sendNative({
+          type: "message.part.updated",
+          id: `event-${partId}-${complete}`,
+          properties: {
+            sessionID: session.ids().providerSessionId,
+            part: {
+              id: partId,
+              messageID: messageId,
+              type: "text",
+              text,
+              time: complete ? { start: 1, end: 2 } : { start: 1 },
+            },
+          },
+        });
+      const terminalPart = (messageId: string, status: "completed" | "error") =>
+        sendNative({
+          type: "message.part.updated",
+          id: `terminal-${status}-${messageId}`,
+          properties: {
+            sessionID: session.ids().providerSessionId,
+            part: {
+              id: `terminal-part-${status}-${messageId}`,
+              messageID: messageId,
+              type: "tool",
+              tool: status === "completed" ? "paperclip_paperclip_finish" : "unknown",
+              callID: status === "error" ? "functions.paperclip_paperclip_finish:24" : undefined,
+              state:
+                status === "completed"
+                  ? { status: "completed", output: "accepted" }
+                  : { status: "error", error: "duplicate terminal report" },
+            },
+          },
+        });
+      const finalText =
+        "This is the complete substantive answer emitted after the accepted completion tool call.";
+
+      try {
+        await session.startTurn({
+          message: { role: "user", text: ordering === "ambiguous-attempt"
+            ? "repair-criteria-wrong final-after-tool-commentary"
+            : "final-after-tool-commentary" },
+        });
+        if (ordering !== "sse-before-rpc") {
+          await feedbackStarted;
+          releaseFeedback();
+          await waitForEvent((event) => event.eventType === "run.result.proposed");
+          await waitForEvent(
+            (event) =>
+              event.eventType === "item.completed" &&
+              event.payload.kind === "dynamicToolCall" &&
+              (event.payload.item as { result?: unknown })?.result === feedback,
+          );
+          message("message-assistant");
+          textPart(
+            "part-tool-commentary",
+            "message-assistant",
+            "This deliberately long pre-tool commentary discusses possible schema corrections, retries, compatibility details, and several implementation alternatives, but it is not the provider's final response.",
+          );
+          terminalPart("message-assistant", "completed");
+          if (ordering === "ambiguous-native") {
+            message("message-other-terminal");
+            terminalPart("message-other-terminal", "error");
+          }
+          message("message-post-tool-final");
+          textPart("part-post-tool-final", "message-post-tool-final", finalText);
+        } else {
+          message("message-assistant");
+          textPart(
+            "part-tool-commentary",
+            "message-assistant",
+            "This deliberately long pre-tool commentary discusses possible schema corrections, retries, compatibility details, and several implementation alternatives, but it is not the provider's final response.",
+          );
+          await waitForEvent(
+            (event) =>
+              event.eventType === "item.delta" &&
+              typeof event.payload.text === "string" &&
+              event.payload.text.startsWith("This deliberately long pre-tool commentary"),
+          );
+          await feedbackStarted;
+          textPart("part-post-tool-final", "message-assistant", "This is the complete ", false);
+          await waitForEvent(
+            (event) => event.eventType === "item.delta" && event.payload.text === "This is the complete ",
+          );
+          terminalPart("message-assistant", "completed");
+          textPart("part-post-tool-final", "message-assistant", finalText);
+          await waitForEvent(
+            (event) =>
+              event.eventType === "item.delta" && event.payload.text === finalText.slice("This is the complete ".length),
+          );
+          // A distinct duplicate/error report must not move the first boundary.
+          terminalPart("message-assistant", "error");
+          releaseFeedback();
+          await waitForEvent((event) => event.eventType === "run.result.proposed");
+        }
+        sendNative({
+          type: "session.idle",
+          id: `idle-${ordering}`,
+          properties: { sessionID: session.ids().providerSessionId },
+        });
+        await events;
+        if (observerFailed) throw observerError;
+
+        const proposed = observed.filter(
+          (event) => event.eventType === "run.result.proposed",
+        );
+        expect(proposed).toHaveLength(1);
+        expect(proposed[0]?.payload).toMatchObject({
+          reportedWorkDisposition: "done",
+          completionClaim: {
+            contractRevision: "codex-demo-v1",
+            objectiveSatisfied: true,
+            criteria: [{ criterionId: "objective", status: "satisfied" }],
+          },
+        });
+        expect((await session.snapshot()).semanticResult?.result).toMatchObject(
+          proposed[0]!.payload,
+        );
+        expect(
+          observed.filter(
+            (event) =>
+              event.eventType === "item.completed" &&
+              event.payload.kind === "dynamicToolCall" &&
+              (event.payload.item as { result?: unknown })?.result === feedback,
+          ),
+        ).toHaveLength(1);
+        if (ordering === "ambiguous-attempt") {
+          expect(observed).toContainEqual(expect.objectContaining({
+            eventType: "item.completed",
+            payload: expect.objectContaining({ item: expect.objectContaining({ is_error: true }) }),
+          }));
+        }
+        const finalMessages = observed.filter(
+          (event) =>
+            event.eventType === "item.completed" &&
+            event.payload.kind === "agentMessage" &&
+            event.payload.channel === "final",
+        );
+        expect(finalMessages).toHaveLength(1);
+        expect(finalMessages[0]?.payload.text).toBe(
+          ordering === "ambiguous-native" || ordering === "ambiguous-attempt"
+            ? "This deliberately long pre-tool commentary discusses possible schema corrections, retries, compatibility details, and several implementation alternatives, but it is not the provider's final response."
+            : finalText,
+        );
+        const finalDelta = observed.findIndex(
+          (event) => event.eventType === "item.delta" && event.payload.text ===
+            (ordering === "sse-before-rpc" ? finalText.slice("This is the complete ".length) : finalText),
+        );
+        const proposedAt = observed.findIndex(
+          (event) => event.eventType === "run.result.proposed",
+        );
+        expect(
+          ordering !== "sse-before-rpc" ? proposedAt < finalDelta : finalDelta < proposedAt,
+        ).toBe(true);
+        if (ordering === "rpc-before-sse") {
+          expect(session.attachRun).toBeDefined();
+          await session.attachRun?.({ runId: "final-order-next-run" });
+          const secondEvents: PrpEvent[] = [];
+          const secondAccepted = Promise.withResolvers<boolean>();
+          let secondObserverError: unknown;
+          secondObserver = (async () => {
+            try {
+              for await (const event of session.events()) {
+                secondEvents.push(event);
+                if (event.eventType === "run.result.proposed") secondAccepted.resolve(true);
+                const item = event.payload.item;
+                if (event.eventType === "item.completed" &&
+                  event.payload.kind === "dynamicToolCall" &&
+                  item !== null && typeof item === "object" &&
+                  "is_error" in item && item.is_error === true) {
+                  secondAccepted.resolve(false);
+                }
+                if (TURN_TERMINAL_EVENT_TYPES.has(event.eventType)) break;
+              }
+            } catch (error) {
+              secondObserverError = error;
+            } finally {
+              secondAccepted.resolve(false);
+            }
+          })();
+          // Continuations carry their own authoritative completion contract;
+          // attachRun intentionally does not resend the initial task envelope.
+          await session.startTurn({
+            message: {
+              role: "user",
+              text: JSON.stringify({
+                message: "final-after-tool-commentary",
+                completionContract: taskEnvelope.completionContract,
+              }),
+            },
+          });
+          expect(await secondAccepted.promise).toBe(true);
+          terminalPart("message-assistant", "error");
+          message("message-next-terminal");
+          textPart("part-next-commentary", "message-next-terminal", "Next turn commentary.");
+          terminalPart("message-next-terminal", "completed");
+          message("message-next-answer");
+          textPart("part-next-answer", "message-next-answer", "Next turn substantive answer.");
+          sendNative({
+            type: "session.idle",
+            id: "idle-next-turn",
+            properties: { sessionID: session.ids().providerSessionId },
+          });
+          await secondObserver;
+          if (secondObserverError) throw secondObserverError;
+          const secondProposed = secondEvents.filter((event) => event.eventType === "run.result.proposed");
+          expect(secondProposed).toHaveLength(1);
+          expect(secondProposed[0]?.payload).toEqual(proposed[0]!.payload);
+          expect((await session.snapshot()).semanticResult?.result).toEqual(secondProposed[0]!.payload);
+          expect(secondEvents.filter((event) => {
+            const item = event.payload.item;
+            return event.eventType === "item.completed" &&
+              event.payload.kind === "dynamicToolCall" &&
+              item !== null && typeof item === "object" &&
+              "result" in item && item.result === feedback;
+          })).toHaveLength(1);
+          expect(secondEvents.filter((event) => event.eventType === "item.completed" &&
+            event.payload.kind === "agentMessage" && event.payload.channel === "final"))
+            .toMatchObject([{ payload: { text: "Next turn substantive answer." } }]);
+        }
+      } finally {
+        markFeedbackStarted();
+        releaseFeedback();
+        try {
+          await session.close({ reason: "final-order test complete" });
+        } finally {
+          stream?.close();
+          await events;
+          await secondObserver;
+        }
+      }
+    },
+  );
 
   it.each(["session.idle", "session.status", "session.error", "aborted"])("settles accepted completion before a racing %s event", async terminalType => {
     await chmod(fixture, 0o755);
@@ -2866,5 +3514,35 @@ describe("OpenCodeServerDriver", () => {
     }).then(() => "provider unexpectedly started", (cause: unknown) => String(cause));
     expect(error).toContain("Gateway rejected [REDACTED]");
     expect(error).not.toContain(key);
+  });
+  it("preserves the operation abort reason before OpenCode resource admission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-admission-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-workspace-"));
+    roots.push(root, workspace);
+    const abortReason = new Error("OpenCode admission cancelled");
+    const controller = new AbortController();
+    controller.abort(abortReason);
+    let factoryStarted = false;
+    vi.doMock("ajv/dist/2020.js", () => {
+      factoryStarted = true;
+      throw new Error("pre-aborted admission must not import AJV");
+    });
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: "missing-opencode-command",
+    });
+    try {
+      await expect(driver.openSession({
+        runId: "cancelled-admission",
+        normalizedSessionId: "cancelled-admission",
+        workingDirectory: workspace,
+        signal: controller.signal,
+      })).rejects.toBe(abortReason);
+      expect(factoryStarted).toBe(false);
+      await expect(readdir(root)).resolves.toEqual([]);
+    } finally {
+      vi.doUnmock("ajv/dist/2020.js");
+    }
   });
 });

@@ -1,4 +1,9 @@
-import { startRunnerToolBridge } from "../runner-tool-bridge.js";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import {
+  startRunnerToolBridge as startRunnerToolBridgeWithCompiler,
+  type RunnerToolBridge,
+  type RunnerToolBridgeOptions,
+} from "../runner-tool-bridge.js";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -501,3 +506,9 @@ describe("owned Pi runtime extension", () => {
     await expect(piMcpRequest(server, "tools/list", {}, "1", undefined, fetch_)).rejects.toThrow("oversized");
   });
 });
+
+function startRunnerToolBridge(
+  options: Omit<RunnerToolBridgeOptions, "ajvConstructor">,
+): Promise<RunnerToolBridge> {
+  return startRunnerToolBridgeWithCompiler({ ...options, ajvConstructor: Ajv2020 });
+}

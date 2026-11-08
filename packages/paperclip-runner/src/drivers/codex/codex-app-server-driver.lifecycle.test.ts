@@ -1,3 +1,4 @@
+import type { PersistedHarnessSession } from "../../contracts/harness-driver.js";
 import {
   PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
   PRP_BLOCK_TOOL_DESCRIPTION,
@@ -114,7 +115,297 @@ class WarmAttachTransport extends FakeCodexTransport {
   }
 }
 
+function abortAfterAdmissionListenerRemoval(
+  controller: AbortController,
+  reason: unknown,
+): () => boolean {
+  const { signal } = controller;
+  const removeListener = signal.removeEventListener.bind(signal);
+  let observedAbortListenerRemoval = false;
+  vi.spyOn(signal, "removeEventListener").mockImplementation(
+    (type, listener, options) => {
+      removeListener(type, listener, options);
+      if (type === "abort" && !observedAbortListenerRemoval) {
+        observedAbortListenerRemoval = true;
+        queueMicrotask(() => controller.abort(reason));
+      }
+    },
+  );
+  return () => observedAbortListenerRemoval;
+}
+
 describe("Codex app-server Codex driver", () => {
+  it("propagates canonical session module load failure before open transport admission", async () => {
+    const loadError = new Error("canonical Codex session initialization failed");
+    vi.doMock("./codex-harness-session.js", () => {
+      throw loadError;
+    });
+    let transportAdmissions = 0;
+    const driver = makeDriver([], {
+      transportFactory: () => {
+        transportAdmissions += 1;
+        return new FakeCodexTransport();
+      },
+    });
+
+    try {
+      const rejection = await driver.openSession({
+        runId: "run-session-load-failure",
+        normalizedSessionId: "normalized-session-load-failure",
+        workingDirectory: WORKSPACE,
+      }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(rejection).toBeInstanceOf(Error);
+      expect(rejection).not.toBe(loadError);
+      expect((rejection as Error & { cause?: unknown }).cause).toBe(loadError);
+      expect(transportAdmissions).toBe(0);
+    } finally {
+      vi.doUnmock("./codex-harness-session.js");
+    }
+  });
+
+  it("propagates canonical session module load failure before recovery transport admission", async () => {
+    const loadError = new Error("canonical Codex session initialization failed");
+    vi.doMock("./codex-harness-session.js", () => {
+      throw loadError;
+    });
+    let transportAdmissions = 0;
+    const driver = makeDriver([], {
+      transportFactory: () => {
+        transportAdmissions += 1;
+        return new FakeCodexTransport();
+      },
+    });
+    const snapshot = {
+      runId: "run-session-load-failure",
+      normalizedSessionId: "normalized-session-load-failure",
+      driverSessionId: "thread-existing",
+    } as PersistedHarnessSession;
+
+    try {
+      const rejection = await driver.recoverSession(snapshot).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(rejection).toBeInstanceOf(Error);
+      expect(rejection).not.toBe(loadError);
+      expect((rejection as Error & { cause?: unknown }).cause).toBe(loadError);
+      expect(transportAdmissions).toBe(0);
+    } finally {
+      vi.doUnmock("./codex-harness-session.js");
+    }
+  });
+
+  it("keeps open cancellation authoritative between acquisition and transport admission", async () => {
+    const abortReason = new Error("open admission cancelled after acquisition");
+    const controller = new AbortController();
+    const listenerRemovalObserved = abortAfterAdmissionListenerRemoval(
+      controller,
+      abortReason,
+    );
+    let transportAdmissions = 0;
+    const driver = makeDriver([], {
+      transportFactory: () => {
+        transportAdmissions += 1;
+        return new FakeCodexTransport();
+      },
+    });
+
+    await expect(
+      driver.openSession({
+        runId: "run-open-cancel-after-acquisition",
+        normalizedSessionId: "normalized-open-cancel-after-acquisition",
+        workingDirectory: WORKSPACE,
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(abortReason);
+    expect(listenerRemovalObserved()).toBe(true);
+    expect(transportAdmissions).toBe(0);
+  });
+
+  it("keeps recovery cancellation authoritative between acquisition and transport admission", async () => {
+    const abortReason = new Error("recovery admission cancelled after acquisition");
+    const controller = new AbortController();
+    const listenerRemovalObserved = abortAfterAdmissionListenerRemoval(
+      controller,
+      abortReason,
+    );
+    let transportAdmissions = 0;
+    const driver = makeDriver([], {
+      transportFactory: () => {
+        transportAdmissions += 1;
+        return new FakeCodexTransport();
+      },
+    });
+    const snapshot = {
+      runId: "run-recovery-cancel-after-acquisition",
+      normalizedSessionId: "normalized-recovery-cancel-after-acquisition",
+      driverSessionId: "thread-existing",
+    } as PersistedHarnessSession;
+
+    await expect(
+      driver.recoverSession(snapshot, { signal: controller.signal }),
+    ).rejects.toBe(abortReason);
+    expect(listenerRemovalObserved()).toBe(true);
+    expect(transportAdmissions).toBe(0);
+  });
+
+  it("keeps open cancellation authoritative when acquisition rejects before caller handoff", async () => {
+    const abortReason = new Error("open admission cancelled after acquisition rejection");
+    const loadError = new Error("canonical Codex session initialization failed");
+    const controller = new AbortController();
+    const listenerRemovalObserved = abortAfterAdmissionListenerRemoval(
+      controller,
+      abortReason,
+    );
+    let loadAttempted = false;
+    let transportAdmissions = 0;
+    const driver = makeDriver([], {
+      transportFactory: () => {
+        transportAdmissions += 1;
+        return new FakeCodexTransport();
+      },
+    });
+    vi.doMock("./codex-harness-session.js", () => {
+      loadAttempted = true;
+      throw loadError;
+    });
+
+    try {
+      await expect(
+        driver.openSession({
+          runId: "run-open-cancel-after-acquisition-rejection",
+          normalizedSessionId: "normalized-open-cancel-after-acquisition-rejection",
+          workingDirectory: WORKSPACE,
+          signal: controller.signal,
+        }),
+      ).rejects.toBe(abortReason);
+      expect(loadAttempted).toBe(true);
+      expect(listenerRemovalObserved()).toBe(true);
+      expect(transportAdmissions).toBe(0);
+    } finally {
+      vi.doUnmock("./codex-harness-session.js");
+    }
+  });
+
+  it("keeps recovery cancellation authoritative when acquisition rejects before caller handoff", async () => {
+    const abortReason = new Error("recovery admission cancelled after acquisition rejection");
+    const loadError = new Error("canonical Codex session initialization failed");
+    const controller = new AbortController();
+    const listenerRemovalObserved = abortAfterAdmissionListenerRemoval(
+      controller,
+      abortReason,
+    );
+    let loadAttempted = false;
+    let transportAdmissions = 0;
+    const driver = makeDriver([], {
+      transportFactory: () => {
+        transportAdmissions += 1;
+        return new FakeCodexTransport();
+      },
+    });
+    const snapshot = {
+      runId: "run-recovery-cancel-after-acquisition-rejection",
+      normalizedSessionId: "normalized-recovery-cancel-after-acquisition-rejection",
+      driverSessionId: "thread-existing",
+    } as PersistedHarnessSession;
+    vi.doMock("./codex-harness-session.js", () => {
+      loadAttempted = true;
+      throw loadError;
+    });
+
+    try {
+      await expect(
+        driver.recoverSession(snapshot, { signal: controller.signal }),
+      ).rejects.toBe(abortReason);
+      expect(loadAttempted).toBe(true);
+      expect(listenerRemovalObserved()).toBe(true);
+      expect(transportAdmissions).toBe(0);
+    } finally {
+      vi.doUnmock("./codex-harness-session.js");
+    }
+  });
+
+  it("keeps open cancellation authoritative over a later canonical session load error", async () => {
+    const abortReason = new Error("open admission cancelled");
+    const loadError = new Error("late canonical Codex session load failure");
+    const loadStarted = Promise.withResolvers<void>();
+    const loadRejected = Promise.withResolvers<void>();
+    const pendingLoad = Promise.withResolvers<never>();
+    let transportAdmissions = 0;
+    const driver = makeDriver([], {
+      transportFactory: () => {
+        transportAdmissions += 1;
+        throw new Error("transport admitted after open cancellation");
+      },
+    });
+    const controller = new AbortController();
+    vi.doMock("./codex-harness-session.js", () => {
+      loadStarted.resolve();
+      void pendingLoad.promise.catch(() => loadRejected.resolve());
+      return pendingLoad.promise;
+    });
+
+    try {
+      const opening = driver.openSession({
+        runId: "run-session-load-cancelled",
+        normalizedSessionId: "normalized-session-load-cancelled",
+        workingDirectory: WORKSPACE,
+        signal: controller.signal,
+      });
+      await loadStarted.promise;
+      controller.abort(abortReason);
+      await expect(opening).rejects.toBe(abortReason);
+      pendingLoad.reject(loadError);
+      await loadRejected.promise;
+      expect(transportAdmissions).toBe(0);
+    } finally {
+      vi.doUnmock("./codex-harness-session.js");
+    }
+  });
+
+  it("keeps recovery cancellation authoritative over a later canonical session load error", async () => {
+    const abortReason = new Error("recovery admission cancelled");
+    const loadError = new Error("late canonical Codex session load failure");
+    const loadStarted = Promise.withResolvers<void>();
+    const loadRejected = Promise.withResolvers<void>();
+    const pendingLoad = Promise.withResolvers<never>();
+    let transportAdmissions = 0;
+    const driver = makeDriver([], {
+      transportFactory: () => {
+        transportAdmissions += 1;
+        throw new Error("transport admitted after recovery cancellation");
+      },
+    });
+    const controller = new AbortController();
+    const snapshot = {
+      runId: "run-session-load-cancelled",
+      normalizedSessionId: "normalized-session-load-cancelled",
+      driverSessionId: "thread-existing",
+    } as PersistedHarnessSession;
+    vi.doMock("./codex-harness-session.js", () => {
+      loadStarted.resolve();
+      void pendingLoad.promise.catch(() => loadRejected.resolve());
+      return pendingLoad.promise;
+    });
+
+    try {
+      const recovering = driver.recoverSession(snapshot, {
+        signal: controller.signal,
+      });
+      await loadStarted.promise;
+      controller.abort(abortReason);
+      await expect(recovering).rejects.toBe(abortReason);
+      pendingLoad.reject(loadError);
+      await loadRejected.promise;
+      expect(transportAdmissions).toBe(0);
+    } finally {
+      vi.doUnmock("./codex-harness-session.js");
+    }
+  });
+
   it("accepts runner-proven warm attachment when the host active-turn reducer is stale", async () => {
     const transport = new WarmAttachTransport();
     const driver = makeDriver([transport]);
@@ -423,6 +714,10 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "normalized-chat",
       workingDirectory: WORKSPACE,
     });
+    // Import after open so this assertion does not defeat the lazy-load tests above.
+    expect(session).toBeInstanceOf(
+      (await import("./codex-harness-session.js")).CodexHarnessSession,
+    );
 
     const threadStart = transport.calls.find(
       (call) => call.method === "thread/start",

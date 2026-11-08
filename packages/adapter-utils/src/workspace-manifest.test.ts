@@ -3,7 +3,7 @@ import nodeFs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { createWorkspaceManifest, readManifestRecords, WorkspaceNulParser, WORKSPACE_PATH_MAX_BYTES, workspacePaths } from "./workspace-manifest.js";
+import { createWorkspaceManifest, readManifestRecords, WorkspaceNulParser, WORKSPACE_PATH_MAX_BYTES, workspacePathMatcher, workspacePaths } from "./workspace-manifest.js";
 import { readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot, runLocalGit, setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
 
 const cleanup: string[] = [];
@@ -36,6 +36,41 @@ it("deduplicates paths on disk and rejects incomplete manifest metadata", async 
   expect([...workspacePaths(manifest)]).toEqual(["a", "b"]);
   expect(() => [...readManifestRecords({ ...manifest, count: 3 })]).toThrow("Incomplete");
   expect(() => [...workspacePaths(["../escape"])]).toThrow("Invalid");
+});
+it("matches sealed manifest paths literally across fixed ancestor groups", async () => {
+  const writer = await createWorkspaceManifest();
+  cleanup.push(path.dirname(writer.filePath));
+  const literal = "wild*?[x]/雪\nline";
+  const entries = [literal, "exact/path", "deep"];
+  writer.batch(() => {
+    for (const entry of entries) writer.add("overlay", entry);
+    writer.add("other", "isolated/path");
+  });
+  const manifest = writer.paths("overlay");
+  writer.close();
+
+  const manifestMatcher = workspacePathMatcher(manifest);
+  const arrayMatcher = workspacePathMatcher(entries);
+  try {
+    const cases: [string, boolean][] = [
+      [literal, true],
+      [`${literal}/child`, true],
+      ["wildZZ[x]/雪\nline", false],
+      ["exact/path", true],
+      ["exact/path/child", true],
+      ["exact/sibling", false],
+      ["deep/a/b/c/d/e/f", true],
+      ["deepish/a/b/c/d/e/f", false],
+      ["isolated/path", false],
+    ];
+    for (const [relative, expected] of cases) {
+      expect(manifestMatcher.matches(relative)).toBe(expected);
+      expect(manifestMatcher.matches(relative)).toBe(arrayMatcher.matches(relative));
+    }
+  } finally {
+    manifestMatcher.close();
+    arrayMatcher.close();
+  }
 });
 
 it("refuses new manifests and fails ongoing writes when the disk reserve is exhausted", async () => {

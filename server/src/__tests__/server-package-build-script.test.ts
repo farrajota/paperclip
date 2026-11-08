@@ -68,7 +68,7 @@ describe("server package build script", () => {
     expect(RUNNER_VENDOR_BUILD_COMMAND).toBe(
       "pnpm --filter @paperclipai/paperclip-runner build",
     );
-    expect(packageJson.scripts?.build.startsWith("pnpm run prepare:runner-vendor && ")).toBe(true);
+    expect(packageJson.scripts?.build.startsWith("node ../scripts/build-sandbox-parent-guard.mjs && pnpm run prepare:runner-vendor && ")).toBe(true);
     expect(packageJson.scripts?.build).toContain(
       "cp -Rf ../packages/paperclip-runner/dist/. dist/vendor/paperclip-runner/",
     );
@@ -169,12 +169,14 @@ describe("server package build script", () => {
     expect(server.dependencies["opencode-ai"]).toBe(runner.dependencies["opencode-ai"]);
   });
 
-  it("loads runner source when the source server starts before workspace builds", () => {
+  it("loads runner source modules when the source server starts before workspace builds", () => {
     const shim = readFileSync(runnerShimPath, "utf8");
 
     expect(shim).toContain(
-      '"../../../../packages/paperclip-runner/src/index.ts"',
+      '"../../../../packages/paperclip-runner/src/"',
     );
+    expect(shim).toContain("function loadRunnerSource");
+    expect(shim).toContain("new URL(relativePath, sourceRootUrl).href");
     expect(shim).not.toContain(
       'export * from "@paperclipai/paperclip-runner"',
     );

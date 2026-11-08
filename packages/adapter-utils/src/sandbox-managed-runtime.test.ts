@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { promises as fsPromises } from "node:fs";
+import { lstat as lstatCallback, promises as fsPromises } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as gitSync from "./git-workspace-sync.js";
 import * as restoreMerge from "./workspace-restore-merge.js";
 import { getWorkspaceRestoreDiagnostic } from "./workspace-restore-diagnostics.js";
+import * as sandboxParentGuard from "./sandbox-parent-guard.js";
 import {
   resetLocalGitIndexToHead,
   runLocalGit,
@@ -18,6 +19,7 @@ import {
 
 import {
   assertSyncOperationsConfined,
+  createTarballFromDirectory,
   escapeTarExcludeLiteral,
   mirrorDirectory,
   prepareSandboxManagedRuntime,
@@ -177,6 +179,7 @@ vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
+    lstat: vi.fn(actual.lstat),
     promises: {
       ...actual.promises,
       chmod: vi.fn(actual.promises.chmod),
@@ -670,7 +673,33 @@ describe("sandbox managed runtime", () => {
     expect(chmodMock.mock.calls[0]?.[0]).toContain(".paperclip-copy.");
     expect(chmodMock.mock.calls[0]?.[0]).not.toBe(targetPath);
     expect(chmodMock.mock.invocationCallOrder[0]).toBeLessThan(renameMock.mock.invocationCallOrder[0]);
+    const nativePublicationCandidate = Reflect.get(sandboxParentGuard, "publishNativeWorkspaceOverlayEntry");
+    const nativePublication = typeof nativePublicationCandidate === "function"
+      ? nativePublicationCandidate as (stagedPath: string, destinationPath: string, mode: number) => Promise<boolean>
+      : undefined;
+    expect(nativePublication).toBeDefined();
+    const unsupportedStagedPath = path.join(path.dirname(targetPath), "unsupported\\stage");
+    const unsupportedTargetPath = path.join(path.dirname(targetPath), "unsupported-target");
+    await writeFile(unsupportedStagedPath, "unsupported bytes\n", { mode: 0o600 });
+    expect(await nativePublication!(unsupportedStagedPath, unsupportedTargetPath, 0o755)).toBe(false);
+    await expect(readFile(unsupportedStagedPath, "utf8")).resolves.toBe("unsupported bytes\n");
+    expect((await stat(unsupportedStagedPath)).mode & 0o777).toBe(0o600);
+    await expect(readFile(unsupportedTargetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+    const nativeMetadata = await sandboxParentGuard.inspectNativeWorkspaceOverlayEntry(
+      sourcePath, path.dirname(sourcePath), relativePath.split(path.sep).join("/"), 2,
+    );
+    if (nativeMetadata) {
+      const nativeStagedPath = `${targetPath}.native-publication-stage`;
+      await mkdir(path.dirname(nativeStagedPath), { recursive: true });
+      await fsPromises.copyFile(sourcePath, nativeStagedPath);
+      expect(await nativePublication!(nativeStagedPath, targetPath, nativeMetadata.mode)).toBe(true);
+      await expect(readFile(targetPath, "utf8")).resolves.toBe("#!/bin/sh\necho hello\n");
+      expect((await stat(targetPath)).mode & 0o777).toBe(nativeMetadata.mode & 0o777);
+      await expect(readFile(nativeStagedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
+
 
   it("cleans up a staged sibling when chmod fails before rename", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-copy-cleanup-"));
@@ -700,6 +729,42 @@ describe("sandbox managed runtime", () => {
     expect(stagedPath).toContain(".paperclip-copy.");
     await expect(readFile(stagedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(targetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    const nativePublicationCandidate = Reflect.get(sandboxParentGuard, "publishNativeWorkspaceOverlayEntry");
+    const nativePublication = typeof nativePublicationCandidate === "function"
+      ? nativePublicationCandidate as (stagedPath: string, destinationPath: string, mode: number) => Promise<boolean>
+      : undefined;
+    expect(nativePublication).toBeDefined();
+    const nativeMetadata = await sandboxParentGuard.inspectNativeWorkspaceOverlayEntry(
+      sourcePath, path.dirname(sourcePath), relativePath.split(path.sep).join("/"), 2,
+    );
+    if (nativeMetadata) {
+      const missingStagedPath = path.join(rootDir, "missing-native-stage.sh");
+      const chmodTargetPath = path.join(rootDir, "native-target.sh");
+      await expect(nativePublication!(missingStagedPath, chmodTargetPath, 0o755)).rejects.toMatchObject({
+        errno: -2,
+        code: "ENOENT",
+        syscall: "chmod",
+        path: missingStagedPath,
+        message: `ENOENT: no such file or directory, chmod '${missingStagedPath}'`,
+      });
+      await expect(readFile(missingStagedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(chmodTargetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+      const renameStagedPath = path.join(rootDir, "native-rename-staged.sh");
+      const renameTargetPath = path.join(rootDir, "missing-rename-parent", "native-target.sh");
+      await writeFile(renameStagedPath, "native rename failure\n", { mode: 0o600 });
+      await expect(nativePublication!(renameStagedPath, renameTargetPath, 0o755)).rejects.toMatchObject({
+        errno: -2,
+        code: "ENOENT",
+        syscall: "rename",
+        path: renameStagedPath,
+        dest: renameTargetPath,
+        message: `ENOENT: no such file or directory, rename '${renameStagedPath}' -> '${renameTargetPath}'`,
+      });
+      await expect(readFile(renameStagedPath, "utf8")).resolves.toBe("native rename failure\n");
+      expect((await stat(renameStagedPath)).mode & 0o777).toBe(0o755);
+      await expect(readFile(renameTargetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("syncs workspace and assets through a provider-neutral sandbox client", async () => {
@@ -1235,6 +1300,18 @@ describe("sandbox managed runtime", () => {
       "utf8",
     );
     await writeFile(path.join(localWorkspaceDir, "src", "local-only.ts"), "export const local = true;\n", "utf8");
+    await mkdir(path.join(localWorkspaceDir, "packages", "ui", "literal[1]"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, "packages", "ui", "literal1"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, "packages", "ui", "multi", "path"), { recursive: true });
+    await mkdir(path.join(localWorkspaceDir, "packages", "ui", "multi", "path-sibling"), { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "literal[1]", "drop.txt"), "excluded literal segment\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "literal1", "keep.txt"), "retained literal sibling\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "multi", "path", "drop.txt"), "excluded multisegment path\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "multi", "path-sibling", "keep.txt"), "retained multisegment sibling\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "fallback.txt"), "excluded remaining pattern\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "fallback-sibling.txt"), "retained remaining sibling\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "empty-segment.txt"), "excluded empty-segment spelling\n", "utf8");
+    await writeFile(path.join(localWorkspaceDir, "packages", "ui", "empty-segment-sibling.txt"), "retained empty-segment sibling\n", "utf8");
 
     const uploadedTars: { remotePath: string; bytes: Buffer }[] = [];
     const downloadedTars: { remotePath: string; bytes: Buffer }[] = [];
@@ -1263,7 +1340,90 @@ describe("sandbox managed runtime", () => {
     };
 
     attachFallbackSyncIn(client);
-    const prepared = await prepareSandboxManagedRuntime(sandboxRuntimeInput(sandboxSpec("sandbox-1", remoteWorkspaceDir), "test-adapter", client, localWorkspaceDir));
+    const workspaceGitSnapshot = await gitSync.readGitWorkspaceSnapshot(localWorkspaceDir);
+    if (!workspaceGitSnapshot) throw new Error("Expected a Git-backed workspace snapshot");
+    const sourceRoot = await fsPromises.realpath(localWorkspaceDir);
+    const preGuard = vi.spyOn(sandboxParentGuard, "inspectNativeWorkspaceOverlayEntry");
+    const postGuard = vi.spyOn(sandboxParentGuard, "assertNativeWorkspaceOverlayPostCopy");
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-1",
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+      workspaceGitSnapshot,
+      workspaceExclude: ["*/literal[1]", "literal[1]", "literal[1]/*", "*/multi/path", "packages/ui/fallback.txt"],
+    });
+
+    // Each eligible entry uses one pre-copy and one post-copy private boundary.
+    const expectedAncestors = [
+      path.join(sourceRoot, "packages"),
+      path.join(sourceRoot, "packages", "ui"),
+      path.join(sourceRoot, "packages", "ui", "multi"),
+      path.join(sourceRoot, "packages", "ui", "multi", "path-sibling"),
+    ];
+    const deepestPreCalls = preGuard.mock.calls.filter((args) => args[1] === expectedAncestors[3]);
+    const deepestPostCalls = postGuard.mock.calls.filter((args) => args[0] === expectedAncestors[3]);
+    expect(deepestPreCalls).toHaveLength(1);
+    expect(deepestPreCalls[0]).toEqual([
+      path.join(expectedAncestors[3]!, "keep.txt"), expectedAncestors[3],
+      "packages/ui/multi/path-sibling/keep.txt", expectedAncestors.length,
+    ]);
+    expect(deepestPostCalls).toHaveLength(1);
+    expect(deepestPostCalls[0]?.[1]).toBe("packages/ui/multi/path-sibling/keep.txt");
+    expect(deepestPostCalls[0]?.[2]).toBe(expectedAncestors.length);
+    const siblingAncestors = [
+      path.join(sourceRoot, "packages"),
+      path.join(sourceRoot, "packages", "ui"),
+      path.join(sourceRoot, "packages", "ui", "literal1"),
+    ];
+    const siblingPreCalls = preGuard.mock.calls.filter((args) => args[1] === siblingAncestors[2]);
+    const siblingPostCalls = postGuard.mock.calls.filter((args) => args[0] === siblingAncestors[2]);
+    expect(siblingPreCalls).toHaveLength(1);
+    expect(siblingPreCalls[0]).toEqual([
+      path.join(siblingAncestors[2]!, "keep.txt"), siblingAncestors[2],
+      "packages/ui/literal1/keep.txt", siblingAncestors.length,
+    ]);
+    expect(siblingPostCalls).toHaveLength(1);
+    expect(siblingPostCalls[0]?.[1]).toBe("packages/ui/literal1/keep.txt");
+    expect(siblingPostCalls[0]?.[2]).toBe(siblingAncestors.length);
+    expect(deepestPreCalls.every((call) => siblingPreCalls.every((sibling) => call[0] !== sibling[0]))).toBe(true);
+    const compatibility = JSON.parse(await readFile(new URL("../dist/sandbox-parent-guard-compatibility.json", import.meta.url), "utf8")) as {
+      schemaVersion: 1;
+      targets: Array<{ platform: string; arch: string; libc: string; node: string; uv: string; glibcFloor: string }>;
+    };
+    const report: unknown = process.report.getReport();
+    let runtimeGlibc: string | undefined;
+    if (report !== null && typeof report === "object" && "header" in report) {
+      const header = report.header;
+      if (header !== null && typeof header === "object" && "glibcVersionRuntime" in header &&
+          typeof header.glibcVersionRuntime === "string") runtimeGlibc = header.glibcVersionRuntime;
+    }
+    const runtimeGlibcParts = runtimeGlibc && /^\d+\.\d+$/.test(runtimeGlibc)
+      ? runtimeGlibc.split(".").map(Number)
+      : [];
+    const nativeTargetAvailable = compatibility.schemaVersion === 1 && process.platform === "linux" && process.arch === "x64" &&
+      runtimeGlibcParts.length === 2 && compatibility.targets.some((target) => {
+        if (target.platform !== "linux" || target.arch !== "x64" || target.libc !== "glibc" ||
+            target.node !== process.versions.node || target.uv !== process.versions.uv) return false;
+        const [runtimeMajor, runtimeMinor] = runtimeGlibcParts;
+        const [floorMajor, floorMinor] = target.glibcFloor.split(".").map(Number);
+        return Number.isInteger(floorMajor) && Number.isInteger(floorMinor) &&
+          (runtimeMajor! > floorMajor! || (runtimeMajor === floorMajor && runtimeMinor! >= floorMinor!));
+      });
+    const preResults = await Promise.all(preGuard.mock.results.map((result) => result.value));
+    const postResults = await Promise.all(postGuard.mock.results.map((result) => result.value));
+    expect(preResults.every(Boolean)).toBe(nativeTargetAvailable);
+    expect(postResults.length > 0).toBe(nativeTargetAvailable);
+    expect(postResults.every(Boolean)).toBe(true);
+    preGuard.mockRestore();
+    postGuard.mockRestore();
 
     const workspaceUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
     expect(workspaceUpload).toBeDefined();
@@ -1271,6 +1431,14 @@ describe("sandbox managed runtime", () => {
     expect(workspaceMembers).toContain("src/local-only.ts");
     expect(workspaceMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
     expect(workspaceMembers.some((entry) => entry.includes("/node_modules/") || entry.endsWith("/node_modules"))).toBe(false);
+    expect(workspaceMembers).toContain("packages/ui/literal1/keep.txt");
+    expect(workspaceMembers).not.toContain("packages/ui/literal[1]/drop.txt");
+    expect(workspaceMembers).toContain("packages/ui/multi/path-sibling/keep.txt");
+    expect(workspaceMembers).not.toContain("packages/ui/multi/path/drop.txt");
+    expect(workspaceMembers).toContain("packages/ui/fallback-sibling.txt");
+    expect(workspaceMembers).not.toContain("packages/ui/fallback.txt");
+    expect(workspaceMembers).toContain("packages/ui/empty-segment-sibling.txt");
+    expect(workspaceMembers).toContain("packages/ui/empty-segment.txt");
 
     await expect(readFile(path.join(remoteWorkspaceDir, "src", "local-only.ts"), "utf8")).resolves.toBe("export const local = true;\n");
     await expect(readFile(path.join(remoteWorkspaceDir, "node_modules", "root-package", "cache.bin"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
@@ -1302,9 +1470,43 @@ describe("sandbox managed runtime", () => {
     expect(downloadMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
     expect(downloadMembers.some((entry) => entry.includes("/node_modules/") || entry.endsWith("/node_modules"))).toBe(false);
+
+    // Exercise the legacy array spelling inbound only: these patterns have a
+    // different wildcard meaning to the real outbound tar consumer.
+    const legacySnapshot = await gitSync.readGitWorkspaceSnapshot(localWorkspaceDir);
+    if (!legacySnapshot) throw new Error("Expected a Git-backed workspace snapshot");
+    legacySnapshot.overlayPaths = [
+      "packages/ui//empty-segment.txt",
+      "packages/ui/empty-segment-sibling.txt",
+    ];
+    const priorUploadCount = uploadedTars.length;
+    const legacyPrepared = await prepareSandboxManagedRuntime({
+      spec: {
+        transport: "sandbox",
+        provider: "test",
+        sandboxId: "sandbox-1",
+        remoteCwd: path.join(rootDir, "legacy-remote-workspace"),
+        timeoutMs: 30_000,
+        apiKey: null,
+      },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: localWorkspaceDir,
+      workspaceGitSnapshot: legacySnapshot,
+      workspaceExclude: ["*/*", "*/*/*"],
+    });
+    try {
+      const legacyUpload = uploadedTars.slice(priorUploadCount).find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
+      expect(legacyUpload).toBeDefined();
+      const legacyMembers = await listTarMembers(rootDir, "legacy-workspace-upload.tar", legacyUpload!.bytes);
+      expect(legacyMembers).toContain("packages/ui/empty-segment-sibling.txt");
+      expect(legacyMembers).not.toContain("packages/ui/empty-segment.txt");
+    } finally {
+      await legacyPrepared.cleanupWorkspaceSnapshot();
+    }
   });
 
-  it.each(["symlink", "root_symlink", "root_alias", "root_alias_retarget", "case_alias", "EACCES", "EIO", "ENOENT"])("handles an overlay source changed after the snapshot: %s", async (change) => {
+  it.each(["symlink", "root_symlink", "root_alias", "root_alias_retarget", "case_alias", "EACCES", "EIO", "ancestor_non_directory", "deep_fallback_callback_error", "ENOENT"])("handles an overlay source changed after the snapshot: %s", async (change) => {
     // The runtime pins a realpath root before staging. Match that spelling so
     // injected I/O errors also reach the selected file on macOS's /var alias.
     const rootDir = await fsPromises.realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-overlay-source-")));
@@ -1312,8 +1514,13 @@ describe("sandbox managed runtime", () => {
     const workspaceLocalDir = path.join(rootDir, "workspace");
     await initGitRepo(workspaceLocalDir);
     const draftsDir = path.join(workspaceLocalDir, "drafts");
-    const selectedPath = path.join(change === "root_symlink" ? workspaceLocalDir : draftsDir, "report.md");
+    const selectedPath = path.join(change === "root_symlink" ? workspaceLocalDir : draftsDir,
+      ...(change === "ancestor_non_directory" ? ["nested", "report.md"] :
+        change === "deep_fallback_callback_error" ? ["deep-1", "deep-2", "deep-3", "deep-4", "deep-5", "deep-6", "deep-7", "deep-8", "deep-9", "report.md"] : ["report.md"]));
     await mkdir(draftsDir);
+    if (change === "ancestor_non_directory" || change === "deep_fallback_callback_error") {
+      await mkdir(path.dirname(selectedPath), { recursive: true });
+    }
     await writeFile(selectedPath, "selected work\n");
     const siblings = ["a-sibling.txt", "b-sibling.txt", "c-sibling.txt"];
     for (const name of siblings) await writeFile(path.join(workspaceLocalDir, name), `allowed ${name}\n`);
@@ -1354,8 +1561,11 @@ describe("sandbox managed runtime", () => {
     };
     const realLstat = fsPromises.lstat.bind(fsPromises);
     const realRealpath = fsPromises.realpath.bind(fsPromises);
-    const failure = Object.assign(new Error(`Cannot inspect overlay: ${change}`), { code: change });
+    const failure = Object.assign(new Error(`Cannot inspect overlay: ${change}`), {
+      code: change === "deep_fallback_callback_error" ? "EACCES" : change,
+    });
     let statSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let nativePreSpy: ReturnType<typeof vi.spyOn> | undefined;
     let realpathSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       const preparing = prepareSandboxManagedRuntime({
@@ -1396,7 +1606,32 @@ describe("sandbox managed runtime", () => {
             // The root was captured with the snapshot, before config_sync.
             await fsPromises.rename(workspaceLocalDir, path.join(rootDir, "original-workspace"));
             await symlink(outsideDir, workspaceLocalDir);
-          } else {
+          } else if (change === "ancestor_non_directory") {
+            await rm(path.join(draftsDir, "nested"), { recursive: true });
+            await writeFile(path.join(draftsDir, "nested"), "not a directory\n");
+            nativePreSpy = vi.spyOn(sandboxParentGuard, "inspectNativeWorkspaceOverlayEntry");
+            statSpy = vi.spyOn(fsPromises, "lstat");
+          } else if (change === "deep_fallback_callback_error") {
+            vi.mocked(lstatCallback).mockClear();
+            vi.mocked(lstatCallback).mockImplementationOnce((...args) => {
+              expect(args[0]).toBe(draftsDir);
+              const callback = args.find((argument) => typeof argument === "function");
+              if (typeof callback !== "function") throw new Error("Expected an lstat callback");
+              callback(failure, undefined as unknown as Parameters<typeof callback>[1]);
+            });
+            statSpy = vi.spyOn(fsPromises, "lstat");
+          } else if (change === "EACCES" || change === "EIO") {
+            const realInspect = sandboxParentGuard.inspectNativeWorkspaceOverlayEntry.bind(sandboxParentGuard);
+            nativePreSpy = vi.spyOn(sandboxParentGuard, "inspectNativeWorkspaceOverlayEntry").mockImplementation(async (...args) => {
+              const result = await realInspect(...args);
+              if (args[0] === selectedPath && result) throw failure;
+              return result;
+            });
+            statSpy = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof fsPromises.lstat>) => {
+              if (args[0] === selectedPath) throw failure;
+              return realLstat(...args);
+            }) as typeof fsPromises.lstat);
+          } else if (change !== "ENOENT") {
             statSpy = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof fsPromises.lstat>) => {
               if (args[0] === selectedPath) throw failure;
               return realLstat(...args);
@@ -1408,12 +1643,38 @@ describe("sandbox managed runtime", () => {
         await preparing;
         expect(syncIn).toHaveBeenCalledOnce();
       } else {
-        await expect(preparing).rejects.toThrow(change.endsWith("symlink") ? /overlay.*directory/i : failure.message);
-        if (statSpy) expect(statSpy).toHaveBeenCalledWith(selectedPath);
+        const expectedError = change === "ancestor_non_directory"
+          ? /Workspace overlay ancestor is not a directory: drafts\/nested\/report\.md/
+          : change.endsWith("symlink") ? /overlay.*directory/i : failure.message;
+        await expect(preparing).rejects.toThrow(expectedError);
+        if (change === "ancestor_non_directory") {
+          expect(nativePreSpy).toHaveBeenCalledWith(
+            selectedPath, path.join(draftsDir, "nested"), "drafts/nested/report.md", 2,
+          );
+          expect(statSpy).not.toHaveBeenCalledWith(selectedPath);
+          const boundaryResults = await Promise.allSettled(nativePreSpy!.mock.results.map((result: { value: unknown }) => result.value));
+          if (boundaryResults[0]?.status === "rejected" && boundaryResults[0].reason !== null &&
+              typeof boundaryResults[0].reason === "object" && "guardPhase" in boundaryResults[0].reason) {
+            expect(boundaryResults[0].reason.guardPhase).toBe("ancestor");
+          }
+        }
+        if (change === "EACCES" || change === "EIO") {
+          await expect(preparing).rejects.toBe(failure);
+          expect(nativePreSpy).toHaveBeenCalledWith(selectedPath, draftsDir, "drafts/report.md", 1);
+          const boundaryResults = await Promise.allSettled(nativePreSpy!.mock.results.map((result: { value: unknown }) => result.value));
+          if (boundaryResults[0]?.status === "fulfilled") expect(statSpy).toHaveBeenCalledWith(selectedPath);
+        }
+        if (change === "deep_fallback_callback_error") {
+          await expect(preparing).rejects.toBe(failure);
+          expect(lstatCallback).toHaveBeenCalledTimes(1);
+          expect(lstatCallback).toHaveBeenCalledWith(draftsDir, expect.any(Function));
+          expect(statSpy).not.toHaveBeenCalledWith(selectedPath);
+        }
         expect(syncIn).not.toHaveBeenCalled();
       }
     } finally {
       statSpy?.mockRestore();
+      nativePreSpy?.mockRestore();
       realpathSpy?.mockRestore();
     }
   });
@@ -1463,6 +1724,29 @@ describe("sandbox managed runtime", () => {
     const members = await listTarMembers(rootDir, "ignored-whitespace-workspace-upload.tar", workspaceUpload!.bytes);
     expect(members).not.toContain(ignoredName);
     expect(members).toContain("kept.txt");
+  });
+
+  it("preserves unusual UTF-8 filenames and content across a multi-chunk tar entry list", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-tar-list-"));
+    cleanupDirs.push(rootDir);
+    const sourceDir = path.join(rootDir, "source");
+    const targetDir = path.join(rootDir, "target");
+    const archivePath = path.join(rootDir, "workspace.tar");
+    await mkdir(sourceDir);
+    await mkdir(targetDir);
+    const names = Array.from({ length: 400 }, (_, index) =>
+      `-${String(index).padStart(3, "0")}-${"é".repeat(90)}\t\n'\\ `);
+    for (const [index, name] of names.entries()) {
+      await writeFile(path.join(sourceDir, name), `payload ${index}\n`);
+    }
+
+    await createTarballFromDirectory({ localDir: sourceDir, archivePath });
+    await execFile("tar", ["-xf", archivePath, "-C", targetDir]);
+
+    expect((await readdir(targetDir)).sort()).toEqual([...names].sort());
+    for (const [index, name] of names.entries()) {
+      expect(await readFile(path.join(targetDir, name), "utf8")).toBe(`payload ${index}\n`);
+    }
   });
 
   it("builds workspace/asset tarballs without a './' self-entry (so untar does not chmod/utime an unowned target dir)", async () => {

@@ -89,9 +89,62 @@ describe("bounded workspace snapshot reads", () => {
       setTimeout(() => stream.resume(), 10);
       return stream;
     });
+    const open = fs.open.bind(fs);
+    vi.spyOn(fs, "open").mockImplementation(async (observedPath, flags, mode) => {
+      const file = await open(observedPath, flags, mode);
+      if (!String(observedPath).startsWith(`${root}${path.sep}`)) return file;
+      return {
+        read: async (...args: Parameters<typeof file.read>) => {
+          active++;
+          peak = Math.max(peak, active);
+          try {
+            await new Promise<void>(resolve => setTimeout(resolve, 10));
+            return await file.read(...args);
+          } finally {
+            active--;
+          }
+        },
+        close: file.close.bind(file),
+      } as unknown as typeof file;
+    });
     const snapshot = await captureDirectorySnapshot(root, { diskBacked: true });
     try {
       expect(snapshot.entries.size).toBe(107);
+      expect(peak).toBeGreaterThan(1);
+      expect(peak).toBeLessThanOrEqual(16);
+      expect(active).toBe(0);
+    } finally {
+      await disposeDirectorySnapshot(snapshot);
+    }
+  });
+
+  it("overlaps streamed files above the small-file cutoff within the original read bound", async () => {
+    const root = await fixture();
+    const expectedHashes = new Map<string, string>();
+    for (let index = 0; index < 17; index++) {
+      const relative = `large-${index}`;
+      const bytes = Buffer.alloc(64 * 1024 + 1, index);
+      await fs.writeFile(path.join(root, relative), bytes);
+      expectedHashes.set(relative, createHash("sha256").update(bytes).digest("hex"));
+    }
+    let active = 0;
+    let peak = 0;
+    vi.mocked(createReadStream).mockImplementation((...args) => {
+      const stream = originalFs.createReadStream(...args);
+      stream.pause();
+      active++;
+      peak = Math.max(peak, active);
+      const settled = () => { active--; };
+      stream.once("end", settled);
+      stream.once("error", settled);
+      setTimeout(() => stream.resume(), 10);
+      return stream;
+    });
+    const snapshot = await captureDirectorySnapshot(root, { diskBacked: true });
+    try {
+      expect(new Map([...snapshot.entries].map(([relative, entry]) => [
+        relative, entry.kind === "file" ? entry.hash : null,
+      ]))).toEqual(expectedHashes);
       expect(peak).toBeGreaterThan(1);
       expect(peak).toBeLessThanOrEqual(16);
       expect(active).toBe(0);
@@ -141,6 +194,8 @@ describe("bounded workspace snapshot reads", () => {
     await fs.writeFile(path.join(root, "pending"), "pending bytes");
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
+    let peerReadStarted!: () => void;
+    const peerReadGate = new Promise<void>(resolve => { peerReadStarted = resolve; });
     let pending = false;
     let failed = false;
     let active = 0;
@@ -158,6 +213,31 @@ describe("bounded workspace snapshot reads", () => {
       }
       return stream;
     });
+    const open = fs.open.bind(fs);
+    const readError = Object.assign(new Error("read failed"), { code: "EIO" });
+    vi.spyOn(fs, "open").mockImplementation(async (observedPath, flags, mode) => {
+      const file = await open(observedPath, flags, mode);
+      if (!String(observedPath).startsWith(`${root}${path.sep}`)) return file;
+      return {
+        read: async (...args: Parameters<typeof file.read>) => {
+          active++;
+          try {
+            if (String(observedPath) === path.join(root, "failed")) {
+              await peerReadGate;
+              failed = true;
+              throw readError;
+            }
+            pending = true;
+            peerReadStarted();
+            await gate;
+            return await file.read(...args);
+          } finally {
+            active--;
+          }
+        },
+        close: file.close.bind(file),
+      } as unknown as typeof file;
+    });
     let settled = false;
     const result = captureDirectorySnapshot(root, { diskBacked: true }).then(
       () => { settled = true; return null; },
@@ -169,6 +249,8 @@ describe("bounded workspace snapshot reads", () => {
       expect(active).toBe(1);
     } finally {
       release();
+      peerReadStarted();
+      await result;
     }
     expect(await result).toMatchObject({ code: "EIO" });
     expect(active).toBe(0);

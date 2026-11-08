@@ -156,14 +156,50 @@ export function* workspacePaths(paths: WorkspacePaths): Generator<string> {
 /** Exact paths and their descendants; Git ignore output is literal, not a glob. */
 export function workspacePathMatcher(paths?: WorkspacePaths): { matches(relative: string): boolean; close(): void } {
   const db = paths && isPathManifest(paths) ? openDatabase(paths.filePath) : null;
-  const lookup = db?.prepare("SELECT 1 FROM records WHERE category=? AND path=?");
+  const lookup = db?.prepare("SELECT 1 FROM records WHERE category=? AND path IN (?, ?, ?, ?, ?, ?, ?, ?)");
   return {
     matches(relative) {
+      if (lookup && paths && isPathManifest(paths)) {
+        let current = relative;
+        while (current) {
+          const candidate1: string | null = current;
+          let candidate2: string | null = null;
+          let candidate3: string | null = null;
+          let candidate4: string | null = null;
+          let candidate5: string | null = null;
+          let candidate6: string | null = null;
+          let candidate7: string | null = null;
+          let candidate8: string | null = null;
+          let candidate = current;
+          for (let index = 1; index < 8; index++) {
+            const slash = candidate.lastIndexOf("/");
+            if (slash < 0) {
+              candidate = "";
+              break;
+            }
+            candidate = candidate.slice(0, slash);
+            if (index === 1) candidate2 = candidate;
+            else if (index === 2) candidate3 = candidate;
+            else if (index === 3) candidate4 = candidate;
+            else if (index === 4) candidate5 = candidate;
+            else if (index === 5) candidate6 = candidate;
+            else if (index === 6) candidate7 = candidate;
+            else candidate8 = candidate;
+          }
+          if (lookup.get(paths.category, candidate1, candidate2, candidate3, candidate4, candidate5, candidate6, candidate7, candidate8)) return true;
+          if (candidate8) {
+            const slash = candidate8.lastIndexOf("/");
+            current = slash < 0 ? "" : candidate8.slice(0, slash);
+          } else {
+            current = "";
+          }
+        }
+        return false;
+      }
+
       let current = relative;
       while (current) {
-        if (lookup && paths && isPathManifest(paths)
-          ? Boolean(lookup.get(paths.category, current))
-          : (paths as readonly string[] | undefined)?.includes(current)) return true;
+        if ((paths as readonly string[] | undefined)?.includes(current)) return true;
         const slash = current.lastIndexOf("/");
         if (slash < 0) break;
         current = current.slice(0, slash);

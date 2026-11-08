@@ -5,6 +5,8 @@
  * External npm packages remain as regular dependencies.
  */
 
+import { copyFileSync, existsSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve, dirname } from "node:path";
@@ -66,6 +68,25 @@ if (bundledCliNpmDependencies.has("embedded-postgres")) {
 }
 
 /** @type {import('esbuild').BuildOptions} */
+const sandboxParentGuardAssets = {
+  name: "sandbox-parent-guard-assets",
+  setup(build) {
+    build.onStart(() => {
+      execFileSync(process.execPath, [resolve(repoRoot, "scripts/build-sandbox-parent-guard.mjs")], { stdio: "inherit" });
+    });
+    build.onEnd((result) => {
+      if (result.errors.length > 0) return;
+      const sourceDirectory = resolve(repoRoot, "packages/adapter-utils/dist");
+      const outputDirectory = resolve(repoRoot, "cli/dist");
+      for (const name of ["sandbox-parent-guard-linux-x64-gnu.node", "sandbox-parent-guard-compatibility.json"]) {
+        const source = resolve(sourceDirectory, name);
+        if (existsSync(source)) copyFileSync(source, resolve(outputDirectory, name));
+        else rmSync(resolve(outputDirectory, name), { force: true });
+      }
+    });
+  },
+};
+
 export default {
   entryPoints: ["src/index.ts"],
   bundle: true,
@@ -77,4 +98,5 @@ export default {
   external: [...externals].sort(),
   treeShaking: true,
   sourcemap: true,
+  plugins: [sandboxParentGuardAssets],
 };

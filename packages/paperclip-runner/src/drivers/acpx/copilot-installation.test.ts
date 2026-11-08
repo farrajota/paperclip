@@ -87,9 +87,25 @@ vi.mock("./installation-integrity.js", () => ({ verifyNativeAcpxInstallation: vi
 
 describe("Copilot build-owned installation", () => {
   it("admits the current profile with environment launch preparation", () => {
-    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(61);
+    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(62);
     expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBeUndefined();
-    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:6522c3747aba0279ed7c9ced2a024659edbb44a7f7a22bf578e727c9f732f955");
+    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:372d646aebe76157b832c3bf81afd07ec8649e5c0b5ee2954a3956feedb25b0f");
+  });
+
+  it("preserves v61 while binding the merged schema-compiler bridge and runtime admission in v62", async () => {
+    const priorBytes = readFileSync(new URL("../../../test/fixtures/copilot-profile-v61-identity.json", import.meta.url));
+    expect(createHash("sha256").update(priorBytes).digest("hex")).toBe("b336c74f8a085e584b03377029a877296eab10b5dbeae79e99177cba4987b207");
+    const prior = JSON.parse(priorBytes.toString("utf8"));
+    const current = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v62-identity.json", import.meta.url), "utf8"));
+    expect(Object.keys(current.declaration).filter(key => current.declaration[key] !== prior.declaration[key]).sort()).toEqual([
+      "agentProfileVersion", "profileCompatibilitySourceSha256", "runtimeAdapterSourceSha256",
+      "runtimeHostSourceSha256", "semanticBridgeSourceSha256",
+    ]);
+    expect(Object.keys(current.declaration).sort()).toEqual(Object.keys(prior.declaration).sort());
+    expect(isSupportedAcpxProfileVersion("copilot", 61)).toBe(true);
+    expect(current.commandDigest).not.toBe(prior.commandDigest);
+    await expect(verifyCopilotInstallation({ ...QUALIFIED_ACPX_PROFILES.copilot,
+      agentProfileVersion: 61, commandDigest: prior.commandDigest })).rejects.toThrow("exact pinned");
   });
 
   it("preserves v60 while binding controller journal retirement in v61", async () => {

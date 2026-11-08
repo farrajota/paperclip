@@ -195,7 +195,10 @@ export type AcpxMcpServerBinding = {
   name: string; command: string; args: string[]; env: Record<string, string>; runnerOwned: false;
 };
 
-export type AcpxSemanticToolSession = Omit<RunnerToolBridgeOptions, "secret" | "preloadClaudeTaskTools">;
+export type AcpxSemanticToolSession = Omit<
+  RunnerToolBridgeOptions,
+  "secret" | "ajvConstructor" | "preloadClaudeTaskTools"
+>;
 
 export interface AcpxRetainedCleanupFailure {
   resource:
@@ -355,6 +358,12 @@ export class AcpxRuntimeHost {
       throw new Error("assigned native MCP launch binding is unavailable");
     }
     const profile = resolveQualifiedAcpxProfile(options.agent, options.model);
+    const { Ajv2020 } = await runAbortableAdmissionStage(
+      options.signal,
+      () => import("ajv/dist/2020.js"),
+      dependencies.retainAdmissionCleanup,
+    );
+    options.signal?.throwIfAborted();
     const binding = await runAbortableAdmissionStage(
       options.signal,
       () =>
@@ -592,6 +601,7 @@ export class AcpxRuntimeHost {
               ...options.semanticTools!,
               preserveToolNames: options.assignedMcpTransport === "prp",
               preloadClaudeTaskTools: options.agent === "claude",
+              ajvConstructor: Ajv2020,
             }),
             resource: "tool_bridge",
             releaseLate: (lateToolBridge) => lateToolBridge.close(),

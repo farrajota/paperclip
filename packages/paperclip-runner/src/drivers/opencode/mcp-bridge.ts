@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
+import type { Ajv2020, Options as AjvOptions, ValidateFunction } from "ajv/dist/2020.js";
 
 import {
   PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
@@ -10,6 +10,8 @@ import {
   PRP_COMPLETION_TOOL_DESCRIPTION,
   PRP_COMPLETION_TOOL_NAME,
 } from "../../contracts/completion-result.js";
+
+export type Ajv2020Constructor = new (options?: AjvOptions) => Ajv2020;
 
 export interface OpenCodeMcpToolDefinition {
   name: string;
@@ -34,6 +36,7 @@ export interface OpenCodeMcpBridgeOptions {
   privateToolTimeoutMs?: number;
   maxBodyBytes?: number;
   secret?: string;
+  ajvConstructor: Ajv2020Constructor;
 }
 
 export interface OpenCodeMcpBridge {
@@ -61,7 +64,7 @@ export async function startOpenCodeMcpBridge(
   const tools = normalizeTools(options.tools ?? []);
   const privateTools = normalizeTools(options.privateTools ?? [], false);
   const admittedTools = [...tools, ...privateTools.filter((candidate) => !tools.some((tool) => tool.name === candidate.name))];
-  const validators = compileValidators(admittedTools);
+  const validators = compileValidators(admittedTools, options.ajvConstructor);
   const calls = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   const controllers = new Map<string, AbortController>();
   const server = createServer((request, response) => {
@@ -127,8 +130,8 @@ function normalizeTools(
   return tools;
 }
 
-function compileValidators(tools: readonly OpenCodeMcpToolDefinition[]): Map<string, ValidateFunction> {
-  const ajv = new Ajv2020({ allErrors: true, strict: false });
+function compileValidators(tools: readonly OpenCodeMcpToolDefinition[], Ajv: Ajv2020Constructor): Map<string, ValidateFunction> {
+  const ajv = new Ajv({ allErrors: true, strict: false });
   return new Map(tools.map((tool) => [tool.name, ajv.compile(tool.inputSchema)]));
 }
 

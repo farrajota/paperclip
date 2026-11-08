@@ -6,10 +6,12 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   constants as fsConstants,
   createReadStream,
+  lstat as lstatCallback,
   promises as fs,
+  type Stats,
 } from "node:fs";
 import os from "node:os";
-import { createWorkspaceManifest, WorkspaceManifestMap, workspacePaths, workspacePathMatcher, writeWorkspacePaths, isPathManifest, type WorkspacePaths } from "./workspace-manifest.js";
+import { createWorkspaceManifest, WorkspaceManifestMap, workspacePaths, workspacePathMatcher, isPathManifest, WORKSPACE_STREAM_CHUNK_BYTES, type WorkspacePaths } from "./workspace-manifest.js";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -62,6 +64,17 @@ import {
   type WorkspaceRestoreDiagnostic,
 } from "./workspace-restore-diagnostics.js";
 
+import {
+  assertNativeWorkspaceOverlayPostCopy,
+  inspectNativeWorkspaceOverlayEntry,
+  publishNativeWorkspaceOverlayEntry,
+  type NativeWorkspaceEntryMetadata,
+} from "./sandbox-parent-guard.js";
+
+function isNativePreGuardNotFound(error: unknown): boolean {
+  if (error === null || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") return false;
+  return "guardPhase" in error && (error.guardPhase === "ancestor" || error.guardPhase === "leaf");
+}
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
   "node_modules",
@@ -715,7 +728,7 @@ function buildRemoveDeletedPathsCommand(input: { remoteDir: string; manifestPath
   // NUL input plus bounded xargs batches preserve whitespace and never create
   const remove = `for entry do
     parent=$entry
-    while [ "\${parent#*/}" != "$parent" ]; do
+    while case "$parent" in */*) : ;; *) ! : ;; esac; do
       parent=\${parent%/*}
       if [ -L "$parent" ] || { [ -e "$parent" ] && [ ! -d "$parent" ]; }; then exit 42; fi
     done
@@ -872,6 +885,44 @@ async function execTar(args: string[]): Promise<void> {
   });
 }
 
+async function writeNulDelimitedFile(
+  filePath: string,
+  entries: Iterable<string> | AsyncIterable<string>,
+): Promise<void> {
+  const file = await fs.open(filePath, "wx", 0o600);
+  try {
+    // Batch bytes, not paths: long names and split UTF-8 sequences stay intact
+    // in the NUL-delimited file without retaining the whole selection in memory.
+    const chunk = Buffer.alloc(WORKSPACE_STREAM_CHUNK_BYTES);
+    let used = 0;
+    for await (const entry of entries) {
+      const recordBytes = Buffer.byteLength(entry, "utf8") + 1;
+      if (recordBytes <= chunk.length - used) {
+        used += chunk.write(entry, used, recordBytes - 1, "utf8");
+        chunk[used++] = 0;
+        if (used === chunk.length) {
+          await file.writeFile(chunk);
+          used = 0;
+        }
+        continue;
+      }
+
+      const record = Buffer.from(`${entry}\0`);
+      let offset = 0;
+      while (offset < record.length) {
+        const copied = record.copy(chunk, used, offset);
+        used += copied;
+        offset += copied;
+        if (used === chunk.length) {
+          await file.writeFile(chunk);
+          used = 0;
+        }
+      }
+    }
+    if (used > 0) await file.writeFile(chunk.subarray(0, used));
+  } finally { await file.close(); }
+}
+
 export async function createTarballFromDirectory(input: {
   localDir: string;
   archivePath: string;
@@ -887,12 +938,12 @@ export async function createTarballFromDirectory(input: {
   // entries avoids the self-entry entirely and is portable across GNU/BSD/busybox
   // tar (no GNU-only --no-overwrite-dir needed). --exclude still filters nested
   // matches and any named entry it matches.
+  async function* entryNames(): AsyncGenerator<string> {
+    for await (const entry of await fs.opendir(input.localDir)) yield entry.name;
+  }
   await withTempDir("paperclip-tar-list-", async (directory) => {
     const list = path.join(directory, "entries.nul");
-    const file = await fs.open(list, "wx", 0o600);
-    try {
-      for await (const entry of await fs.opendir(input.localDir)) await file.writeFile(`${entry.name}\0`);
-    } finally { await file.close(); }
+    await writeNulDelimitedFile(list, entryNames());
     await execTar(["-c", "--no-xattrs", ...(input.followSymlinks ? ["-h"] : []),
       "-f", input.archivePath, "-C", input.localDir, ...excludeArgs, "--null", "-T", list]);
   });
@@ -985,19 +1036,20 @@ export async function restoreVerifiedSnapshotArchive(input: {
   await confineFullWorkspaceExport(input.localDir, true);
 }
 
-async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relative: string): Promise<void> {
+async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relative: string, sourceStats?: Stats | NativeWorkspaceEntryMetadata): Promise<void> {
   const sourcePath = path.join(sourceRoot, relative);
   const targetPath = path.join(targetRoot, relative);
-  const stats = await fs.lstat(sourcePath);
-
-  if (stats.isDirectory()) {
+  const stats = sourceStats ?? await fs.lstat(sourcePath);
+  const isDirectory = "kind" in stats ? stats.kind === 1 : stats.isDirectory();
+  const isSymbolicLink = "kind" in stats ? stats.kind === 2 : stats.isSymbolicLink();
+  if (isDirectory) {
     await fs.mkdir(targetPath, { recursive: true });
     return;
   }
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
-  if (stats.isSymbolicLink()) {
+  if (isSymbolicLink) {
     const linkTarget = await fs.readlink(sourcePath);
     await fs.symlink(linkTarget, targetPath);
     return;
@@ -1005,14 +1057,24 @@ async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relati
 
   const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
   await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+  let published = false;
   try {
     await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, stagedTargetPath);
     });
-    await fs.chmod(stagedTargetPath, stats.mode);
-    await fs.rename(stagedTargetPath, targetPath);
+    let nativePublished = false;
+    if ("kind" in stats && stats.kind === 0) {
+      nativePublished = await publishNativeWorkspaceOverlayEntry(stagedTargetPath, targetPath, stats.mode);
+    }
+    if (!nativePublished) {
+      await fs.chmod(stagedTargetPath, stats.mode);
+      await fs.rename(stagedTargetPath, targetPath);
+    }
+    published = true;
   } finally {
-    await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    if (!published) {
+      await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
@@ -1055,6 +1117,46 @@ async function captureWorkspaceSourceRoot(localDir: string): Promise<WorkspaceSo
   return { sourceDir, dev: stats.dev, ino: stats.ino };
 }
 
+async function assertWorkspaceOverlayParentDirectory(
+  relative: string,
+  sourceDir: string,
+  segments: readonly string[],
+  ancestorPaths: readonly string[],
+): Promise<void> {
+  if (segments.length === 0) return;
+  return new Promise<void>((resolve, reject) => {
+    let index = 0;
+    let parentPath = sourceDir;
+    const inspectNext = () => {
+      const segment = segments[index]!;
+      if (segment === "..") {
+        reject(new Error(`Workspace overlay directory escapes its root: ${relative}`));
+        return;
+      }
+      parentPath = ancestorPaths[index] ?? path.join(parentPath, segment);
+      try {
+        lstatCallback(parentPath, inspectParent);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    const inspectParent = (error: NodeJS.ErrnoException | null, stats: Stats) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (!stats.isDirectory()) {
+        reject(new Error(`Workspace overlay ancestor is not a directory: ${relative}`));
+        return;
+      }
+      index++;
+      if (index === segments.length) resolve();
+      else queueMicrotask(inspectNext);
+    };
+    inspectNext();
+  });
+}
+
 async function copySelectedWorkspaceEntries(input: {
   sourceRoot: WorkspaceSourceRoot;
   targetDir: string;
@@ -1072,7 +1174,77 @@ async function copySelectedWorkspaceEntries(input: {
   };
   await assertSourceRoot();
   const ignored = workspacePathMatcher(input.ignoredPaths);
-  // Cache only bounded path spellings; every entry still checks live metadata.
+  // Partially evaluate only bounded, immutable lexical exclusions. Oversized
+  // inputs retain the original predicate path without changing selection.
+  const MAX_EXCLUDE_PATTERNS = 128;
+  const MAX_EXCLUDE_SEGMENT_LENGTH = 256;
+  const MAX_PARENT_PREFIX_LENGTH = 4096;
+  let lexicalSegments: Set<string> | undefined;
+  let remainingExcludes: string[] | undefined;
+  if (input.exclude.length <= MAX_EXCLUDE_PATTERNS) {
+    const segments = new Set<string>();
+    const remaining: string[] = [];
+    let eligible = true;
+    for (const pattern of input.exclude) {
+      if (pattern.startsWith("*/") && pattern.endsWith("/*")) {
+        const segment = pattern.slice(2, -2);
+        if (segment.length > 0 && !segment.includes("/")) {
+          if (segment.length > MAX_EXCLUDE_SEGMENT_LENGTH) { eligible = false; break; }
+          segments.add(segment);
+          continue;
+        }
+      } else if (pattern.startsWith("*/")) {
+        const segment = pattern.slice(2);
+        if (segment.length > 0 && !segment.includes("/")) {
+          if (segment.length > MAX_EXCLUDE_SEGMENT_LENGTH) { eligible = false; break; }
+          segments.add(segment);
+          continue;
+        }
+      }
+      remaining.push(pattern);
+    }
+    if (eligible) {
+      let retainedCount = 0;
+      for (const pattern of remaining) {
+        // Keep */ patterns in the original matcher; for example, */* matches internal empty segments.
+        if (pattern.startsWith("*/")) {
+          remaining[retainedCount++] = pattern;
+          continue;
+        }
+        const root = pattern.endsWith("/*") ? pattern.slice(0, -2) : pattern;
+        if (!segments.has(root)) remaining[retainedCount++] = pattern;
+      }
+      remaining.length = retainedCount;
+      lexicalSegments = segments;
+      remainingExcludes = remaining;
+    }
+  }
+  let cachedParentPrefix: string | undefined;
+  let cachedParentExcluded = false;
+  const parentMatchesLexicalSegment = (parent: string): boolean => {
+    if (!lexicalSegments) return false;
+    for (const segment of lexicalSegments) {
+      let start = 0;
+      while (start < parent.length) {
+        const end = parent.indexOf("/", start);
+        const segmentEnd = end < 0 ? parent.length : end;
+        if (segmentEnd - start === segment.length && parent.startsWith(segment, start)) return true;
+        if (end < 0) break;
+        start = end + 1;
+      }
+    }
+    return false;
+  };
+  const pathMatchesLexicalSegment = (relative: string, parentLength: number): boolean => {
+    if (!lexicalSegments) return false;
+    const basenameStart = parentLength < 0 ? 0 : parentLength + 1;
+    const basenameLength = relative.length - basenameStart;
+    for (const segment of lexicalSegments) {
+      if (basenameLength === segment.length && relative.startsWith(segment, basenameStart)) return true;
+    }
+    return false;
+  };
+  // Cache only one bounded parent spelling and its pure predicate result.
   let cachedParent: {
     directory: string;
     segments: readonly string[];
@@ -1093,35 +1265,42 @@ async function copySelectedWorkspaceEntries(input: {
     // Capture immutable references before another in-flight copy changes the cache.
     const parentSegments = parent.segments;
     const ancestorPaths = parent.ancestors;
-    const assertParentDirectory = async () => {
-      // Git selected this path before staging. A replaced ancestor must not
-      // redirect the copy through a symlink, even to another workspace folder.
-      // Inspect types instead of comparing realpath spelling: case-insensitive
-      // filesystems can resolve Git's indexed casing to a renamed directory.
-      let parentPath = sourceDir;
-      for (let index = 0; index < parentSegments.length; index++) {
-        const segment = parentSegments[index]!;
-        if (segment === "..") throw new Error(`Workspace overlay directory escapes its root: ${relative}`);
-        parentPath = ancestorPaths[index] ?? path.join(parentPath, segment);
-        if (!(await fs.lstat(parentPath)).isDirectory()) {
-          throw new Error(`Workspace overlay ancestor is not a directory: ${relative}`);
-        }
+    let nativeStats: NativeWorkspaceEntryMetadata | undefined = undefined;
+    if (parentSegments.length > 0 && ancestorPaths.length === parentSegments.length) {
+      try {
+        nativeStats = await inspectNativeWorkspaceOverlayEntry(
+          sourcePath,
+          ancestorPaths[ancestorPaths.length - 1]!,
+          relative,
+          parentSegments.length,
+        );
+      } catch (error) {
+        if (isNativePreGuardNotFound(error)) return;
+        throw error;
       }
-    };
-    // Include root-level entries, and do not treat a missing root as an
-    // ordinary source file that disappeared after the snapshot.
-    await assertSourceRoot();
-    try {
-      await assertParentDirectory();
-      await fs.lstat(sourcePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
     }
-    await copyWorkspaceEntry(sourceDir, input.targetDir, relative);
+    let sourceStats: Stats | NativeWorkspaceEntryMetadata;
+    if (nativeStats) {
+      sourceStats = nativeStats;
+    } else {
+      try {
+        // Git-selected ancestry and leaf metadata remain fresh on explicit JS fallback.
+        await assertWorkspaceOverlayParentDirectory(relative, sourceDir, parentSegments, ancestorPaths);
+        sourceStats = await fs.lstat(sourcePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+    }
+    await copyWorkspaceEntry(sourceDir, input.targetDir, relative, sourceStats);
+
     // Do not upload the staged tree if an ancestor changed during the copy.
+    if (nativeStats && ancestorPaths.length === parentSegments.length &&
+        await assertNativeWorkspaceOverlayPostCopy(
+          ancestorPaths[ancestorPaths.length - 1]!, relative, parentSegments.length, dev, ino,
+        )) return;
     await assertSourceRoot();
-    await assertParentDirectory();
+    await assertWorkspaceOverlayParentDirectory(relative, sourceDir, parentSegments, ancestorPaths);
   };
   const batch: string[] = [];
   const copyBatch = async (): Promise<void> => {
@@ -1152,7 +1331,23 @@ async function copySelectedWorkspaceEntries(input: {
   };
   try {
     for (const relative of workspacePaths(input.relativePaths)) {
-      if (shouldExcludePath(relative, input.exclude) || ignored.matches(relative)) continue;
+      const parentLength = relative.lastIndexOf("/");
+      let excluded: boolean;
+      if (!lexicalSegments || !remainingExcludes || parentLength > MAX_PARENT_PREFIX_LENGTH) {
+        excluded = shouldExcludePath(relative, input.exclude);
+      } else {
+        if (parentLength < 0) {
+          excluded = pathMatchesLexicalSegment(relative, parentLength) || shouldExcludePath(relative, remainingExcludes);
+        } else {
+          if (cachedParentPrefix === undefined || cachedParentPrefix.length !== parentLength || !relative.startsWith(cachedParentPrefix)) {
+            cachedParentPrefix = relative.slice(0, parentLength);
+            cachedParentExcluded = parentMatchesLexicalSegment(cachedParentPrefix);
+          }
+          excluded = cachedParentExcluded || pathMatchesLexicalSegment(relative, parentLength) ||
+            shouldExcludePath(relative, remainingExcludes);
+        }
+      }
+      if (excluded || ignored.matches(relative)) continue;
       batch.push(relative);
       // Keep manifest consumption and filesystem work bounded to four entries.
       if (batch.length === 4) await copyBatch();
@@ -1733,7 +1928,7 @@ export async function prepareSandboxManagedRuntime(input: {
             if ((isPathManifest(deletedPaths) ? deletedPaths.count : deletedPaths.length) > 0) {
               const deletedManifest = path.join(tempDir, "deleted.nul");
               const remoteDeletedManifest = path.posix.join(runtimeRootDir, "deleted.nul");
-              await runStepSpan("workspace.deleted_manifest", () => writeWorkspacePaths(deletedPaths, deletedManifest));
+              await runStepSpan("workspace.deleted_manifest", () => writeNulDelimitedFile(deletedManifest, workspacePaths(deletedPaths)));
               workspaceFiles.push({ sourcePath: deletedManifest, targetPath: remoteDeletedManifest, kind: "file", access: "rw", writablePath: runtimeRootDir });
               workspacePostUploadCommands.push({ command: buildRemoveDeletedPathsCommand({ remoteDir: workspaceRemoteDir, manifestPath: remoteDeletedManifest }) });
             }

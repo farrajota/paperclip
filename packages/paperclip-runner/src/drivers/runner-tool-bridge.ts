@@ -7,7 +7,7 @@ import {
   type ServerResponse,
 } from "node:http";
 
-import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
+import type { Ajv2020, Options as AjvOptions, ValidateFunction } from "ajv/dist/2020.js";
 
 import {
   PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
@@ -17,6 +17,8 @@ import {
   PRP_COMPLETION_TOOL_DESCRIPTION,
   PRP_COMPLETION_TOOL_NAME,
 } from "../contracts/completion-result.js";
+
+type Ajv2020Constructor = new (options?: AjvOptions) => Ajv2020;
 
 export interface RunnerToolDefinition {
   name: string;
@@ -53,6 +55,7 @@ export interface RunnerToolBridgeOptions {
   /** Internal test seam; production bounds headers and body reads to 30 seconds. */
   requestBodyTimeoutMs?: number;
   secret?: string;
+  ajvConstructor: Ajv2020Constructor;
 }
 
 export interface RunnerToolBridge {
@@ -132,7 +135,7 @@ export async function startRunnerToolBridge(
     }
   }
   const admittedTools = [...visibleTools, ...privateTools];
-  const validators = compileValidators(admittedTools);
+  const validators = compileValidators(admittedTools, options.ajvConstructor);
   const calls = new Map<string, AdmittedCall>();
   const controllers = new Map<string, AbortController>();
   const context = {
@@ -452,8 +455,9 @@ function normalizeTools(
 
 function compileValidators(
   tools: readonly RunnerToolDefinition[],
+  Ajv: Ajv2020Constructor,
 ): Map<string, ValidateFunction> {
-  const ajv = new Ajv2020({ allErrors: true, strict: false });
+  const ajv = new Ajv({ allErrors: true, strict: false });
   return new Map(
     tools.map((tool) => [tool.name, ajv.compile(tool.inputSchema)]),
   );
