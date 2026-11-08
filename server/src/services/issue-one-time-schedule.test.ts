@@ -37,6 +37,24 @@ describe("issue one-time schedule time normalization", () => {
       normalizeIssueScheduleTime("2026-10-23T00:00:00Z", "UTC", NOW),
     ).toThrow("future");
   });
+
+  it("normalizes offsets that are not whole hours", () => {
+    expect(
+      normalizeIssueScheduleTime("2026-10-26T18:30:00+05:30", "Asia/Kolkata", NOW),
+    ).toEqual({ dueAt: DUE_AT, timeZone: "Asia/Kolkata" });
+    expect(
+      normalizeIssueScheduleTime("2026-10-26T18:45:00+05:45", "Asia/Kathmandu", NOW),
+    ).toEqual({ dueAt: DUE_AT, timeZone: "Asia/Kathmandu" });
+  });
+
+  it("rejects out-of-range offset hours and minutes", () => {
+    expect(() =>
+      normalizeIssueScheduleTime("2026-10-26T13:00:00+24:00", "UTC", NOW),
+    ).toThrow("Invalid scheduled timestamp");
+    expect(() =>
+      normalizeIssueScheduleTime("2026-10-26T13:00:00+05:60", "UTC", NOW),
+    ).toThrow("Invalid scheduled timestamp");
+  });
 });
 
 describe("one-time schedule due claim policy", () => {
