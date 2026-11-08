@@ -2943,6 +2943,10 @@ describe("OpenCodeServerDriver", () => {
             ? "repair-criteria-wrong final-after-tool-commentary"
             : "final-after-tool-commentary" },
         });
+        // The driver subscribes to /event after its asynchronous request recovery,
+        // which startTurn does not await. OpenCode cannot deliver SSE frames before
+        // that subscription exists, so each ordering starts from an open stream.
+        await vi.waitFor(() => expect(stream).toBeDefined());
         if (ordering !== "sse-before-rpc") {
           await feedbackStarted;
           releaseFeedback();
