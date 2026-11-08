@@ -196,6 +196,19 @@ reports the prior cursor once after reconnect. The runner sends the same bytes
 again. The mock increments delivery count, keeps one logical event, and sends
 the committed cumulative ACK.
 
+After a terminal command, the runner waits for the controller to acknowledge
+the terminal result and then the rest of its outbox before it clears the
+terminal fence. A warm run attachment likewise waits for the old authority's
+outbox first. Each of these waits fails after two seconds without cumulative
+ACK progress, not after two seconds in total. Every ACK that advances the
+durable cursor starts a new two-second window, so a controller that is still
+committing a large retained outbox on a slow volume is not treated as stalled.
+Repeating the current cursor does not extend the window. A positive
+`--max-runtime-ms` still bounds the whole wait; progress cannot extend it past
+the process deadline. Acknowledgements without a cursor, such as the
+warm-activation and warm-attachment result receipts, keep a fixed two-second
+bound.
+
 ## Command delivery and effects
 
 Mock-core commands are durable before delivery. Only the lowest pending
@@ -375,8 +388,8 @@ repeatedly read, parse and fingerprint the durable state files to decide which
 provider command to issue: those epochs cannot issue provider commands. Initial
 binding checks, authenticated event processing, exact retirement and final
 settlement checks remain required. Command-driving state polling belongs to the
-later provider-stop/drain epoch; receipt acknowledgements retain their existing
-deadline.
+later provider-stop/drain epoch. Receipt and old-outbox acknowledgements use the
+progress-based deadline described in [Event delivery and ACKs](#event-delivery-and-acks).
 
 ## Protocol versions and warm handoff
 
