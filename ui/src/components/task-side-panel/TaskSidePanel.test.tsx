@@ -2,9 +2,10 @@
 
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { Issue, IssueDocument } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { Issue, IssueDocument, IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   taskPanelAgentTasksTab,
@@ -28,6 +29,8 @@ class ResizeObserverStub {
 const browserFixture = vi.hoisted(() => ({ data: [] as import("@paperclipai/shared").TaskBrowser[], viewer: vi.fn(async () => ({ url: "https://live.browser-use.com/test-viewer" })), control: vi.fn(async () => ({})) }));
 vi.mock("@/hooks/useTaskBrowsers", () => ({ useTaskBrowsers: () => ({ data: browserFixture.data, isError: false }) }));
 vi.mock("@/api/browser-use", () => ({ browserUseApi: { viewer: browserFixture.viewer, control: browserFixture.control, presence: vi.fn(async () => ({ accepted: true })) } }));
+const mockIssuesApi = vi.hoisted(() => ({ getDocument: vi.fn() }));
+vi.mock("@/api/issues", () => ({ issuesApi: mockIssuesApi }));
 const fixture = vi.hoisted(() => ({
   documents: [] as IssueDocument[] | undefined,
   plan: null as IssueDocument | null | undefined,
@@ -57,7 +60,9 @@ vi.mock("@/lib/router", () => ({
 }));
 
 vi.mock("@/components/IssueProperties", () => ({
-  IssueProperties: () => <div>Properties content</div>,
+  IssueProperties: ({ executionHandoffContent }: { executionHandoffContent?: ReactNode }) => (
+    <div>Properties content{executionHandoffContent}</div>
+  ),
 }));
 
 vi.mock("@/components/issue-properties/IssuePropertiesArtifactsTab", () => ({
@@ -123,6 +128,23 @@ function issueDocument(key: string, title: string): IssueDocument {
   } as unknown as IssueDocument;
 }
 
+async function waitForAssertion(assertion: () => void, attempts = 20) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await act(async () => {
+        await Promise.resolve();
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+    }
+  }
+  throw lastError;
+}
+
 describe("TaskSidePanel", () => {
   let root: Root;
   let container: HTMLDivElement;
@@ -132,6 +154,7 @@ describe("TaskSidePanel", () => {
     window.localStorage.clear();
     browserFixture.data = [];
     browserFixture.control.mockClear();
+    mockIssuesApi.getDocument.mockResolvedValue(null);
     fixture.documents = [];
     fixture.plan = null;
     routeFixture.location.search = "";
@@ -309,6 +332,42 @@ describe("TaskSidePanel", () => {
     } finally {
       agentChat.enabled = true;
     }
+  });
+
+  it("shows native handoff context in the default Properties reader without replacing its controls", async () => {
+    const policy: IssueExecutionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        { id: "review", type: "review", approvalsNeeded: 1, participants: [{ id: "reviewer", type: "user", userId: "reviewer-user", agentId: null }] },
+        { id: "acceptance", type: "approval", approvalsNeeded: 1, participants: [{ id: "approver", type: "user", userId: "approver-user", agentId: null }] },
+      ],
+    };
+    const state: IssueExecutionState = {
+      status: "changes_requested",
+      currentStageId: "review",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "user", userId: "reviewer-user" },
+      returnAssignee: { type: "agent", agentId: "developer" },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: "decision-native-return",
+      lastDecisionOutcome: "changes_requested",
+    };
+    mockIssuesApi.getDocument.mockResolvedValue(
+      issueDocument(ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, "Handoff return brief"),
+    );
+
+    await render(panel({ issue: issue({ executionPolicy: policy, executionState: state }) }));
+
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("data-side-panel-tab-target")).toBe("properties");
+    await waitForAssertion(() => expect(container.textContent).toContain("Handoff return brief"));
+    expect(container.textContent).toContain("Current responsible actor: Agent developer");
+    expect(container.textContent).toContain("Rework reason: Unknown");
+    expect(container.textContent).toContain("decision-native-return");
+    expect(container.textContent).toContain("Properties content");
+    expect(mockIssuesApi.getDocument).toHaveBeenCalledWith("task-1", ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY);
   });
 
   it("opens Properties on first visit", async () => {
