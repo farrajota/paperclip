@@ -4,6 +4,7 @@
 
 ### Patch Changes
 
+- Remove deleted workspace paths with one `rm` per 64-path batch instead of one process per path, after checking every ancestor in the batch with shell builtins. A symlink or non-directory ancestor now refuses the whole batch before anything in it is deleted. Spawning a process per path made a 40,000-path deletion take minutes under gVisor and timed out the streaming fixture in CI.
 - Allow the Paperclip host to route adapter sandbox-sync full-tree Git enumeration through its process-wide bounded scheduler.
 - Stage independent Git overlay entries in batches of at most four, preserving
   input order for overlapping destinations, per-entry root and ancestor checks,
