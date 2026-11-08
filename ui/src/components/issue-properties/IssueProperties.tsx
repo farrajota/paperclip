@@ -3,6 +3,7 @@ import { AgentIdentity } from "@/components/AgentIdentity";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { PROPERTIES_PANE_HEADER_SLOT_ID } from "../PropertiesPanel";
 import { issueStatusText } from "@/lib/status-colors";
@@ -55,6 +56,7 @@ import { extractProviderIdWithFallback } from "../../lib/model-utils";
 import { formatRetryReason } from "../../lib/runRetryState";
 import { useRetryNowMutation } from "../../hooks/useRetryNowMutation";
 import { RetryErrorBand } from "../IssueScheduledRetryCard";
+import { IssueOneTimeScheduleCard } from "../IssueOneTimeScheduleCard";
 import { StatusIcon } from "../StatusIcon";
 import { PriorityIcon } from "../PriorityIcon";
 import { SHOW_TASK_PRIORITY_UI } from "../../lib/ui-flags";
@@ -201,6 +203,7 @@ interface IssuePropertiesProps {
   onCheckMonitorNow?: () => void;
   checkingMonitorNow?: boolean;
   documentDeepLink?: IssuePropertiesDocumentDeepLink | null;
+  executionHandoffContent?: ReactNode;
   /** Render only the Properties body when a parent owns the side-panel tabs. */
   sidePanelContentOnly?: boolean;
 }
@@ -240,6 +243,7 @@ export function IssueProperties({
   onCheckMonitorNow,
   checkingMonitorNow = false,
   documentDeepLink,
+  executionHandoffContent,
   sidePanelContentOnly = false,
 }: IssuePropertiesProps) {
   const { selectedCompanyId } = useCompany();
@@ -2326,6 +2330,18 @@ export function IssueProperties({
 
   const propertiesBody = (
     <div className={cn(streamlinedPropertiesEnabled && "task-detail-properties pl-4")}>
+      {taskChatShellEnabled && sidePanelContentOnly ? (
+        <IssueOneTimeScheduleCard
+          key={issue.id}
+          issueId={issue.id}
+          canSchedule={
+            Boolean(issue.assigneeAgentId) &&
+            !issue.assigneeUserId &&
+            issue.hiddenAt === null &&
+            ["backlog", "todo", "in_progress"].includes(issue.status)
+          }
+        />
+      ) : null}
       <PropertySection
         title={streamlinedPropertiesEnabled ? "Work" : "Triage"}
         first
@@ -2591,6 +2607,7 @@ export function IssueProperties({
       </PropertySection>
 
       <PropertySection title="Execution" streamlined={streamlinedPropertiesEnabled}>
+        {executionHandoffContent}
         {/* Read-only: agents set the policy, the board does not. */}
         {reviewPolicyBadge ? (
           <PropertyRow label="Approvals">

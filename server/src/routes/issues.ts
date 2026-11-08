@@ -254,6 +254,7 @@ import {
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { issueOneTimeScheduleService } from "../services/issue-one-time-schedules.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
@@ -359,6 +360,12 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+const issueOneTimeScheduleSchema = z
+  .object({
+    timestamp: z.string().trim().min(1),
+    timeZone: z.string().trim().min(1),
+  })
+  .strict();
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -2188,6 +2195,7 @@ async function assertCanManageIssueMonitor(
   companyId: string,
   assigneeAgentId: string | null,
   monitorChanged: boolean,
+  controlName = "issue monitors",
 ) {
   if (!monitorChanged) return;
   if (req.actor.type === "board") return;
@@ -2209,7 +2217,7 @@ async function assertCanManageIssueMonitor(
   )
     return;
   throw forbidden(
-    "Only the assignee agent or a board user can manage issue monitors",
+    `Only the assignee agent or a board user can manage ${controlName}`,
   );
 }
 
@@ -3526,6 +3534,7 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  const oneTimeSchedules = issueOneTimeScheduleService(db);
   const commentWasCreatedByAssigneeRun = async (
     comment: { companyId: string; createdByRunId?: string | null },
     assigneeAgentId: string | null | undefined,
@@ -12577,6 +12586,73 @@ export function issueRoutes(
           (issue) => issue.id,
         ),
       });
+    },
+  );
+
+  router.get("/issues/:id/one-time-schedule", async (req, res) => {
+    const issue = await getAccessibleResource(
+      req,
+      res,
+      svc.getById(req.params.id as string),
+      "Issue not found",
+    );
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    res.json(await oneTimeSchedules.get(issue.companyId, issue.id));
+  });
+
+  router.post(
+    "/issues/:id/one-time-schedule",
+    validate(issueOneTimeScheduleSchema),
+    async (req, res) => {
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(req.params.id as string),
+        "Issue not found",
+      );
+      if (!issue) return;
+      await assertCanManageIssueMonitor(
+        access,
+        req,
+        issue.companyId,
+        issue.assigneeAgentId,
+        true,
+        "one-time schedules",
+      );
+      const schedule = await oneTimeSchedules.create({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        timestamp: req.body.timestamp,
+        timeZone: req.body.timeZone,
+      });
+      res.status(201).json(schedule);
+    },
+  );
+
+  router.delete(
+    "/issues/:id/one-time-schedule/:scheduleId",
+    async (req, res) => {
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(req.params.id as string),
+        "Issue not found",
+      );
+      if (!issue) return;
+      await assertCanManageIssueMonitor(
+        access,
+        req,
+        issue.companyId,
+        issue.assigneeAgentId,
+        true,
+        "one-time schedules",
+      );
+      const schedule = await oneTimeSchedules.cancel({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        scheduleId: req.params.scheduleId as string,
+      });
+      res.json(schedule);
     },
   );
 

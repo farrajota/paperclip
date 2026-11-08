@@ -215,6 +215,7 @@ import {
   hasVisibleMonitorSurface,
 } from "../components/IssueMonitorBanner";
 import { IssueScheduledRetryCard } from "../components/IssueScheduledRetryCard";
+import { IssueOneTimeScheduleCard } from "../components/IssueOneTimeScheduleCard";
 import { ExternallyConnectedTaskBanner } from "../components/chat/ExternallyConnectedTaskBanner";
 import {
   IssueProperties,
@@ -2958,6 +2959,15 @@ function IssueDetailActivityTab({
       <IssueScheduledRetryCard
         issueId={issue.id}
         scheduledRetry={issue.scheduledRetry ?? null}
+      />
+      <IssueOneTimeScheduleCard
+        issueId={issue.id}
+        canSchedule={
+          Boolean(issue.assigneeAgentId) &&
+          !issue.assigneeUserId &&
+          issue.hiddenAt === null &&
+          ["backlog", "todo", "in_progress"].includes(issue.status)
+        }
       />
       {/* Waiting-monitor state now lives in the pinned top banner (IssueMonitorBanner) — PAP-14557 decision 1. */}
     </>
