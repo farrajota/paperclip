@@ -602,6 +602,31 @@ export interface IssueScheduledRetry {
   errorCode?: string | null;
 }
 
+export type IssueOneTimeScheduleStatus =
+  | "scheduled"
+  | "queued"
+  | "waiting"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface IssueOneTimeSchedule {
+  id: string;
+  issueId: string;
+  agentId: string;
+  dueAt: Date | string;
+  timeZone: string;
+  status: IssueOneTimeScheduleStatus;
+  cancellationReason: string | null;
+  wakeupRequestId: string | null;
+  runId: string | null;
+  runStatus: string | null;
+  error: string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
 export type IssueRetryNowOutcome =
   | "promoted"
   | "already_promoted"

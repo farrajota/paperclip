@@ -527,6 +527,7 @@ function invalidateVisibleIssueRunQueries(
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueRef) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueRef) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(issueRef) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.issues.oneTimeSchedule(issueRef) });
     if (status && TERMINAL_RUN_STATUSES.has(status)) {
       // A final comment can race the last in-flight history fetch. Reconcile
       // persisted messages after the turn settles.
@@ -1352,6 +1353,9 @@ function invalidateActivityQueries(
             : undefined;
         queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(ref), ...invalidationOptions });
         queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(ref), ...invalidationOptions });
+        // Wake admission and target changes can settle a schedule without a
+        // run or transcript change; keep its persisted projection active.
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.oneTimeSchedule(ref) });
         if (action === "issue.comment_added" || action === "issue.conversation_session_started") {
           queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(ref), ...invalidationOptions });
         }

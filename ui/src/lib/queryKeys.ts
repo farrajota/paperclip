@@ -358,6 +358,8 @@ export const queryKeys = {
         executionWorkspaceId,
       ] as const,
     detail: (id: string) => ["issues", "detail", id] as const,
+    oneTimeSchedule: (issueId: string) =>
+      ["issues", "one-time-schedule", issueId] as const,
     comments: (issueId: string) => ["issues", "comments", issueId] as const,
     commentsList: (issueId: string) =>
       ["issues", "comments", issueId, "list"] as const,

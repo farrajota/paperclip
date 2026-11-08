@@ -175,6 +175,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  issueOneTimeSchedules,
   issueWorkProducts,
   nativeRunFinalizations,
   projects,
@@ -440,6 +441,12 @@ import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  ISSUE_ONE_TIME_SCHEDULE_WAKE_REASON,
+  issueOneTimeScheduleService,
+  logIssueOneTimeScheduleUpdate,
+} from "./issue-one-time-schedules.js";
+import { isIssueOneTimeScheduleEligibleStatus } from "./issue-one-time-schedule.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -3783,6 +3790,11 @@ interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
+  };
+  issueOneTimeScheduleGuard?: {
+    scheduleId: string;
+    wakeupRequestId: string;
+    assigneeAgentId: string;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -9564,6 +9576,7 @@ export function heartbeatService(
 ) {
   let shutdownInProgress = false;
   const instanceSettings = instanceSettingsService(db);
+  const oneTimeSchedules = issueOneTimeScheduleService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
@@ -27980,6 +27993,102 @@ export function heartbeatService(
             onBlocked: (reason, message) => { continuationWait = { reason, message }; },
           }))) return deferBlockedExecution(executionBlocker);
 
+          const scheduleGuard = opts.issueOneTimeScheduleGuard;
+          if (scheduleGuard && issueId) {
+            const [targetIssue] = await tx
+              .select({
+                status: issues.status,
+                hiddenAt: issues.hiddenAt,
+                assigneeAgentId: issues.assigneeAgentId,
+                assigneeUserId: issues.assigneeUserId,
+              })
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.id, issueId),
+                  eq(issues.companyId, agent.companyId),
+                ),
+              )
+              .for("update");
+            const [schedule] = await tx
+              .select({
+                assigneeAgentId: issueOneTimeSchedules.assigneeAgentId,
+                cancelledAt: issueOneTimeSchedules.cancelledAt,
+                wakeupRequestId: issueOneTimeSchedules.wakeupRequestId,
+              })
+              .from(issueOneTimeSchedules)
+              .where(
+                and(
+                  eq(issueOneTimeSchedules.id, scheduleGuard.scheduleId),
+                  eq(issueOneTimeSchedules.companyId, agent.companyId),
+                  eq(issueOneTimeSchedules.issueId, issueId),
+                ),
+              )
+              .for("update");
+            const issueStillEligible = Boolean(
+              targetIssue &&
+                targetIssue.hiddenAt === null &&
+                targetIssue.assigneeAgentId === scheduleGuard.assigneeAgentId &&
+                targetIssue.assigneeUserId === null &&
+                isIssueOneTimeScheduleEligibleStatus(targetIssue.status),
+            );
+            const scheduleStillPending = Boolean(
+              schedule &&
+                schedule.cancelledAt === null &&
+                schedule.assigneeAgentId === scheduleGuard.assigneeAgentId &&
+                schedule.wakeupRequestId === scheduleGuard.wakeupRequestId,
+            );
+            if (!issueStillEligible || !scheduleStillPending) {
+              const now = new Date();
+              if (
+                schedule &&
+                schedule.cancelledAt === null &&
+                schedule.wakeupRequestId === scheduleGuard.wakeupRequestId
+              ) {
+                await tx
+                  .update(issueOneTimeSchedules)
+                  .set({
+                    cancelledAt: now,
+                    cancellationReason: !targetIssue
+                      ? "Issue no longer exists"
+                      : targetIssue.assigneeAgentId !== scheduleGuard.assigneeAgentId ||
+                          targetIssue.assigneeUserId !== null
+                        ? "Issue assignee changed before the scheduled run"
+                        : "Issue was hidden or became ineligible before the scheduled run",
+                    updatedAt: now,
+                  })
+                  .where(
+                    and(
+                      eq(issueOneTimeSchedules.id, scheduleGuard.scheduleId),
+                      isNull(issueOneTimeSchedules.cancelledAt),
+                      eq(issueOneTimeSchedules.wakeupRequestId, scheduleGuard.wakeupRequestId),
+                    ),
+                  );
+              }
+              await tx.insert(agentWakeupRequests).values({
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: "issue_one_time_schedule_ineligible",
+                payload: {
+                  ...(payload ?? {}),
+                  heartbeatSkip: {
+                    reason: "The issue or schedule changed before the due wake was admitted.",
+                    issueId,
+                  },
+                },
+                status: "skipped",
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                error: "The scheduled issue changed before native wake admission.",
+                finishedAt: now,
+              });
+              return { kind: "skipped" as const };
+            }
+          }
+
           const issueStateGuard = opts.issueStateGuard;
           if (
             issueStateGuard &&
@@ -29155,6 +29264,15 @@ export function heartbeatService(
     return newRun;
   }
 
+  async function logOneTimeScheduleWakeUpdate(wake: typeof agentWakeupRequests.$inferSelect) {
+    if (wake.reason !== ISSUE_ONE_TIME_SCHEDULE_WAKE_REASON) return;
+    const payload = parseObject(wake.payload);
+    const scheduleId = readNonEmptyString(payload.issueOneTimeScheduleId);
+    const issueId = readNonEmptyString(payload.issueId) ?? readNonEmptyString(payload.taskId);
+    if (!scheduleId || !issueId) return;
+    await logIssueOneTimeScheduleUpdate(db, { id: scheduleId, companyId: wake.companyId, issueId });
+  }
+
   /**
    * Native status commitment deliberately persists dependency/parent wake
    * intents in the same transaction as the authoritative status projection.
@@ -29242,6 +29360,7 @@ export function heartbeatService(
               isNull(agentWakeupRequests.runId),
             ),
           );
+        await logOneTimeScheduleWakeUpdate(candidate);
         recovered += 1;
         continue;
       }
@@ -29276,6 +29395,13 @@ export function heartbeatService(
       if (claimed.length === 0) continue;
 
       const payload = parseObject(candidate.payload);
+      const scheduleGuard = candidate.reason === ISSUE_ONE_TIME_SCHEDULE_WAKE_REASON
+        ? {
+            scheduleId: readNonEmptyString(payload.issueOneTimeScheduleId) ?? "",
+            wakeupRequestId: candidate.id,
+            assigneeAgentId: candidate.agentId,
+          }
+        : null;
       const wakeContext = parseObject(payload._paperclipWakeContext);
       const issueId =
         readNonEmptyString(payload.issueId) ??
@@ -29299,6 +29425,7 @@ export function heartbeatService(
             updatedAt: new Date(),
           })
           .where(eq(agentWakeupRequests.id, candidate.id));
+        await logOneTimeScheduleWakeUpdate(candidate);
         recovered += 1;
         continue;
       }
@@ -29350,6 +29477,7 @@ export function heartbeatService(
               updatedAt: new Date(),
             })
             .where(eq(agentWakeupRequests.id, candidate.id));
+          await logOneTimeScheduleWakeUpdate(candidate);
           recovered += 1;
           continue;
         }
@@ -29366,6 +29494,7 @@ export function heartbeatService(
           requestedByActorType: "system",
           requestedByActorId: dispatchActorId,
           ...(completedOnboardingGuard ? { issueStateGuard: completedOnboardingGuard } : {}),
+          ...(scheduleGuard ? { issueOneTimeScheduleGuard: scheduleGuard } : {}),
           contextSnapshot: {
             ...wakeContext,
             ...(issueId ? { issueId, taskId: issueId } : {}),
@@ -29450,6 +29579,9 @@ export function heartbeatService(
         );
         deferred += 1;
       }
+      // Admission may produce only a skipped/deferred receipt, with no run
+      // event to refresh the visible schedule. Publish after the wake write.
+      await logOneTimeScheduleWakeUpdate(candidate);
     }
 
     return { scanned: candidates.length, dispatched, recovered, deferred };
@@ -30525,14 +30657,16 @@ export function heartbeatService(
         if (run) enqueued += 1;
         else skipped += 1;
       }
-
+      const oneTimeScheduleTick = await oneTimeSchedules.tickDue(now);
+      const nativeStatusWakeups = await dispatchPendingNativeStatusWakeups();
       const issueMonitors = await tickDueIssueMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
+        checked: checked + oneTimeScheduleTick.checked + issueMonitors.checked,
+        enqueued: enqueued + nativeStatusWakeups.dispatched + issueMonitors.triggered,
+        skipped: skipped + oneTimeScheduleTick.invalidated + issueMonitors.skipped,
       };
+
     },
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
