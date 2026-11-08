@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Patch Changes
+- Calculate stored ZIP checksums with Node's built-in CRC32 primitive while preserving deterministic ZIP content.
 - Scale the company import/export e2e fixture's 30-second server health wait, 60-second setup hook and 90-second round-trip budgets by the opt-in `PAPERCLIP_TEST_TIMEOUT_FACTOR` (1-10, default 1) for slower sandboxed CI runners; the exercised workflow and assertions are unchanged.
 
 
