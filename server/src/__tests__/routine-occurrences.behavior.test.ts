@@ -46,6 +46,7 @@ import {
   startEmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateTablesWithDeadlockRetry } from "./helpers/truncate-with-deadlock-retry.js";
 
 type WakeupInput = {
   source?: string;
@@ -73,7 +74,7 @@ describePostgres("durable routine occurrences", () => {
   }, 60_000);
 
   afterEach(async () => {
-    await db.execute(sql`TRUNCATE companies CASCADE`);
+    await truncateTablesWithDeadlockRetry(db, "TRUNCATE companies CASCADE");
     if (ownedUserIds.length) await db.delete(authUsers).where(inArray(authUsers.id, ownedUserIds));
     ownedUserIds.length = 0;
   });
