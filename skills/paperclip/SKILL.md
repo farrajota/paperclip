@@ -266,7 +266,19 @@ Because of that, follow these rules:
 
 **Step 9 — Delegate if needed.** For ordinary execution tasks, create subtasks with `POST /api/companies/{companyId}/issues` and set `parentId` and `goalId`. For conversation tasks, use the project handoff above instead. When a follow-up issue needs to stay on the same code change but is not a true child task, set `inheritExecutionWorkspaceFromIssueId` to the source issue. Set `billingCode` for cross-team work.
 
+### Managing specialist child work
+
+Use this protocol when you are the accountable owner of a parent task and delegate bounded work to specialists. Team membership, a roster, and skill access provide context only; they do not grant task access, permissions, authority, or an alternate assignment route.
+
+1. Keep the parent assigned to its accountable manager. Name the objective, acceptance criteria, decision boundaries, review expectations, and who owns each result. Create each specialist's ordinary child issue through the supported task-creation/assignment path, setting its `parentId` and assigning it to the intended agent. Give each child self-contained scope, inputs or accessible links, a concrete deliverable, acceptance checks, and an explicit instruction to record its result on the child (comment/document/work product) and link durable artifacts there. A child should accept its assignment, clarify missing prerequisites through the issue interaction/comment path, and report completion or a first-class blocker; it must not claim completion merely because work was attempted.
+2. Do not rely on roster membership, @-mentions, direct writes to another agent's task, or repeated polling to dispatch or wake anyone. Use native assignment and addressed interaction routes. Follow the existing budget and pause state; never delegate around denied permissions, a blocker, checkout/workspace ownership, concurrency limits, or an independent review requirement.
+3. The manager resumes through Paperclip's native child-completion wake after every direct child is terminal (`done` or `cancelled`). A blocked child is not terminal for this barrier: resolve its first-class blocker or explicitly cancel/re-scope it through the authorized path. Treat cancellation as a terminal outcome, not a successful result. Read the returned linked child IDs and bounded summaries, then open each relevant child and its durable result/artifact links before deciding what is usable; the wake summary is capped and is not the complete record.
+4. Accept each child against its stated criteria. The manager owns integration and synthesis: reconcile findings, preserve links to child results and revisions, and record the resulting decision/synthesis on the parent. If evidence, permissions, review, or a decision is missing, leave the parent in the truthful waiting/blocked/review state and identify the responsible human or next action explicitly. Do not mark the parent complete solely because children are terminal. Keep required independent review independent.
+
+Reusable packaging: put the leader role and this protocol in the manager agent's instructions; maintain a small roster of specialist agent identities with scope/skills and assignment eligibility, not access grants; put role-specific acceptance requirements in each child description; enable the shared Paperclip skill for participants that need the workflow. Install/configure the agents and skill using existing company/team packages and policies. There is no separate team coordinator or autonomous synthesis service.
+
 ### Delegating review tasks
+
 
 Run-scoped writes are subtree-scoped: the delegate's run can write to its own issue and descendants, generally **not** to your issue. Write review-task descriptions accordingly:
 
