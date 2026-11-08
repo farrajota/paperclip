@@ -33,7 +33,11 @@ const transcriptHookRuns = vi.hoisted(() => ({
   native: [] as unknown[][],
 }));
 const sidebarState = vi.hoisted(() => ({ isMobile: false }));
-const planState = vi.hoisted(() => ({ data: null as IssueDocument | null }));
+const planState = vi.hoisted(() => ({
+  data: null as IssueDocument | null,
+  isLoading: false,
+  isError: false,
+}));
 const DIRECT_ADAPTER_TYPES = [
   "codex_local",
   "claude_local",
@@ -121,6 +125,8 @@ beforeEach(() => {
   transcriptHookRuns.native.length = 0;
   sidebarState.isMobile = false;
   planState.data = null;
+  planState.isLoading = false;
+  planState.isError = false;
   streamlinedState.enabled = true;
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -377,6 +383,65 @@ it.each([true, false])("reveals saved conversation when initial history stalls (
   } finally {
     vi.useRealTimers();
   }
+});
+
+describe.each([false, true])("conversation navigation history coverage (mobile=%s)", (mobile) => {
+  it.each(["plan-loading", "plan-error", "transcript-loading", "transcript-error"] as const)(
+    "stays partial while %s is incomplete and becomes complete only after recovery",
+    async (source) => {
+      vi.useFakeTimers();
+      try {
+        sidebarState.isMobile = mobile;
+        planState.isLoading = source === "plan-loading";
+        planState.isError = source === "plan-error";
+        const hasTranscript = source.startsWith("transcript-");
+        if (hasTranscript) {
+          nativeTranscriptState.hydratedRunIds = new Set(source === "transcript-error" ? ["coverage-run"] : []);
+          if (source === "transcript-error") nativeTranscriptState.errorsByRun.set("coverage-run", "History unavailable");
+        }
+        const props = {
+          issueId: "coverage-issue",
+          comments: [{
+            id: "coverage-reply", body: "A saved reply remains available.",
+            runId: hasTranscript ? "coverage-run" : null,
+            companyId: "company", issueId: "coverage-issue", authorType: "agent" as const,
+            authorAgentId: "agent", authorUserId: null, presentation: null, metadata: null,
+            createdAt: new Date("2025-01-01T10:00:20Z"), updatedAt: new Date("2025-01-01T10:00:20Z"),
+          }],
+          linkedRuns: hasTranscript ? [{
+            runId: "coverage-run", status: "succeeded", runtimeMode: "native" as const,
+            agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
+            createdAt: "2025-01-01T10:00:00Z", startedAt: "2025-01-01T10:00:01Z",
+            finishedAt: "2025-01-01T10:00:30Z",
+          }] : [],
+          onAdd: async () => {},
+        };
+        render(<TaskChatThread {...props} />);
+        await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+        expect(container.querySelector('[data-testid="task-chat-history-loading"]')).toBeNull();
+        expect(container.textContent).toContain("A saved reply remains available.");
+        expect(container.textContent).toContain(source.endsWith("loading")
+          ? "Some task history is still loading."
+          : "Some task history could not be loaded.");
+        const rail = container.querySelector('nav[aria-label="Conversation navigation"]')!;
+        expect(rail.textContent).toContain("Showing loaded history only");
+        expect(rail.textContent).not.toContain("All conversation history loaded");
+
+        planState.isLoading = false;
+        planState.isError = false;
+        if (hasTranscript) {
+          nativeTranscriptState.hydratedRunIds = new Set(["coverage-run"]);
+          nativeTranscriptState.errorsByRun.clear();
+        }
+        render(<TaskChatThread {...props} />);
+        expect(container.textContent).not.toContain("Some task history");
+        expect(rail.textContent).toContain("All conversation history loaded");
+        expect(rail.textContent).not.toContain("Showing loaded history only");
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 });
 
 describe.each(["legacy", "native"] as const)("%s task history readiness", (runtimeMode) => {
@@ -3942,6 +4007,82 @@ describe("TaskChatThread Paperclip Runner queue", () => {
 });
 
 describe("TaskChatThread mobile composer dock (PAP-495)", () => {
+  it.each([true, false])("keeps narrow navigation above the growing native composer in its offset-owning dock (streamlined=%s)", async (streamlined) => {
+    sidebarState.isMobile = true;
+    streamlinedState.enabled = streamlined;
+    const props = {
+      issueId: "mobile-navigation",
+      comments: [{
+        id: "mobile-reply", body: "A saved native reply.", runId: null,
+        companyId: "company", issueId: "mobile-navigation", authorType: "agent" as const,
+        authorAgentId: "agent", authorUserId: null, presentation: null, metadata: null,
+        createdAt: new Date("2025-01-01T10:00:20Z"), updatedAt: new Date("2025-01-01T10:00:20Z"),
+      }],
+      onAdd: vi.fn(async () => {}),
+    };
+    render(<TaskChatThread {...props} initialHistoryPending />);
+    const editor = container.querySelector('[data-testid="mock-editor"]')!;
+    const dock = editor.closest<HTMLElement>('[data-testid="task-chat-composer-dock"]')!;
+    expect(dock.hasAttribute("inert")).toBe(true);
+    render(<TaskChatThread {...props} />);
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    });
+    expect(dock.hasAttribute("inert")).toBe(false);
+
+    const rail = container.querySelector<HTMLElement>('nav[aria-label="Conversation navigation"]')!;
+    // Native composition, not an isolated button-size assertion: both controls
+    // share the sticky offset owner, with navigation in flow before the stack.
+    expect(dock.contains(rail)).toBe(true);
+    const slot = rail.closest('[data-testid="task-chat-navigation-slot"]')!;
+    const stack = dock.querySelector('[data-testid="task-chat-composer-stack"]')!;
+    expect(slot.compareDocumentPosition(stack) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    const navigation = rail.parentElement!;
+    expect(navigation.classList.contains("relative")).toBe(true);
+    expect(navigation.classList.contains("fixed")).toBe(false);
+    expect(dock.className).toContain("bottom-(--tc-composer-bottom)");
+
+    const button = rail.querySelector<HTMLButtonElement>("button")!;
+    const row = container.querySelector<HTMLElement>('[data-thread-anchor="mobile-reply"]')!;
+    const scroll = vi.fn();
+    Object.defineProperty(row, "scrollIntoView", { configurable: true, value: scroll });
+    vi.spyOn(row, "getBoundingClientRect").mockReturnValue(new DOMRect(10, 100, 200, 80));
+    const readingPosition = window.scrollY;
+    act(() => button.focus());
+    const preview = dock.querySelector<HTMLElement>('[data-testid="conversation-navigation-preview"]')!;
+    expect(preview.textContent).toContain("A saved native reply.");
+    expect(rail.contains(preview)).toBe(false);
+    // Preview growth must not resize the sticky dock or cover the composer.
+    expect(preview.classList.contains("absolute")).toBe(true);
+    expect(preview.classList.contains("bottom-full")).toBe(true);
+    expect(scroll).not.toHaveBeenCalled();
+    expect(window.scrollY).toBe(readingPosition);
+
+    act(() => editorCallbacks.change(Array.from({ length: 20 }, () => "Growing draft").join("\n")));
+    render(<TaskChatThread {...props} composerAccessory={<div style={{ height: 96 }}>Composer accessory</div>} />);
+    expect(container.querySelector('[data-testid="mock-editor"]')).toBe(editor);
+    expect(editor.textContent).toContain("Growing draft");
+    expect(dock.contains(rail)).toBe(true);
+    expect(dock.querySelector('[data-testid="conversation-navigation-preview"]')).toBe(preview);
+    expect(slot.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    await act(async () => {
+      button.click();
+      // Let the real native activation finish both mount/confirmation frames
+      // and flush its resulting announcement before asserting the landing.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    });
+    expect(scroll).toHaveBeenCalledWith({ block: "center", behavior: "auto" });
+    expect(dock.querySelector('[aria-live="polite"]')?.textContent).toMatch(/^Opened .+\.$/);
+    expect(props.onAdd).not.toHaveBeenCalled();
+
+    // A read-only native thread keeps its rail in the same dock, not a second
+    // fixed overlay with an independently guessed composer height.
+    render(<TaskChatThread {...props} showComposer={false} />);
+    expect(container.querySelector('[data-testid="mock-editor"]')).toBeNull();
+    expect(dock.contains(rail)).toBe(true);
+    expect(container.querySelectorAll('nav[aria-label="Conversation navigation"]')).toHaveLength(1);
+  });
+
   it("pins the composer to the nav-aware bottom offset so its action row clears the auto-hiding bottom nav", () => {
     sidebarState.isMobile = true;
 
