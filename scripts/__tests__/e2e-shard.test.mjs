@@ -222,7 +222,7 @@ test("runner selection uses hosted metadata without checkout or secret access", 
   assert.match(workflow, /^permissions:\n  actions: read\n  contents: read\n  pull-requests: read$/m);
   assert.match(workflow, /^ {6}runner:\n {8}value: \$\{\{ jobs\.gate\.outputs\.runner \}\}$/m);
   assert.match(workflow, /^ {6}full_ci:\n {8}value: \$\{\{ jobs\.gate\.outputs\.full_ci \}\}$/m);
-  assert.match(jobs.get("gate"), /runner=ubuntu-24\.04/);
+  assert.match(jobs.get("gate"), /runner=ubuntu-latest/);
   assert.doesNotMatch(workflow, /AWS_CI_ENABLED|paperclip-ci-routing-x64|^ {2}(?:actions|contents|pull-requests): write$/m);
 });
 
