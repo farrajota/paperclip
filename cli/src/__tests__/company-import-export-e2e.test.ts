@@ -15,10 +15,15 @@ import {
   PortabilityPhaseDiagnostics,
   StartupTimingFrameDecoder,
 } from "./helpers/portability-phase-diagnostics.js";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 
 const portabilityPhaseOutputPath = process.env.PAPERCLIP_TEST_COMPANY_PORTABILITY_PHASE_OUTPUT || undefined;
 const portabilityPhaseDiagnostics = new PortabilityPhaseDiagnostics(portabilityPhaseOutputPath);
 const startupTimingDecoder = portabilityPhaseOutputPath ? new StartupTimingFrameDecoder() : undefined;
+
+const serverHealthTimeoutMs = scaleTestTimeout(30_000);
+const setupHookTimeoutMs = scaleTestTimeout(60_000);
+const roundTripTestTimeoutMs = scaleTestTimeout(90_000);
 
 const execFileAsync = promisify(execFile);
 type ServerProcess = ReturnType<typeof spawn>;
@@ -266,7 +271,7 @@ async function waitForServer(
 ) {
   const startedAt = Date.now();
   const observeHealthWait = portabilityPhaseDiagnostics.createHealthWaitObserver(startedAt);
-  while (Date.now() - startedAt < 30_000) {
+  while (Date.now() - startedAt < serverHealthTimeoutMs) {
     if (child.exitCode !== null) {
       observeHealthWait?.("health-child-exit-observed");
       throw new Error(
@@ -356,7 +361,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     await portabilityPhaseDiagnostics.run("setup", "health-wait", () =>
       waitForServer(apiBase, child, output),
     );
-  }, 60_000);
+  }, setupHookTimeoutMs);
 
   afterAll(async () => {
     await portabilityPhaseDiagnostics.run("cleanup", "server-stop", () =>
@@ -658,5 +663,5 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
 
     expect(importedFromZip.company.action).toBe("created");
     expect(importedFromZip.agents.some((agent) => agent.action === "created")).toBe(true);
-  }, 90_000);
+  }, roundTripTestTimeoutMs);
 });

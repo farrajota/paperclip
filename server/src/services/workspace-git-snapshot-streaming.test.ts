@@ -10,6 +10,7 @@ import { disposeGitWorkspaceSnapshot, readGitWorkspaceSnapshot, runLocalGit, set
 import { isPathManifest, workspacePaths } from "@paperclipai/adapter-utils/workspace-manifest";
 import { prepareSandboxManagedRuntime, type PreparedSandboxManagedRuntime, type SandboxManagedRuntimeClient } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { createWorkspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
+import { scaleTestTimeout } from "../__tests__/helpers/test-timeout-factor.js";
 
 enum StreamDiagnosticPhase {
   FixtureReady = "fixture_ready",
@@ -140,7 +141,8 @@ function localClient(commands: string[], stage: PostCommandStage): SandboxManage
 }
 
 // macOS adds per-file process and filesystem overhead to the real deletion lane.
-const realGitTimeoutMs = process.platform === "darwin" ? 300_000 : 180_000;
+const realGitTimeoutMs = scaleTestTimeout(process.platform === "darwin" ? 300_000 : 180_000);
+const realGitCommandTimeoutMs = scaleTestTimeout(120_000);
 it("streams and stages all four real Git filename lanes above 32 MiB through the shared scheduler", async () => {
   const diagnosticStartedAt = performance.now();
   let diagnosticRecordCount = 0;
@@ -194,7 +196,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   const repo = path.join(root, "repo");
   await fs.mkdir(repo);
   const env = { ...process.env, GIT_AUTHOR_NAME: "Test", GIT_COMMITTER_NAME: "Test", GIT_AUTHOR_EMAIL: "test@example.test", GIT_COMMITTER_EMAIL: "test@example.test" };
-  const git = (args: string[]) => runLocalGit(repo, args, { env, timeout: 120_000, maxBuffer: 64 * 1024 });
+  const git = (args: string[]) => runLocalGit(repo, args, { env, timeout: realGitCommandTimeoutMs, maxBuffer: 64 * 1024 });
   await git(["init"]);
   await git(["commit", "--allow-empty", "-qm", "fixture"]);
   // Leave room for the fixture/staging root below macOS's 1,024-byte path
@@ -279,7 +281,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   const remote = path.join(root, "remote");
   const stage = async (gitSnapshot: GitWorkspaceSnapshot, stageLabel: "initial" | "deletion") => {
     const runtime = await prepareSandboxManagedRuntime({
-      spec: { transport: "sandbox", provider: "test", sandboxId: "test", remoteCwd: remote, timeoutMs: 120_000, apiKey: null },
+      spec: { transport: "sandbox", provider: "test", sandboxId: "test", remoteCwd: remote, timeoutMs: realGitCommandTimeoutMs, apiKey: null },
       client: localClient(commands, stageLabel), adapterKey: "stream-test", workspaceLocalDir: repo, workspaceGitSnapshot: gitSnapshot,
       runtimeSpan: (name, work) => timeExistingSpan(stageLabel, name, work),
     });

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Patch Changes
+- Scale the company import/export e2e fixture's 30-second server health wait, 60-second setup hook and 90-second round-trip budgets by the opt-in `PAPERCLIP_TEST_TIMEOUT_FACTOR` (1-10, default 1) for slower sandboxed CI runners; the exercised workflow and assertions are unchanged.
 - Heartbeat formatter registry acquisition now occurs when `heartbeatRun` starts; formatter acquisition errors reject before context resolution or heartbeat API requests.
 
 - Extend opt-in company portability diagnostics with bounded startup timings around the fixed `startup-workspace-prerequisites`, `startup-server-import`, and `startup-server-start` calls. The child emits at most six fixed-name outcome and elapsed-time frames only when the dedicated test flag is enabled; `enter` frames use elapsed time zero, and the fixture accepts only closed, canonical, ordered frames as setup observations.
