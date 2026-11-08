@@ -55,7 +55,7 @@ describe("prepared OpenCode context transport", () => {
     }
     const snapshot = await session.snapshot();
     await session.close({ reason: "prepared-test" });
-    const recovered = await driver.recoverSession?.(snapshot);
+    const recovered = await driver.recoverSession?.(snapshot, { signal: new AbortController().signal });
     expect(recovered?.recovered).toBe(true);
     await recovered!.session!.startTurn({
       message: {
