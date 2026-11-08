@@ -29,9 +29,12 @@ jobs:
     steps:
       - name: Select GitHub-hosted runner
         id: route
+        # Pin the image the suites were qualified on. ubuntu-latest moved to
+        # Ubuntu 26.04, whose multicall Rust coreutils and preinstalled
+        # bubblewrap change upstream fixtures' exit codes and binary identities.
         run: |
-          echo 'runner=ubuntu-latest' >> "$GITHUB_OUTPUT"
-          echo '::notice title=CI routing::Using GitHub-hosted runner for this fork'
+          echo 'runner=ubuntu-24.04' >> "$GITHUB_OUTPUT"
+          echo '::notice title=CI routing::Using GitHub-hosted ubuntu-24.04 runner for this fork'
       - name: Authorize CODEOWNERS CI profiling
         id: profile
         shell: bash
