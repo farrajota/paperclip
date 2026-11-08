@@ -2352,6 +2352,55 @@ describe("IssueDetail", () => {
     await waitForAssertion(() => expect(panelProps().artifactsOpenRequestId).toBe(2));
   });
 
+  it("lets a streamlined mobile task open its properties sheet from the header", async () => {
+    mockSidebarState.isMobile = true;
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await waitForAssertion(() => {
+      expect(document.querySelector('[data-testid="issue-detail-header"]')).not.toBeNull();
+    });
+    const header = document.querySelector('[data-testid="issue-detail-header"]')!;
+    expect(document.querySelector('[data-testid="mobile-task-side-panel"]')).toBeNull();
+    const button = header.querySelector<HTMLButtonElement>('button[aria-label="Show properties"]');
+    expect(button).not.toBeNull();
+
+    await act(async () => {
+      button!.click();
+    });
+
+    await waitForAssertion(() => {
+      const panel = document.querySelector('[data-testid="mobile-task-side-panel"]');
+      expect(panel?.textContent).toContain("Task side panel");
+    });
+  });
+
+  it("keeps the desktop streamlined header free of a second properties toggle", async () => {
+    mockSidebarState.isMobile = false;
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await waitForAssertion(() => {
+      expect(document.querySelector('[data-testid="issue-detail-header"]')).not.toBeNull();
+    });
+    const header = document.querySelector('[data-testid="issue-detail-header"]')!;
+    expect(header.querySelector('button[aria-label="Show properties"]')).toBeNull();
+  });
+
   it("opens the mobile properties sheet for a document deep link", async () => {
     mockSidebarState.isMobile = true;
     mockLocation.hash = "#document-qa-evidence";
