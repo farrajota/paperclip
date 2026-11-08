@@ -598,6 +598,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const queryClient = useQueryClient();
   const createdProjectItems = useProjectCreatedItems(props.creationActivity ?? [], companyId);
   const createdSkillItems = useMemo(() => skillCreatedItems(props.creationActivity ?? []), [props.creationActivity]);
+  const [mobileNavigationContainer, setMobileNavigationContainer] = useState<HTMLDivElement | null>(null);
   const [pendingComposerAssignee, setPendingComposerAssignee] = useState<
     string | null
   >(null);
@@ -3111,6 +3112,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     contentKey={`${autoFollowContentKey}:${historyRevealed}`}
                     className={isMobile ? undefined : "pt-3"}
                     scroll={!isMobile}
+                    navigationHistoryPartial={hasOlderComments || historyPending || historyError}
+                    navigationContainer={isMobile ? mobileNavigationContainer : undefined}
                   />
                 )}
               </div>
@@ -3124,8 +3127,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 />
               </div>
             ) : null}
-            {showComposer ? (
-              <TaskChatComposerDock mobile={isMobile} streamlined={streamlinedUiEnabled} concealed={!historyRevealed}>
+            {showComposer || isMobile ? (
+              <TaskChatComposerDock mobile={isMobile} streamlined={streamlinedUiEnabled} concealed={!historyRevealed}
+                navigationRef={isMobile ? setMobileNavigationContainer : undefined}>
+                {showComposer ? <>
                 {composerAccessory}
                 {tailTurnStatus ? (
                   <TaskChatTurnStatusIsland model={tailTurnStatus} />
@@ -3229,6 +3234,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                   </div>
                 </div>
                 {footer}
+                </> : null}
               </TaskChatComposerDock>
             ) : null}
           </div>

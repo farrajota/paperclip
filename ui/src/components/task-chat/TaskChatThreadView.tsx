@@ -1,7 +1,8 @@
 import { TaskBrowserActivity } from "../task-side-panel/TaskBrowserActivity";
 import { TaskChatProjectCreatedCard } from "./TaskChatProjectCreatedCard";
 import { TaskChatSkillCreatedCard } from "./TaskChatSkillCreatedCard";
-import { useMemo, type ReactNode } from "react";
+import { useCallback, useMemo, useRef, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { IssueAttachment } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
@@ -25,6 +26,8 @@ import { TaskMessageScroller } from "./TaskMessageScroller";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
+import { ConversationNavigator } from "./ConversationNavigator";
+import { buildConversationNavigationEntries, type ConversationNavigationEntry } from "./conversation-navigation";
 
 const EMPTY_ATTACHMENTS: IssueAttachment[] = [];
 
@@ -76,6 +79,10 @@ interface TaskChatThreadViewProps {
   attachments?: IssueAttachment[];
   onOpenSkill?: (skillId: string, name: string) => void;
   onOpenBrowser?: (browserId: string) => void;
+  /** Enable the semantic navigator for a history-aware live task thread. */
+  navigationHistoryPartial?: boolean;
+  /** Native mobile dock slot; null waits for its mount, undefined uses the reader edge. */
+  navigationContainer?: HTMLElement | null;
 }
 
 function renderItem(
@@ -315,7 +322,59 @@ export function TaskChatThreadView({
   attachments = EMPTY_ATTACHMENTS,
   onOpenSkill,
   onOpenBrowser,
+  navigationHistoryPartial,
+  navigationContainer,
 }: TaskChatThreadViewProps) {
+  const highlightedRow = useRef<HTMLElement | null>(null);
+  const highlightAnchor = useCallback((entry: ConversationNavigationEntry | null) => {
+    highlightedRow.current?.classList.remove("rounded-sm", "outline", "outline-2", "outline-offset-2", "outline-primary/70");
+    highlightedRow.current = null;
+    if (entry === null) return;
+    const target = document.getElementById(entry.domId);
+    if (!target) return;
+    target.classList.add("rounded-sm", "outline", "outline-2", "outline-offset-2", "outline-primary/70");
+    highlightedRow.current = target;
+  }, []);
+  const navigationEntries = useMemo(
+    () => buildConversationNavigationEntries(items, Boolean(renderInteraction)),
+    [items, Boolean(renderInteraction)],
+  );
+  const activateNavigationEntry = useCallback(async (entry: (typeof navigationEntries)[number]) => {
+    const scroller = document.querySelector<HTMLElement>('[data-testid="task-chat-scroller"]');
+    const target = document.getElementById(entry.domId);
+    if (!target || target.dataset.threadAnchor !== entry.anchorKey || (scroller && !scroller.contains(target))) return false;
+
+    const selectedTurnTarget = entry.kind === "turn"
+      ? target.querySelector<HTMLElement>('[data-testid="task-chat-turn-summary"], [data-testid="task-chat-live-turn"]')
+      : null;
+    if (entry.kind === "turn" && !selectedTurnTarget) return false;
+    const landingTarget = selectedTurnTarget ?? target;
+    const disclosure = selectedTurnTarget?.matches('button[aria-expanded="false"]')
+      ? selectedTurnTarget as HTMLButtonElement
+      : null;
+
+    landingTarget.scrollIntoView({ block: "center", behavior: "auto" });
+    disclosure?.click();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+
+    if (disclosure && !target.querySelector('.tc-turn-fold[data-folded="false"]')) return false;
+    if (
+      !target.isConnected ||
+      document.getElementById(entry.domId) !== target ||
+      target.dataset.threadAnchor !== entry.anchorKey ||
+      (scroller && !scroller.contains(target))
+    ) return false;
+    const confirmedTarget = entry.kind === "turn"
+      ? target.querySelector<HTMLElement>('[data-testid="task-chat-turn-summary"], [data-testid="task-chat-live-turn"]')
+      : target;
+    if (!confirmedTarget || !target.contains(confirmedTarget)) return false;
+    const row = confirmedTarget.getBoundingClientRect();
+    if (scroller) {
+      const viewport = scroller.getBoundingClientRect();
+      return row.bottom > viewport.top && row.top < viewport.bottom && row.right > viewport.left && row.left < viewport.right;
+    }
+    return row.bottom > 0 && row.top < window.innerHeight && row.right > 0 && row.left < window.innerWidth;
+  }, []);
   const streamlined = useStreamlinedTaskChatPresentation();
   const retryableMarkerId =
     onRetryFailedRun || onTryAgainNoLiveExecutionPath
@@ -367,7 +426,7 @@ export function TaskChatThreadView({
                 data-thread-anchor={
                   item.kind === "message" ? (item.renderKey ?? item.id) : item.id
                 }
-                id={item.kind === "message" ? `comment-${item.id}` : undefined}
+                id={item.kind === "message" ? `comment-${item.id}` : `thread-anchor-${encodeURIComponent(item.id)}`}
                 className={taskChatItemSpacingClass(
                   item,
                   renderedItems[index - 1]?.item ?? null,
@@ -387,7 +446,7 @@ export function TaskChatThreadView({
                 data-thread-anchor={
                   item.kind === "message" ? (item.renderKey ?? item.id) : item.id
                 }
-                id={item.kind === "message" ? `comment-${item.id}` : undefined}
+                id={item.kind === "message" ? `comment-${item.id}` : `thread-anchor-${encodeURIComponent(item.id)}`}
                 className={cn(
                   index > 0 &&
                     item.kind === "interaction" &&
@@ -443,13 +502,38 @@ export function TaskChatThreadView({
       {tail ? streamlined ? <div className="mt-4">{tail}</div> : tail : null}
     </div>
   );
+  const navigation = navigationHistoryPartial !== undefined ? (
+    <ConversationNavigator
+      entries={navigationEntries}
+      historyPartial={navigationHistoryPartial}
+      docked={navigationContainer !== undefined}
+      onHighlight={highlightAnchor}
+      onActivate={activateNavigationEntry}
+    />
+  ) : null;
+  // Keep semantic/activation ownership here; only the native mobile dock owns
+  // placement, so composer growth and nav/safe-area offsets cannot occlude it.
+  const placedNavigation = navigationContainer === undefined
+    ? navigation
+    : navigationContainer ? createPortal(navigation, navigationContainer) : null;
 
-  if (!scroll) return body;
+  if (!scroll) {
+    if (navigationHistoryPartial === undefined) return body;
+    return (
+      <div className="relative">
+        {body}
+        {placedNavigation}
+      </div>
+    );
+  }
 
   return (
-    <TaskMessageScroller contentKey={contentKey ?? taskChatContentKey(items)}>
-      {body}
-    </TaskMessageScroller>
+    <div className="relative flex min-h-0 flex-1">
+      <TaskMessageScroller contentKey={contentKey ?? taskChatContentKey(items)}>
+        {body}
+      </TaskMessageScroller>
+      {placedNavigation}
+    </div>
   );
 }
 
