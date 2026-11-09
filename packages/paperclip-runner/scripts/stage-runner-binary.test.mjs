@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -83,6 +83,11 @@ test("release metadata rejects incompatible native, harness and protocol contrac
   }
 });
 
+// Copies of /bin/sleep or /bin/echo are not portable stand-ins: Ubuntu 26.04 ships coreutils as one
+// multicall binary that dispatches on argv[0], so a renamed copy exits 1 and both share bytes. A copy
+// of Node is a native host executable that behaves the same under any name.
+const waitArgs = ["-e", "setTimeout(() => {}, 30_000)"], exitArgs = ["-e", ""];
+
 async function withOwnedChildren(root, action) {
   const owned = [];
   const start = (command, args) => {
@@ -112,18 +117,18 @@ test("atomically publishes while the previous executable is running", { skip: pr
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
   const destination = path.join(root, "paperclip-runnerd");
   await withOwnedChildren(root, async start => {
-    await stageRunnerBinary("/bin/sleep", destination);
+    await stageRunnerBinary(process.execPath, destination);
     const previous = await stat(destination);
-    const old = start(destination, ["30"]);
+    const old = start(destination, waitArgs);
     await old.spawned;
-    await stageRunnerBinary("/bin/sleep", destination);
+    await stageRunnerBinary(process.execPath, destination);
     const published = await stat(destination);
     assert.notEqual(published.ino, previous.ino);
     assert.equal(published.mode & 0o777, 0o755);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
     assert.deepEqual(await readdir(root), ["paperclip-runnerd"]);
-    const next = start(destination, ["0"]);
+    const next = start(destination, exitArgs);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
   });
@@ -146,12 +151,21 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
         if (slices.length > 1) execFileSync("/usr/bin/lipo", [input, "-thin", architecture, "-output", output]);
       }
     };
+    // Writes a host executable whose bytes differ from Node's and returns the arguments that exit 0.
+    const writeDevBuildFixture = async output => {
+      // codesign rejects bytes appended to a Mach-O, so macOS uses its standalone BSD echo.
+      if (process.platform === "darwin") { await copyHostFixture("/bin/echo", output); return ["rebuilt"]; }
+      // ELF loaders ignore bytes past the file's mapped contents, so a marker makes this copy distinct.
+      await copyFile(process.execPath, output);
+      await appendFile(output, "\npaperclip-runnerd dev build fixture\n");
+      return exitArgs;
+    };
     await mkdir(path.dirname(source), { recursive: true });
     await writeFile(source, "fn main() {}\n");
     await mkdir(path.dirname(built), { recursive: true });
-    await copyHostFixture("/bin/echo", built);
+    const builtArgs = await writeDevBuildFixture(built);
     const previousBuild = path.join(root, "previous-build");
-    await copyHostFixture("/bin/sleep", previousBuild);
+    await copyHostFixture(process.execPath, previousBuild);
     await stageRunnerBinary(previousBuild, hostTarget);
     await stageRunnerBinary(built, path.join(binaryRoot, "paperclip-runnerd"));
     const platforms = {}, releaseBytes = new Map();
@@ -177,7 +191,7 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     const manifestPath = path.join(binaryRoot, "release-manifest.json");
     const manifest = JSON.stringify({ schema: "paperclip.runner.release-binaries.v1", sourceRevision: "a".repeat(40), platforms });
     await writeFile(manifestPath, manifest);
-    const old = start(hostTarget, ["30"]);
+    const old = start(hostTarget, waitArgs);
     await old.spawned;
     const requirement = { repoRoot: root, nativeRunnerRequired: true };
     assert.equal(paperclipRunnerBinaryNeedsBuild(requirement), true);
@@ -197,7 +211,7 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     assert.equal(paperclipRunnerBinaryNeedsBuild(requirement), false);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    const next = start(selected.binary, ["rebuilt"]);
+    const next = start(selected.binary, builtArgs);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
   });
