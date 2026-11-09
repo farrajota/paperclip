@@ -47,3 +47,10 @@ overrides:
   # Parsers and highlighters must share NodeProp IDs from one Lezer instance.
   # Mixed copies can interpret unrelated node metadata as highlighting tags.
   "@lezer/common": "^1.5.2"
+  # Undici security fixes within each parent's declared major (GHSA-2m5v-pch6-74hx,
+  # GHSA-4w7w-5xrc-9h26 and six related advisories): discord.js needs ^6,
+  # @ai-sdk/provider-utils ^7 and jsdom ^8. Undici 5.x has no fixed release,
+  # so @connectrpc/connect-node's ^5.28.4 copy is deliberately left unchanged.
+  "undici@^6.0.0": "^6.29.1"
+  "undici@^7.0.0": "^7.30.2"
+  "undici@^8.0.0": "^8.12.4"
