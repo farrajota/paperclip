@@ -49,6 +49,52 @@ enum CommandLifecycle {
 const TERMINAL_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const CUMULATIVE_ACK_PERSIST_INTERVAL: usize = 16;
 
+/// Deadline for a terminal or old-authority acknowledgement fence.
+///
+/// The controller durably commits each retained event before acknowledging
+/// it, so the time to drain an outbox grows with its length and the
+/// controller's storage latency. A fixed total budget misreads a slow but
+/// advancing controller as a stalled one. The fence therefore fails only
+/// after `TERMINAL_RESULT_ACK_TIMEOUT` without cumulative cursor progress.
+/// Progress is bounded by the produced source cursor, and a configured
+/// process runtime limit still caps the whole wait.
+struct AckProgressDeadline {
+    acked_source_seq: u64,
+    idle_deadline: Instant,
+    runtime_deadline: Option<Instant>,
+}
+
+impl AckProgressDeadline {
+    fn start(now: Instant, acked_source_seq: u64, runtime_deadline: Option<Instant>) -> Self {
+        Self {
+            acked_source_seq,
+            idle_deadline: now + TERMINAL_RESULT_ACK_TIMEOUT,
+            runtime_deadline,
+        }
+    }
+
+    fn observe(&mut self, now: Instant, acked_source_seq: u64) {
+        if acked_source_seq > self.acked_source_seq {
+            self.acked_source_seq = acked_source_seq;
+            self.idle_deadline = now + TERMINAL_RESULT_ACK_TIMEOUT;
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now >= self.idle_deadline
+            || self
+                .runtime_deadline
+                .is_some_and(|runtime_deadline| now >= runtime_deadline)
+    }
+}
+
+fn runtime_deadline(config: &DurableRunnerConfig, started: Instant) -> Option<Instant> {
+    if config.max_runtime.is_zero() {
+        return None;
+    }
+    started.checked_add(config.max_runtime)
+}
+
 fn sleep_for_reconnect(base: Duration, max_delay: Duration, attempt: &mut u32) {
     let multiplier = 1_u128 << (*attempt).min(5);
     let uncapped = base.as_millis().saturating_mul(multiplier);
@@ -614,6 +660,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                     &transition.command,
                     &transition.result,
                     &mut sent,
+                    runtime_deadline(&config, started),
                 ) {
                     Ok(()) => {
                         apply_authority_rotation(
@@ -644,6 +691,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                 &mut transport,
                 &connection,
                 &welcome.pending_commands,
+                runtime_deadline(&config, started),
             );
         }
         state.lifecycle = "ready".to_owned();
@@ -686,6 +734,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                         &command,
                         &result,
                         &mut sent_source_seq,
+                        runtime_deadline(&config, started),
                     );
                 } else if result.status == "failed" {
                     send_outbox(
@@ -717,6 +766,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                     &store,
                     &connection,
                     &result,
+                    runtime_deadline(&config, started),
                 ) {
                     return stop_after_terminal_result_delivery_failure(
                         &mut state,
@@ -778,6 +828,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                         &store,
                         &connection,
                         &mut sent_source_seq,
+                        runtime_deadline(&config, started),
                     )
                 },
             );
@@ -941,6 +992,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                                 &command,
                                 &result,
                                 &mut sent_source_seq,
+                                runtime_deadline(&config, started),
                             );
                         } else if result.status == "failed" {
                             send_outbox(
@@ -978,6 +1030,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                             &store,
                             &connection,
                             &result,
+                            runtime_deadline(&config, started),
                         ) {
                             return stop_after_terminal_result_delivery_failure(
                                 &mut state,
@@ -1033,6 +1086,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                                     &store,
                                     &connection,
                                     &mut sent_source_seq,
+                                    runtime_deadline(&config, started),
                                 )
                             },
                         );
@@ -1241,10 +1295,12 @@ fn wait_for_terminal_result_ack(
     store: &DurableStateStore,
     connection: &ConnectionMetadata,
     result: &StoredCommandResult,
+    runtime_deadline: Option<Instant>,
 ) -> Result<(), DurableRunnerError> {
-    let deadline = Instant::now() + TERMINAL_RESULT_ACK_TIMEOUT;
+    let mut deadline =
+        AckProgressDeadline::start(Instant::now(), state.acked_source_seq, runtime_deadline);
     let mut ack_persistence = CumulativeAckPersistence::default();
-    while Instant::now() < deadline {
+    while !deadline.expired(Instant::now()) {
         let Some(message) = transport.receive_json()? else {
             continue;
         };
@@ -1279,6 +1335,7 @@ fn wait_for_terminal_result_ack(
                     .and_then(Value::as_u64)
                     .ok_or_else(|| DurableRunnerError::invalid("ACK cursor is required"))?;
                 ack_persistence.apply(state, store, acked, connection.protocol_version)?;
+                deadline.observe(Instant::now(), state.acked_source_seq);
             }
             Some("ping") => transport.send_json(&control_envelope(
                 state,
@@ -1317,6 +1374,7 @@ fn wait_for_old_authority_outbox_ack(
     store: &DurableStateStore,
     connection: &ConnectionMetadata,
     sent_source_seq: &mut u64,
+    runtime_deadline: Option<Instant>,
 ) -> Result<(), DurableRunnerError> {
     send_outbox(
         transport,
@@ -1325,9 +1383,10 @@ fn wait_for_old_authority_outbox_ack(
         connection.protocol_version,
     )?;
     let target = state.highest_source_seq();
-    let deadline = Instant::now() + TERMINAL_RESULT_ACK_TIMEOUT;
+    let mut deadline =
+        AckProgressDeadline::start(Instant::now(), state.acked_source_seq, runtime_deadline);
     while state.acked_source_seq < target {
-        if Instant::now() >= deadline {
+        if deadline.expired(Instant::now()) {
             return Err(DurableRunnerError::invalid(
                 "old authority event acknowledgement timed out",
             ));
@@ -1344,6 +1403,7 @@ fn wait_for_old_authority_outbox_ack(
                     .ok_or_else(|| DurableRunnerError::invalid("ACK cursor is required"))?;
                 state.apply_ack(acked, connection.protocol_version)?;
                 store.save(state)?;
+                deadline.observe(Instant::now(), state.acked_source_seq);
             }
             Some("ping") => transport.send_json(&control_envelope(
                 state,
@@ -1445,8 +1505,16 @@ fn deliver_warm_attachment(
     command: &Command,
     result: &StoredCommandResult,
     sent_source_seq: &mut u64,
+    runtime_deadline: Option<Instant>,
 ) -> Result<(), DurableRunnerError> {
-    wait_for_old_authority_outbox_ack(transport, state, store, connection, sent_source_seq)?;
+    wait_for_old_authority_outbox_ack(
+        transport,
+        state,
+        store,
+        connection,
+        sent_source_seq,
+        runtime_deadline,
+    )?;
     let receipt = WarmRunTransition::new(
         config,
         next,
@@ -1550,6 +1618,7 @@ fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
     transport: &mut AuthenticatedTransport,
     connection: &ConnectionMetadata,
     pending_commands: &[Command],
+    runtime_deadline: Option<Instant>,
 ) -> Result<(), DurableRunnerError> {
     let pending = state.pending_terminal_delivery.clone().ok_or_else(|| {
         DurableRunnerError::invalid("terminal result reconciliation has no durable fence")
@@ -1585,9 +1654,14 @@ fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
         if let Err(error) = delivery {
             return stop_after_terminal_result_delivery_failure(state, store, executor, error);
         }
-        if let Err(error) =
-            wait_for_terminal_result_ack(transport, state, store, connection, &result)
-        {
+        if let Err(error) = wait_for_terminal_result_ack(
+            transport,
+            state,
+            store,
+            connection,
+            &result,
+            runtime_deadline,
+        ) {
             return stop_after_terminal_result_delivery_failure(state, store, executor, error);
         }
     } else {
@@ -1613,7 +1687,14 @@ fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
         return Err(error);
     }
     finish_terminal_reconciliation(state, store, config, executor, |state| {
-        wait_for_old_authority_outbox_ack(transport, state, store, connection, &mut sent_source_seq)
+        wait_for_old_authority_outbox_ack(
+            transport,
+            state,
+            store,
+            connection,
+            &mut sent_source_seq,
+            runtime_deadline,
+        )
     })
 }
 
@@ -5075,5 +5156,61 @@ mod tests {
         assert_eq!(first_lifecycle.durable_state(), Some("suspended"));
         assert_eq!(executor.calls, 1);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ack_fence_stays_live_while_a_slow_controller_keeps_acknowledging() {
+        // A delivery-only replay of ~94 retained events against a controller
+        // that durably commits each one in ~25 ms needs ~2.35 s in total.
+        let started = Instant::now();
+        let mut fence = AckProgressDeadline::start(started, 0, None);
+        let step = Duration::from_millis(25);
+        let mut now = started;
+        for acked in 1..=94 {
+            now += step;
+            assert!(!fence.expired(now), "fence expired before ACK {acked}");
+            fence.observe(now, acked);
+        }
+        assert!(now - started > TERMINAL_RESULT_ACK_TIMEOUT);
+        assert!(!fence.expired(now + TERMINAL_RESULT_ACK_TIMEOUT - Duration::from_millis(1)));
+        assert!(fence.expired(now + TERMINAL_RESULT_ACK_TIMEOUT));
+    }
+
+    #[test]
+    fn ack_fence_times_out_after_two_seconds_without_cursor_progress() {
+        let started = Instant::now();
+        let mut stalled = AckProgressDeadline::start(started, 7, None);
+        // Repeating the current cursor is not progress.
+        stalled.observe(started + Duration::from_millis(1_900), 7);
+        assert!(!stalled.expired(started + Duration::from_millis(1_999)));
+        assert!(stalled.expired(started + TERMINAL_RESULT_ACK_TIMEOUT));
+
+        let mut progressed_then_stalled = AckProgressDeadline::start(started, 7, None);
+        let progress = started + Duration::from_millis(1_500);
+        progressed_then_stalled.observe(progress, 8);
+        progressed_then_stalled.observe(progress + Duration::from_millis(1_000), 8);
+        assert!(!progressed_then_stalled
+            .expired(progress + TERMINAL_RESULT_ACK_TIMEOUT - Duration::from_millis(1)));
+        assert!(progressed_then_stalled.expired(progress + TERMINAL_RESULT_ACK_TIMEOUT));
+    }
+
+    #[test]
+    fn ack_fence_progress_cannot_outlive_the_runner_runtime_deadline() {
+        let started = Instant::now();
+        let mut limited = config(std::env::temp_dir().join("runner-ack-fence-runtime"));
+        limited.max_runtime = Duration::from_secs(3);
+        let runtime = runtime_deadline(&limited, started);
+        assert_eq!(runtime, Some(started + Duration::from_secs(3)));
+        limited.max_runtime = Duration::ZERO;
+        assert_eq!(runtime_deadline(&limited, started), None);
+
+        let mut fence = AckProgressDeadline::start(started, 0, runtime);
+        let mut now = started;
+        for acked in 1..=29 {
+            now += Duration::from_millis(100);
+            fence.observe(now, acked);
+        }
+        assert!(!fence.expired(started + Duration::from_millis(2_999)));
+        assert!(fence.expired(started + Duration::from_secs(3)));
     }
 }
