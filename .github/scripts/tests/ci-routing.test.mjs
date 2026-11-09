@@ -67,10 +67,7 @@ test("PR CI selects fork-owned workflows and ordinary hosted runners", () => {
   assert.match(caller, /uses: \.\/\.github\/workflows\/pr-trusted\.yml/);
   assert.match(trusted, /uses: \.\/\.github\/workflows\/ci-routing\.yml/);
   assert.match(routing, /^    runs-on: ubuntu-latest$/m);
-  // Suites run on the pinned image they were qualified against, not whatever
-  // ubuntu-latest currently resolves to.
-  assert.match(routing, /runner=ubuntu-24\.04/);
-  assert.doesNotMatch(routing, /runner=ubuntu-latest/);
+  assert.match(routing, /runner=ubuntu-latest/);
   assert.doesNotMatch(`${caller}\n${trusted}\n${routing}`, /uses: paperclipai\/paperclip|@master/);
 });
 

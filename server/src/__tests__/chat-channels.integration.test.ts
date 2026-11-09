@@ -235,6 +235,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 
 const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const embeddedPostgresSupport = externalTestDatabaseUrl
@@ -66805,6 +66806,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
   it.each([false, true])("orders reversed GitHub edit and delete callbacks behind their durable root (root processed before replay: %s)", async (rootProcessedFirst) => {
     const fixture = await seedCompany();
+    // The drained callbacks hand the ordered conversation drain to background
+    // tasks, so these waits measure real database work. Vitest's implicit
+    // 1-second waitFor budget is the upstream budget; scale it on slower
+    // runners like the other wall-clock fixtures.
+    const backgroundWait = { timeout: scaleTestTimeout(1_000) };
     const deferred: Array<() => void | Promise<void>> = [];
     const { callbacks, endpoint, service, wakeup, webhookSecret } =
       await configuredGitHubEndpoint(fixture, {
@@ -66939,7 +66945,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(
         deliveries.every((delivery) => delivery.state === "processed"),
       ).toBe(true);
-    });
+    }, backgroundWait);
 
     const [conversation] = await readChatConversationsByEndpointId(endpoint.id);
     const comments = await db
@@ -66990,7 +66996,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           state: "filtered",
         },
       ]);
-    });
+    }, backgroundWait);
     await expect(
       db
         .select({ body: issueComments.body })
