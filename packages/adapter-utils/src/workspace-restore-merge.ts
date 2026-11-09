@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, type Stats } from "node:fs";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, type PathManifest, type WorkspacePaths, type WorkspaceManifestWriter } from "./workspace-manifest.js";
 import { shouldExcludePath } from "./exclude-patterns.js";
-import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
+import { runSnapshotThread } from "./workspace-snapshot-thread.js";
 import type { WorkspaceRestoreDiagnostic } from "./workspace-restore-diagnostics.js";
 
 export type SnapshotEntry =
@@ -165,41 +165,82 @@ async function hashFile(filePath: string, fileSize: number, smallFileBuffer?: Bu
 
 const SMALL_FILE_HASH_WINDOW_SIZE = 4;
 
-type SettledSmallFileHash = { hash: string } | { error: unknown };
+type SettledResult<T> = { value: T } | { error: unknown };
 
 interface CaptureHashScratch {
   buffers: Array<Buffer | undefined>;
+  pending: Set<Promise<unknown>>;
 }
 
 interface CapturePathMatcher {
   matches(relative: string): boolean;
   close(): void;
 }
+
 interface PendingSmallFileHash {
   relative: string;
   mode: number;
   slot: number;
-  result: Promise<SettledSmallFileHash>;
+  result: Promise<SettledResult<string>>;
+  settled?: SettledResult<string>;
 }
+
+type DeferredSnapshotEntry =
+  | { kind: "small"; record: PendingSmallFileHash }
+  | { kind: "large"; relative: string; mode: number; result: Promise<SettledResult<string>> }
+  | { kind: "symlink"; relative: string; result: Promise<SettledResult<string>> }
+  | { kind: "directory"; relative: string };
 
 async function* walkDirectory(
   root: string, exclude: readonly string[], ignored: CapturePathMatcher, scratch: CaptureHashScratch, relative = "",
 ): AsyncGenerator<[string, SnapshotEntry]> {
+  const readEntry = async (nextRelative: string) => [nextRelative, await fs.lstat(path.join(root, nextRelative))] as const;
   const current = relative ? path.join(root, relative) : root;
   const pending = new Array<PendingSmallFileHash | undefined>(SMALL_FILE_HASH_WINDOW_SIZE);
   let head = 0;
   let tail = 0;
   let pendingCount = 0;
-  let hashFailureObserved = false;
+  let contentFailureObserved = false;
+  let firstContentFailureFound = false;
+  let firstContentFailureIndex = Number.POSITIVE_INFINITY;
+  let firstContentFailure: unknown;
   let consumerFailureObserved = false;
   let consumerFailure: unknown;
+  let nextEntryIndex = 0;
+
+  function noteContentFailure(index: number, error: unknown): void {
+    contentFailureObserved = true;
+    if (!firstContentFailureFound || index < firstContentFailureIndex) {
+      firstContentFailureFound = true;
+      firstContentFailureIndex = index;
+      firstContentFailure = error;
+    }
+  }
+
+  function trackResult<T>(operation: Promise<T>, index: number): Promise<SettledResult<T>> {
+    const result = operation.then<SettledResult<T>, SettledResult<T>>(
+      (value) => ({ value }),
+      (error: unknown) => {
+        noteContentFailure(index, error);
+        return { error };
+      },
+    );
+    scratch.pending.add(result);
+    void result.then(() => scratch.pending.delete(result));
+    return result;
+  }
+
+  async function waitForContentSlot(): Promise<void> {
+    while (scratch.pending.size >= 16) await Promise.race(scratch.pending);
+  }
 
   async function* consumeHead(): AsyncGenerator<[string, SnapshotEntry]> {
     const record = pending[head]!;
     const result = await record.result;
+    record.settled = result;
     if ("error" in result) throw result.error;
     try {
-      yield [record.relative, { kind: "file", mode: record.mode, hash: result.hash }];
+      yield [record.relative, { kind: "file", mode: record.mode, hash: result.value }];
     } catch (error) {
       consumerFailureObserved = true;
       consumerFailure = error;
@@ -210,66 +251,166 @@ async function* walkDirectory(
     pendingCount -= 1;
   }
 
+  async function completeHead(): Promise<PendingSmallFileHash> {
+    const record = pending[head]!;
+    record.settled = await record.result;
+    pending[record.slot] = undefined;
+    head = (record.slot + 1) % SMALL_FILE_HASH_WINDOW_SIZE;
+    pendingCount -= 1;
+    return record;
+  }
+
   async function* drainSmallFiles(): AsyncGenerator<[string, SnapshotEntry]> {
     while (pendingCount > 0) yield* consumeHead();
   }
 
-  async function settlePending(): Promise<{ found: false } | { found: true; error: unknown }> {
-    let firstHashError: unknown;
-    let hashErrorFound = false;
+  async function settlePending(): Promise<void> {
     for (let index = 0; index < pendingCount; index += 1) {
       const record = pending[(head + index) % SMALL_FILE_HASH_WINDOW_SIZE]!;
-      const result = await record.result;
-      if ("error" in result && !hashErrorFound) {
-        firstHashError = result.error;
-        hashErrorFound = true;
-      }
+      await record.result;
     }
-    return hashErrorFound ? { found: true, error: firstHashError } : { found: false };
   }
 
+  async function settleDeferred(entries: readonly DeferredSnapshotEntry[]): Promise<void> {
+    await settlePending();
+    for (const entry of entries) {
+      if (entry.kind === "small") await entry.record.result;
+      else if (entry.kind !== "directory") await entry.result;
+    }
+  }
+
+  function deferPendingSmallFiles(entries: DeferredSnapshotEntry[]): void {
+    for (let index = 0; index < pendingCount; index += 1) {
+      entries.push({ kind: "small", record: pending[(head + index) % SMALL_FILE_HASH_WINDOW_SIZE]! });
+    }
+  }
+
+  async function* visitBatch(paths: string[]): AsyncGenerator<[string, SnapshotEntry]> {
+    // Admit metadata peers together, but consume each result in order so an
+    // earlier file can start hashing before a later metadata read settles.
+    const discoveries = paths.map((entry) => readEntry(entry).then<SettledResult<readonly [string, Stats]>, SettledResult<readonly [string, Stats]>>(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    ));
+    try {
+      yield* visitDiscoveredBatch(discoveries);
+    } finally {
+      for (const discovery of discoveries) await discovery;
+    }
+  }
+
+  async function* visitDiscoveredBatch(discoveries: Array<Promise<SettledResult<readonly [string, Stats]>>>): AsyncGenerator<[string, SnapshotEntry]> {
+    let deferred: DeferredSnapshotEntry[] | undefined;
+
+    for (let index = 0; index < discoveries.length; index += 1) {
+      const entryIndex = nextEntryIndex++;
+      if (contentFailureObserved) {
+        await settleDeferred(deferred ?? []);
+        throw firstContentFailure;
+      }
+      await waitForContentSlot();
+      if (contentFailureObserved) {
+        await settleDeferred(deferred ?? []);
+        throw firstContentFailure;
+      }
+
+      const discovery = await discoveries[index]!;
+      if (contentFailureObserved) {
+        await settleDeferred(deferred ?? []);
+        throw firstContentFailure;
+      }
+      if ("error" in discovery) {
+        await settleDeferred(deferred ?? []);
+        if (firstContentFailureFound) throw firstContentFailure;
+        throw discovery.error;
+      }
+
+      const [nextRelative, stats] = discovery.value;
+      const fullPath = path.join(root, nextRelative);
+      if (stats.isFile() && stats.size <= SMALL_FILE_STREAM_THRESHOLD_BYTES) {
+        await waitForContentSlot();
+        const slot = tail;
+        const buffer = scratch.buffers[slot] ?? (scratch.buffers[slot] = Buffer.alloc(SMALL_FILE_READ_BUFFER_BYTES));
+        const record: PendingSmallFileHash = {
+          relative: nextRelative,
+          mode: stats.mode,
+          slot,
+          result: trackResult(hashFile(fullPath, stats.size, buffer), entryIndex),
+        };
+        pending[slot] = record;
+        tail = (tail + 1) % SMALL_FILE_HASH_WINDOW_SIZE;
+        pendingCount += 1;
+        if (deferred) deferred.push({ kind: "small", record });
+        if (pendingCount === SMALL_FILE_HASH_WINDOW_SIZE) {
+          if (deferred) await completeHead();
+          else yield* consumeHead();
+        }
+      } else if (stats.isDirectory()) {
+        if (!deferred) {
+          deferred = [];
+          deferPendingSmallFiles(deferred);
+        }
+        deferred.push({ kind: "directory", relative: nextRelative });
+      } else if (stats.isSymbolicLink()) {
+        await waitForContentSlot();
+        const result = trackResult(fs.readlink(fullPath), entryIndex);
+        if (!deferred) {
+          deferred = [];
+          deferPendingSmallFiles(deferred);
+        }
+        deferred.push({ kind: "symlink", relative: nextRelative, result });
+      } else if (stats.isFile()) {
+        await waitForContentSlot();
+        const result = trackResult(hashFile(fullPath, stats.size), entryIndex);
+        if (!deferred) {
+          deferred = [];
+          deferPendingSmallFiles(deferred);
+        }
+        deferred.push({ kind: "large", relative: nextRelative, mode: stats.mode, result });
+      }
+    }
+
+    if (!deferred) return;
+    while (pendingCount > 0) await completeHead();
+    await settleDeferred(deferred);
+    if (firstContentFailureFound) throw firstContentFailure;
+    for (const entry of deferred) {
+      if (entry.kind === "small") {
+        const result = entry.record.settled!;
+        if ("error" in result) throw result.error;
+        yield [entry.record.relative, { kind: "file", mode: entry.record.mode, hash: result.value }];
+      } else if (entry.kind === "large") {
+        const result = await entry.result;
+        if ("error" in result) throw result.error;
+        yield [entry.relative, { kind: "file", mode: entry.mode, hash: result.value }];
+      } else if (entry.kind === "symlink") {
+        const result = await entry.result;
+        if ("error" in result) throw result.error;
+        yield [entry.relative, { kind: "symlink", target: result.value }];
+      } else {
+        yield [entry.relative, { kind: "dir" }];
+        yield* walkDirectory(root, exclude, ignored, scratch, entry.relative);
+      }
+    }
+  }
+
+  let batch: string[] = [];
   try {
     for await (const entry of await fs.opendir(current)) {
       const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
-      if (hashFailureObserved) yield* drainSmallFiles();
       if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
-      const fullPath = path.join(root, nextRelative);
-      const stats = await fs.lstat(fullPath);
-      if (hashFailureObserved) yield* drainSmallFiles();
-      if (stats.isFile() && stats.size <= SMALL_FILE_STREAM_THRESHOLD_BYTES) {
-        const slot = tail;
-        const buffer = scratch.buffers[slot] ?? (scratch.buffers[slot] = Buffer.alloc(SMALL_FILE_READ_BUFFER_BYTES));
-        const result = hashFile(fullPath, stats.size, buffer).then<SettledSmallFileHash, SettledSmallFileHash>(
-          (hash) => ({ hash }),
-          (error: unknown) => {
-            hashFailureObserved = true;
-            return { error };
-          },
-        );
-        pending[slot] = { relative: nextRelative, mode: stats.mode, slot, result };
-        tail = (tail + 1) % SMALL_FILE_HASH_WINDOW_SIZE;
-        pendingCount += 1;
-        if (pendingCount === SMALL_FILE_HASH_WINDOW_SIZE) yield* consumeHead();
-      } else {
-        yield* drainSmallFiles();
-        if (stats.isDirectory()) {
-          yield [nextRelative, { kind: "dir" }];
-          yield* walkDirectory(root, exclude, ignored, scratch, nextRelative);
-        } else if (stats.isSymbolicLink()) {
-          yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
-        } else if (stats.isFile()) {
-          yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath, stats.size) }];
-        }
+      batch.push(nextRelative);
+      if (batch.length === 16) {
+        yield* visitBatch(batch);
+        batch = [];
       }
     }
+    if (batch.length) yield* visitBatch(batch);
     yield* drainSmallFiles();
   } catch (error) {
-    if (consumerFailureObserved) {
-      await settlePending();
-      throw consumerFailure;
-    }
-    const settled = await settlePending();
-    if (settled.found) throw settled.error;
+    await settleDeferred([]);
+    if (consumerFailureObserved) throw consumerFailure;
+    if (firstContentFailureFound) throw firstContentFailure;
     throw error;
   } finally {
     await settlePending();
@@ -313,6 +454,14 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
     return left.mode === right.mode && left.hash === right.hash;
   }
   return false;
+}
+
+function directorySnapshotsMatch(left: DirectorySnapshot, right: DirectorySnapshot): boolean {
+  if (left.entries.size !== right.entries.size) return false;
+  for (const [relative, entry] of right.entries) {
+    if (!entriesMatch(left.entries.get(relative), entry)) return false;
+  }
+  return true;
 }
 
 const LOCK_WAIT_MS = 30_000;
@@ -581,6 +730,7 @@ function nonEmpty(value: string | undefined): string | null {
  * would follow the symlink) before any caller treats it as the lock root.
  */
 async function resolveDirectoryMergeLockRoot(env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const { resolvePaperclipInstanceRootForAdapter } = await import("./server-utils.js");
   const instanceRoot = resolvePaperclipInstanceRootForAdapter({
     homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
     instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
@@ -617,6 +767,50 @@ export async function withDirectoryMergeLock<T>(
   // Canonicalize before we hash or lock: a retargeted symlink must not let the
   // lock protect one directory while the caller mutates another.
   const canonicalTargetDir = await fs.realpath(targetDir);
+  return withCanonicalDirectoryMergeLock(canonicalTargetDir, fn, env, diagnosticOperation, waitMs);
+}
+
+export async function withDirectoryPublicationLock<T>(
+  targetDir: string,
+  fn: (canonicalTargetDir: string) => Promise<T>,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<T> {
+  const absoluteTarget = path.resolve(targetDir);
+  const parent = await fs.realpath(path.dirname(absoluteTarget));
+  const canonicalTargetDir = path.join(parent, path.basename(absoluteTarget));
+  const assertSafeLeaf = async () => {
+    const leaf = await fs.lstat(canonicalTargetDir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (leaf && (!leaf.isDirectory() || leaf.isSymbolicLink())) {
+      throw new Error(`Directory publication target at ${canonicalTargetDir} is not a plain directory.`);
+    }
+  };
+  await assertSafeLeaf();
+  return withCanonicalDirectoryMergeLock(canonicalTargetDir, async () => {
+    await assertSafeLeaf();
+    return fn(canonicalTargetDir);
+  }, env);
+}
+
+export async function tryWithDirectoryMergeLock<T>(targetDir: string, fn: () => Promise<T>): Promise<T | undefined> {
+  const canonicalTargetDir = await fs.realpath(targetDir);
+  try {
+    return await withCanonicalDirectoryMergeLock(canonicalTargetDir, fn, process.env, undefined, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE) return undefined;
+    throw error;
+  }
+}
+
+async function withCanonicalDirectoryMergeLock<T>(
+  canonicalTargetDir: string,
+  fn: (canonicalTargetDir: string) => Promise<T>,
+  env: NodeJS.ProcessEnv,
+  diagnosticOperation?: DirectoryMergeLockOperation,
+  waitMs: number = LOCK_WAIT_MS,
+): Promise<T> {
   const lockRoot = await resolveDirectoryMergeLockRoot(env);
   const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
   const releaseLock = await acquireDirectoryMergeLock(path.join(lockRoot, `${lockKey}.lock`), diagnosticOperation, waitMs);
@@ -674,11 +868,11 @@ export async function captureDirectorySnapshot(
 ): Promise<DirectorySnapshot> {
   const exclude = [...new Set(options.exclude ?? [])];
   const ignored = workspacePathMatcher(options.ignoredPaths);
+  const scratch: CaptureHashScratch = { buffers: [], pending: new Set() };
   let writer: WorkspaceManifestWriter | null = null;
   try {
     writer = options.diskBacked ? await createWorkspaceManifest("paperclip-workspace-baseline-") : null;
     const memory = new Map<string, SnapshotEntry>();
-    const scratch: CaptureHashScratch = { buffers: [] };
     for await (const [relative, entry] of walkDirectory(rootDir, exclude, ignored, scratch)) {
       if (writer) writer.add("baseline", relative, JSON.stringify(entry));
       else memory.set(relative, entry);
@@ -692,10 +886,27 @@ export async function captureDirectorySnapshot(
     if (writer) ownedDirectorySnapshots.set(snapshot, path.dirname(writer.filePath));
     return snapshot;
   } catch (error) {
+    await Promise.allSettled(scratch.pending);
     writer?.close(false);
     if (writer) await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
     throw error;
   } finally { ignored.close(); }
+}
+
+export async function captureDirectorySnapshotOffThread(
+  rootDir: string,
+  options: { exclude?: string[]; ignoredPaths?: WorkspacePaths; diskBacked?: boolean } = {},
+): Promise<DirectorySnapshot> {
+  if (!options.diskBacked) return captureDirectorySnapshot(rootDir, options);
+  const result = await runSnapshotThread({ rootDir, exclude: options.exclude, ignoredPaths: options.ignoredPaths });
+  try {
+    const snapshot = openDirectorySnapshot(result.snapshot);
+    ownedDirectorySnapshots.set(snapshot, result.directory);
+    return snapshot;
+  } catch (error) {
+    await fs.rm(result.directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 /** A disk-backed subset for independent nested-repository merges. */
@@ -774,20 +985,26 @@ export async function mergeDirectoryWithBaseline(input: {
   sourceDir: string;
   targetDir: string;
   conflictPolicy?: "reject";
+  workspaceSnapshotIsolation?: "worker";
   beforeApply?: () => Promise<void>;
   afterApply?: () => Promise<void>;
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
-  snapshots?: { source: DirectorySnapshot; current: DirectorySnapshot };
+  snapshots?: { source: DirectorySnapshot; current?: DirectorySnapshot };
 }): Promise<void> {
+  const capture = input.workspaceSnapshotIsolation === "worker" ? captureDirectorySnapshotOffThread : captureDirectorySnapshot;
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
-  const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);
+  const source = input.snapshots?.source ?? await capture(input.sourceDir, options);
   try {
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
       await input.beforeApply?.();
+      if (!input.snapshots?.current && directorySnapshotsMatch(input.baseline, source)) {
+        await input.afterApply?.();
+        return;
+      }
       // Strict preflight must see excluded children before a directory is
       // replaced. The merge still applies only the filtered source/baseline.
-      const current = input.snapshots?.current ?? await captureDirectorySnapshot(canonicalTargetDir,
+      const current = input.snapshots?.current ?? await capture(canonicalTargetDir,
         input.conflictPolicy === "reject" ? { exclude: [], diskBacked: true } : options);
       try {
         if (input.conflictPolicy === "reject") {

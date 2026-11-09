@@ -13,8 +13,12 @@ import {
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
+import { routineOccurrenceDispositionRequestSchema } from "@paperclipai/shared/governance-occurrences";
+import { governanceOccurrenceService } from "../services/governance-occurrences.js";
 import { accessService, documentAnnotationService, logActivity, routineService } from "../services/index.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { canActorReadCase } from "../services/case-access.js";
+import type { AuthorizationActor } from "../services/authorization.js";
 import { badRequest, forbidden, unauthorized, unsupportedMediaType } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -29,6 +33,7 @@ export function routineRoutes(
   });
   const documentAnnotationsSvc = documentAnnotationService(db);
   const access = accessService(db);
+  const occurrenceSvc = governanceOccurrenceService(db);
   const routineDocumentKey = "description";
 
   function parseBooleanQuery(value: unknown) {
@@ -117,6 +122,12 @@ export function routineRoutes(
     return routine;
   }
 
+  async function assertRoutineCaseBindingAccess(req: Request, caseId: string) {
+    if (!(await canActorReadCase(db, req.actor as AuthorizationActor, caseId))) {
+      throw forbidden("The bound case is not available to this actor");
+    }
+  }
+
   async function logRoutineRevisionCreated(req: Request, input: {
     companyId: string;
     routineId: string;
@@ -158,10 +169,12 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     await assertBoardCanAssignTasks(req, companyId);
     assertCanManageCompanyRoutine(req, companyId, req.body.assigneeAgentId);
+    if (req.body.caseId) await assertRoutineCaseBindingAccess(req, req.body.caseId);
     const created = await svc.create(companyId, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
+      authorizationActor: req.actor as AuthorizationActor,
     });
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -192,7 +205,7 @@ export function routineRoutes(
   });
 
   router.get("/routines/:id", async (req, res) => {
-    const detail = await getAccessibleResource(req, res, svc.getDetail(req.params.id as string), "Routine not found");
+    const detail = await getAccessibleResource(req, res, svc.getDetail(req.params.id as string, req.actor as AuthorizationActor), "Routine not found");
     if (!detail) return;
     res.json(detail);
   });
@@ -203,7 +216,7 @@ export function routineRoutes(
       res.status(404).json({ error: "Routine not found" });
       return;
     }
-    const revisions = await svc.listRevisions(routine.id);
+    const revisions = await svc.listRevisions(routine.id, req.actor as AuthorizationActor);
     res.json(revisions);
   });
 
@@ -386,10 +399,14 @@ export function routineRoutes(
     ) {
       throw forbidden("Agents can only assign routines to themselves");
     }
+    if (req.body.caseId !== undefined && req.body.caseId !== routine.caseId && req.body.caseId) {
+      await assertRoutineCaseBindingAccess(req, req.body.caseId);
+    }
     const updated = await svc.update(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
+      authorizationActor: req.actor as AuthorizationActor,
     });
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -429,6 +446,7 @@ export function routineRoutes(
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
+      authorizationActor: req.actor as AuthorizationActor,
     });
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -457,7 +475,7 @@ export function routineRoutes(
     const routine = await getAccessibleResource(req, res, svc.get(req.params.id as string), "Routine not found");
     if (!routine) return;
     const limit = Number(req.query.limit ?? 50);
-    const result = await svc.listRuns(routine.id, Number.isFinite(limit) ? limit : 50);
+    const result = await svc.listRuns(routine.id, req.actor as AuthorizationActor, Number.isFinite(limit) ? limit : 50);
     res.json(result);
   });
 
@@ -472,6 +490,7 @@ export function routineRoutes(
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
+      authorizationActor: req.actor as AuthorizationActor,
     });
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -513,6 +532,7 @@ export function routineRoutes(
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
+      authorizationActor: req.actor as AuthorizationActor,
     });
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -555,6 +575,7 @@ export function routineRoutes(
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
+      authorizationActor: req.actor as AuthorizationActor,
     });
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -600,6 +621,7 @@ export function routineRoutes(
         agentId: req.actor.type === "agent" ? req.actor.agentId : null,
         userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
         runId: req.actor.runId ?? null,
+        authorizationActor: req.actor as AuthorizationActor,
       });
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -636,6 +658,8 @@ export function routineRoutes(
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
+      runId: req.actor.runId ?? null,
+      authorizationActor: req.actor as AuthorizationActor,
     });
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -671,6 +695,33 @@ export function routineRoutes(
       payload: typeof req.body === "object" && req.body !== null ? req.body as Record<string, unknown> : null,
     });
     res.status(202).json(result);
+  });
+
+  router.get("/routines/:id/occurrences", async (req, res) => {
+    const routine = await getAccessibleResource(req, res, svc.get(req.params.id as string), "Routine not found");
+    if (!routine) return;
+    if (req.query.limit !== undefined && (typeof req.query.limit !== "string" || !/^\d+$/.test(req.query.limit))) throw badRequest("limit must be an integer from 1 to 200");
+    const limit = req.query.limit === undefined ? 100 : Number(req.query.limit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw badRequest("limit must be an integer from 1 to 200");
+    if (req.query.cursor !== undefined && (typeof req.query.cursor !== "string" || req.query.cursor.length > 1024)) throw badRequest("Invalid occurrence cursor");
+    res.json(await occurrenceSvc.listForRoutine(routine.companyId, routine.id, req.actor as AuthorizationActor, { limit, cursor: req.query.cursor as string | undefined }));
+  });
+
+  router.post("/routines/:id/occurrences/:occurrenceId/disposition", validate(routineOccurrenceDispositionRequestSchema), async (req, res) => {
+    const routine = await assertCanManageExistingRoutine(req, req.params.id as string);
+    if (!routine) {
+      res.status(404).json({ error: "Routine not found" });
+      return;
+    }
+    if (req.actor.type !== "board") throw forbidden("Only a board user may skip or waive a routine obligation");
+    const occurrence = await occurrenceSvc.get(routine.companyId, req.params.occurrenceId as string, req.actor as AuthorizationActor);
+    if (!occurrence || occurrence.routineId !== routine.id) {
+      res.status(404).json({ error: "Routine occurrence not found" });
+      return;
+    }
+    const input = routineOccurrenceDispositionRequestSchema.parse(req.body);
+    const updated = await occurrenceSvc.setDisposition(routine.companyId, req.params.occurrenceId as string, input, req.actor as AuthorizationActor);
+    res.json(updated);
   });
 
   return router;

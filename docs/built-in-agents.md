@@ -9,7 +9,7 @@ The first built-ins are `briefs` and `learning`. Operators can provision them fr
 The subsystem has four layers:
 
 - Registry: `server/src/services/built-in-agents.ts` defines the static `BuiltInAgentDefinition` list.
-- Marker: `server/src/services/built-in-agent-metadata.ts` reads and writes `metadata.paperclipBuiltInAgent`.
+- Marker: `server/src/lib/built-in-agent-metadata.ts` reads and writes `metadata.paperclipBuiltInAgent`.
 - Provisioning service: `builtInAgentService(db)` finds, creates, updates, resets, and requires built-ins per company.
 - Routes: `server/src/routes/built-in-agents.ts` exposes list, provision, and reset APIs.
 
@@ -21,6 +21,14 @@ Built-in agent state is derived from the marked agent row:
 - `paused`: the marked row is paused. Scheduled/background work should log the paused warning and skip queueing work.
 
 Use `builtInAgentService(db).requireBuiltInAgent(companyId, key)` from backend features that need a built-in agent before scheduling work. It throws HTTP 412 with `code: "built_in_agent_not_configured"` for missing or incomplete agents. Paused agents return the agent plus a `built_in_agent_paused` warning so callers can pass the warning through to logs or API responses without treating the agent as ready for scheduling.
+
+## Bundled Routine Responsibility
+
+Automatically created bundled routines use the native company default responsible user, or the oldest active company owner when no default is configured. Automated creation remains unattributed to a human; `built-in-bundles` remains a system activity label, not a user that should receive company membership.
+
+Dispatch still requires the accountable user's current active membership. A configured but inactive default does not authorize another owner as a fallback, and revoking an existing owner does not silently reassign responsibility.
+
+Migration `0380_builtin_routine_responsibility` repairs only proven legacy bundled routines whose accountable user is the system label and whose agent marker matches the current bundled identity. It selects active same-company authority, appends a new current definition revision, and preserves routine configuration, activity timestamps, triggers, existing real-user ownership, historical revisions and runs. The new audit revision records the migration time without making the routine appear newly active. Replaying the cutover does not append another revision. Unresolved authority remains fail closed; the migration grants no membership. Use the normal authorized responsibility controls to correct an unavailable owner rather than creating a synthetic user for the audit label.
 
 ## API
 

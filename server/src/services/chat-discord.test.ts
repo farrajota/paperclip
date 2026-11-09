@@ -1,9 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  discordMarkdownRequiresAttachment,
-  listDiscordBotChannels,
-  verifyDiscordBot,
-} from "./chat-discord.js";
+import { discordMarkdownRequiresAttachment } from "./chat-discord-publication-format.js";
+import { listDiscordBotChannels, verifyDiscordBot } from "./chat-discord.js";
 
 const applicationId = "123456789012345678";
 const guildId = "1457808928258658549";

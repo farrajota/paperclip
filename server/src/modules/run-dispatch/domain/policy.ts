@@ -108,6 +108,7 @@ export type ScheduledRetryFacts = {
 };
 
 export type QueuedRunStalenessErrorCode =
+  | "issue_waiting_for_response"
   | "execution_reconciliation_required"
   | "issue_dependencies_blocked"
   | "issue_not_found"
@@ -117,7 +118,11 @@ export type QueuedRunStalenessErrorCode =
   | "issue_execution_lock_changed"
   | "issue_blocked"
   | "issue_review_participant_changed"
-  | "issue_continuation_waiting_on_review";
+  | "issue_continuation_waiting_on_review"
+  | "issue_access_revoked"
+  | "issue_earliest_start"
+  | "issue_schedule_unknown"
+  | "issue_execution_paused";
 
 export type StalenessDecision =
   | { stale: false }
@@ -129,6 +134,7 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
+  pendingResponse?: "interaction" | "approval" | null;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
   runId: string;
@@ -544,6 +550,12 @@ export function decideQueuedRunStaleness(
         },
       };
     }
+  }
+
+  if (facts.pendingResponse) {
+    return { stale: true, errorCode: "issue_waiting_for_response",
+      reason: "Cancelled because the continuation is still waiting for an authorized response",
+      details: { issueId: facts.issueId, pendingResponse: facts.pendingResponse } };
   }
 
   if (facts.continuationParkApplies && facts.continuationParksExecutor) {

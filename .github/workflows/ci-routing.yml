@@ -1,0 +1,148 @@
+name: CI routing
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      runner:
+        value: ${{ jobs.gate.outputs.runner }}
+      full_ci:
+        value: ${{ jobs.gate.outputs.full_ci }}
+      profile_ci:
+        value: ${{ jobs.gate.outputs.profile_ci }}
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate:
+    name: Select trusted runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runner: ${{ steps.route.outputs.runner }}
+      full_ci: ${{ steps.scope.outputs.full_ci }}
+      profile_ci: ${{ steps.profile.outputs.profile_ci }}
+
+    steps:
+      - name: Select GitHub-hosted runner
+        id: route
+        # Pin the image the suites were qualified on. ubuntu-latest moved to
+        # Ubuntu 26.04, whose multicall Rust coreutils and preinstalled
+        # bubblewrap change upstream fixtures' exit codes and binary identities.
+        run: |
+          echo 'runner=ubuntu-24.04' >> "$GITHUB_OUTPUT"
+          echo '::notice title=CI routing::Using GitHub-hosted ubuntu-24.04 runner for this fork'
+      - name: Authorize CODEOWNERS CI profiling
+        id: profile
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROFILE_REQUESTED: ${{ contains(github.event.pull_request.labels.*.name, 'profile-ci') }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PROFILE_REQUESTED" != 'true' ]]; then
+            echo 'profile_ci=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Profile authorization code is read only from the trusted event base.
+          if [[ ! "$EVENT_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+             ! gh api -H 'Accept: application/vnd.github.raw+json' \
+               "/repos/$GITHUB_REPOSITORY/contents/scripts/ci-profile/authorize.mjs?ref=$EVENT_BASE_SHA" \
+               > "$RUNNER_TEMP/ci-profile-authorize.mjs"; then
+            echo 'profile_ci=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          export TRUSTED_PROFILE_SHA="$EVENT_BASE_SHA"
+          node "$RUNNER_TEMP/ci-profile-authorize.mjs"
+
+      - name: Select PR CI scope
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PROFILE_CI: ${{ steps.profile.outputs.profile_ci }}
+          STACK_JSON: ${{ toJSON(github.event.pull_request.stack) }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          full_ci='true'
+          reason='ordinary pull request'
+          # True when the PR's own diff is everything it adds to the stack's
+          # base branch: no stack, or the lowest unmerged PR in one. Above
+          # that, the diff omits lower PRs' code that this run must still test.
+          diff_covers_stack='true'
+
+          # Release notes PRs touch only releases/v*.md or releases/beta/v*.md,
+          # which no build, test, or e2e lane reads. The diff is pinned to the
+          # event's base and head SHAs, so a later push cannot change the
+          # decision for this run. Any lookup failure keeps full CI.
+          release_notes_only() {
+            [[ "${EVENT_NAME:-}" == 'pull_request' ]] || return 1
+            [[ "${EVENT_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || return 1
+            [[ "${EVENT_HEAD_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || return 1
+
+            local comparison
+            comparison="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/$GITHUB_REPOSITORY/compare/$EVENT_BASE_SHA...$EVENT_HEAD_SHA" 2>/dev/null)" \
+              || return 1
+
+            # The compare API lists at most 300 files, so a full page may be
+            # truncated. Renames count both the old and the new path.
+            jq -e '
+              (.files | type == "array") and
+              (.files | length > 0 and length < 300) and
+              all(.files[];
+                (.filename | type == "string") and
+                ([.filename, .previous_filename] | map(select(. != null)) |
+                  all(.[]; type == "string" and test("^releases/(beta/)?v[^/]+\\.md$"))))
+            ' <<< "$comparison" >/dev/null 2>&1
+          }
+
+          if jq -e 'type == "object"' <<< "$STACK_JSON" >/dev/null 2>&1; then
+            stack_position="$(jq -r '.position // empty' <<< "$STACK_JSON")"
+            stack_size="$(jq -r '.size // empty' <<< "$STACK_JSON")"
+            stack_base_ref="$(jq -r '.base.ref // empty' <<< "$STACK_JSON")"
+            if [[ -z "$stack_base_ref" || "$stack_base_ref" != "$PR_BASE_REF" ]]; then
+              diff_covers_stack='false'
+            fi
+
+            if [[ ! "$stack_position" =~ ^[1-9][0-9]*$ ]] ||
+               [[ ! "$stack_size" =~ ^[1-9][0-9]*$ ]] ||
+               (( stack_position > stack_size )) ||
+               [[ -z "$stack_base_ref" ]]; then
+              reason='malformed stack metadata; defaulting to full CI'
+              diff_covers_stack='false'
+            elif (( stack_position == stack_size )); then
+              reason='top pull request in stack'
+            elif [[ "$stack_base_ref" == "$PR_BASE_REF" ]]; then
+              reason='lowest unmerged pull request in stack'
+            else
+              full_ci='false'
+              reason='middle pull request in stack'
+            fi
+          fi
+
+          if [[ "$full_ci" == 'true' && "$diff_covers_stack" == 'true' ]] &&
+             release_notes_only; then
+            full_ci='false'
+            reason='release notes only'
+          fi
+
+          if [[ "${PROFILE_CI:-false}" == 'true' ]]; then
+            full_ci='true'
+            reason='profile-ci requests the complete PR suite'
+          fi
+
+          echo "full_ci=$full_ci" >> "$GITHUB_OUTPUT"
+          echo "::notice title=PR CI scope::$reason; full_ci=$full_ci"
+

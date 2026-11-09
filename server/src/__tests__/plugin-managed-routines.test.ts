@@ -6,10 +6,12 @@ import {
   agentConfigRevisions,
   agents,
   companies,
+  companyMemberships,
   createDb,
   documentRevisions,
   documents,
   issues,
+  agentWakeupRequests,
   pluginManagedResources,
   plugins,
   principalPermissionGrants,
@@ -113,6 +115,7 @@ describeEmbeddedPostgres("plugin-managed routines", () => {
 
   afterEach(async () => {
     await db.delete(routineRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(routineTriggers);
     await db.delete(routineDocuments);
     await db.delete(routines);
@@ -124,6 +127,7 @@ describeEmbeddedPostgres("plugin-managed routines", () => {
     await db.delete(pluginManagedResources);
     await db.delete(principalPermissionGrants);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(projects);
     await db.delete(plugins);
     await db.delete(companies);
@@ -238,10 +242,28 @@ describeEmbeddedPostgres("plugin-managed routines", () => {
 
   it("creates routine operation issues with plugin visibility and managed project scoping", async () => {
     const { companyId, services } = await seedCompanyAndPlugin();
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "operator",
+    });
     const agent = await services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" });
     const project = await services.projects.reconcileManaged({ companyId, projectKey: "operations" });
     const routine = await services.routines.managedReconcile({ companyId, routineKey: "nightly-lint" });
-    const wakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const wakeup = vi.fn(async (wakeupAgentId: string, wakeupOpts: { idempotencyKey?: string | null }) => {
+      const queuedRunId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId: wakeupAgentId,
+        source: "assignment",
+        status: "queued",
+        runId: queuedRunId,
+        idempotencyKey: wakeupOpts.idempotencyKey ?? null,
+      });
+      return { id: queuedRunId };
+    });
     const routinesSvc = routineService(db, { heartbeat: { wakeup } });
 
     const run = await routinesSvc.runRoutine(routine.routineId!, { source: "manual" }, { userId: "board-user" });

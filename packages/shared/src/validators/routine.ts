@@ -78,6 +78,10 @@ export const createRoutineSchema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
+  approvedWorkflowDocumentId: z.string().uuid().optional().nullable(),
+  approvedWorkflowRevisionId: z.string().uuid().optional().nullable(),
+  milestoneId: z.string().uuid().optional().nullable(),
+  caseId: z.string().uuid().optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
@@ -106,6 +110,11 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   variables: z.array(routineVariableSchema),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
+  approvedWorkflowDocumentId: z.string().uuid().nullable().optional().default(null),
+  approvedWorkflowRevisionId: z.string().uuid().nullable().optional().default(null),
+  milestoneId: z.string().uuid().nullable().optional().default(null),
+  milestoneRevisionId: z.string().uuid().nullable().optional().default(null),
+  caseId: z.string().uuid().nullable().optional().default(null),
 }).strict();
 
 export const routineRevisionSnapshotTriggerV1Schema = z.object({

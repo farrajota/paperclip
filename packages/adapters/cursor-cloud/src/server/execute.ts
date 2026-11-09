@@ -1,13 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  Agent,
-  type AgentOptions,
-  type ModelSelection,
-  type Run,
-  type RunResult,
-  type SDKAgent,
-  type SDKMessage,
+import type {
+  AgentOptions,
+  ModelSelection,
+  Run,
+  RunResult,
+  SDKAgent,
+  SDKMessage,
 } from "@cursor/sdk";
 import type { AdapterExecutionContext, AdapterExecutionResult, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
 import {
@@ -17,6 +16,7 @@ import {
   asString,
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
+  isForbiddenConfigEnvKey,
   joinPromptSections,
   parseObject,
   readPaperclipIssueWorkModeFromContext,
@@ -59,6 +59,7 @@ function asStringEnvMap(value: unknown): Record<string, string> {
   const parsed = parseObject(value);
   const env: Record<string, string> = {};
   for (const [key, entry] of Object.entries(parsed)) {
+    if (isForbiddenConfigEnvKey(key)) continue;
     if (typeof entry === "string") {
       env[key] = entry;
     } else if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
@@ -108,7 +109,9 @@ function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, st
   const { runId, agent, context, authToken } = ctx;
   const env: Record<string, string> = {
     ...configEnv,
-    ...buildPaperclipEnv(agent),
+    // The selected managed cloud host is trusted with this persistent identity,
+    // just like a managed local host (see doc/AGENT-IDENTITY.md).
+    ...buildPaperclipEnv(agent, ctx.agentIdentity),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
     PAPERCLIP_RUN_ID: runId,
   };
@@ -327,7 +330,7 @@ async function streamRun(run: Run, onLog: AdapterExecutionContext["onLog"]) {
 async function getAttachedRun(input: {
   apiKey: string;
   session: CursorCloudSession | null;
-}): Promise<Run | null> {
+}, Agent: typeof import("@cursor/sdk").Agent): Promise<Run | null> {
   const latestRunId = input.session?.latestRunId;
   const cursorAgentId = input.session?.cursorAgentId;
   if (!latestRunId || !cursorAgentId) return null;
@@ -497,12 +500,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let run: Run | null = null;
   let streamError: string | null = null;
   try {
+    const { Agent } = await import("@cursor/sdk");
     // This adapter has no local child process, so crossing into the first SDK
     // request is its dispatch boundary. Report it before any potentially
     // long-running remote reattach/create/send operation.
     onDispatch?.();
     const attachedRun = canReuseSession
-      ? await getAttachedRun({ apiKey, session })
+      ? await getAttachedRun({ apiKey, session }, Agent)
       : null;
 
     if (attachedRun) {

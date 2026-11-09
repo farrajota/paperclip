@@ -1,5 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
-import { S3Client } from "@aws-sdk/client-s3";
+import type { S3Client } from "@aws-sdk/client-s3";
+import { getS3Sdk } from "../lib/aws-s3-runtime.js";
 import type { DeploymentMode, SecretProviderConfigDiscoveryPreviewResult } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import type {
@@ -218,6 +219,7 @@ async function loadAwsCredentials(region: string): Promise<AwsCredentialIdentity
   const now = Date.now();
   let cached = awsCredentialProviders.get(region);
   if (!cached) {
+    const { S3Client } = getS3Sdk();
     // S3Client is only used as a carrier for the AWS SDK default credential provider chain.
     // No S3 API calls are made here; switch to defaultProvider({ region }) if we add that dependency.
     cached = {

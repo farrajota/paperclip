@@ -34,6 +34,10 @@ import type { PrpEvent } from "../protocol/replay-contract.js";
 import { completeRetainedNativeSessionCleanup, executeNativeSession } from "../native-session-runtime.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
+import type {
+  RunnerProcessHandle,
+  RunnerProcessResult,
+} from "../control-plane/durable-prp-control-plane.js";
 import * as durableControlPlane from "../control-plane/durable-prp-control-plane.js";
 
 import {
@@ -123,6 +127,7 @@ it.each([
   }) => {
     const replaySpyRestorers: Array<() => void> = [];
     const replayRetirements: ReturnType<typeof maintenanceReplaySnapshot>[] = [];
+    const replayProcessCompletions: Promise<RunnerProcessResult>[] = [];
     const withheldTerminalFrames: Array<{
       epoch: number;
       direction: "inbound" | "outbound";
@@ -130,6 +135,82 @@ it.each([
       controllerSeq: number;
       count: number;
     }> = [];
+    let terminalReplayTraceEnabled = false;
+    const terminalReplayTraceCap = 2048;
+    const terminalReplayTraceRecords: Array<Record<string, unknown>> = [];
+    const terminalReplayAliases = new Map<string, string>();
+    let terminalReplayTraceDropped = 0;
+    let terminalReplayAliasDropped = 0;
+    let terminalReplayAliasOrdinal = 0;
+    let terminalReplayAttachmentOrdinal = 0;
+    let terminalReplayLaunchOrdinal = 0;
+    let terminalReplayAuthority = {
+      requestAlias: "request-0",
+      epochAlias: "epoch-unknown",
+      launchAlias: "launch-unknown",
+    };
+    const terminalReplayTraceStartedAt = performance.now();
+    const terminalReplayAlias = (kind: string, key: string): string => {
+      const composite = `${kind}:${key}`;
+      const existing = terminalReplayAliases.get(composite);
+      if (existing) return existing;
+      if (terminalReplayAliases.size >= terminalReplayTraceCap) {
+        terminalReplayAliasDropped += 1;
+        return `${kind}-overflow`;
+      }
+      const alias = `${kind}-${++terminalReplayAliasOrdinal}`;
+      terminalReplayAliases.set(composite, alias);
+      return alias;
+    };
+    const recordTerminalReplayTrace = (
+      record: Record<string, unknown>,
+    ): void => {
+      if (!terminalReplayTraceEnabled) return;
+      if (terminalReplayTraceRecords.length >= terminalReplayTraceCap) {
+        terminalReplayTraceDropped += 1;
+        return;
+      }
+      terminalReplayTraceRecords.push({
+        atMs: performance.now() - terminalReplayTraceStartedAt,
+        ...record,
+      });
+    };
+    const terminalReplayAuthorityAlias = (value: {
+      requestId?: unknown;
+      epoch?: unknown;
+      launchId?: unknown;
+    }): typeof terminalReplayAuthority => {
+      const requestKey = typeof value.requestId === "string" ? value.requestId : "missing";
+      const epochKey = typeof value.epoch === "number" ? String(value.epoch) : "missing";
+      const launchKey = typeof value.launchId === "string" ? value.launchId : "missing";
+      return {
+        requestAlias: terminalReplayAlias("request", requestKey),
+        epochAlias: terminalReplayAlias("epoch", `${requestKey}:${epochKey}`),
+        launchAlias: terminalReplayAlias("launch", `${requestKey}:${epochKey}:${launchKey}`),
+      };
+    };
+    const terminalReplayEventTypes: Record<string, true> = {
+      "session.started": true,
+      "session.resumed": true,
+      "session.completed": true,
+      "session.failed": true,
+      "session.interrupted": true,
+      "harness.ready": true,
+      "item.started": true,
+      "item.delta": true,
+      "item.completed": true,
+      "item.failed": true,
+      provider_startup: true,
+      provider_startup_ownership: true,
+    };
+    const terminalReplayEventType = (eventType: string): string =>
+      Object.prototype.hasOwnProperty.call(terminalReplayEventTypes, eventType)
+        ? eventType
+        : "other";
+    const terminalReplayPhase = (phase: unknown): string =>
+      phase === "launch_intent" || phase === "spawned" || phase === "retired"
+        ? phase
+        : "other";
     const fixtureId = randomUUID();
     const fixtureRunner = defaultCapabilityRunnerdBinary();
     const directory = await mkdtemp(join(tmpdir(), "runnerd-maintenance-"));
@@ -273,7 +354,14 @@ it.each([
       builder.queueCommand("turn.stop", {
         reason: "interrupted original close",
       });
-      if (!missingHome) builder.queueCommand("runner.suspend", {});
+      // The outbound-ACK row must reach its injected loss after retained event
+      // commits finish. An already queued suspend starts the real two-second
+      // ACK deadline behind that commit queue and can time out without ever
+      // sending the frame this row is meant to withhold. Maintenance queues its
+      // own suspend after draining; the other rows keep the old pending command.
+      if (!missingHome && completedTerminalAck !== "completed") {
+        builder.queueCommand("runner.suspend", {});
+      }
       // Match the retained production split: runner-owned unacknowledged
       // output plus another full provider-owned prefix behind the old suspend.
       const runnerFile = join(original, "runner/runner-state.json");
@@ -349,7 +437,56 @@ it.each([
           ),
         )
         .digest("hex");
-      const appendEvent = vi.fn(async (_event: PrpEvent) => {});
+      const appendEvent = vi.fn(async (event: PrpEvent) => {
+        if (!terminalReplayTraceEnabled) {
+          if (completedTerminalAck === "completed") {
+            await new Promise((resolveCommit) => setTimeout(resolveCommit, 30));
+          }
+          return;
+        }
+        const authority = terminalReplayAuthority;
+        const eventAlias = terminalReplayTraceEnabled
+          ? terminalReplayAlias("event", `sequence-${event.sourceSeq}`)
+          : "disabled";
+        const eventType = terminalReplayEventType(event.eventType);
+        const sourceSeq = Number.isSafeInteger(event.sourceSeq)
+          ? event.sourceSeq
+          : null;
+        recordTerminalReplayTrace({
+          seam: "appendEvent",
+          phase: "callback-entry",
+          sourceSeq,
+          eventType,
+          eventAlias,
+          authority,
+        });
+        try {
+          // Reproduce slow durable commits without extending the runtime ACK
+          // deadline: all 218 retained events still have to commit exactly once.
+          if (completedTerminalAck === "completed") {
+            await new Promise((resolveCommit) => setTimeout(resolveCommit, 30));
+          }
+          recordTerminalReplayTrace({
+            seam: "appendEvent",
+            phase: "callback-body-return",
+            sourceSeq,
+            eventType,
+            eventAlias,
+            authority,
+          });
+        } catch (error) {
+          recordTerminalReplayTrace({
+            seam: "appendEvent",
+            phase: "callback-body-rejected",
+            sourceSeq,
+            eventType,
+            eventAlias,
+            authority,
+            contentFreeError: true,
+          });
+          throw error;
+        }
+      });
       const maintenanceAbort = new AbortController();
       let finalAuthorityRevoked = false;
       const authorize = vi.fn(async () => {
@@ -959,7 +1096,7 @@ it.each([
             await assertNoProviderBeforeSpawnedReceipt();
         });
       }
-      if (completedTerminalAck) {
+      if (completedTerminalAck || terminalReplay) {
         const originalAttach =
           DurablePrpControlPlane.prototype.attachWireConnection;
         const attachSpy = vi
@@ -968,12 +1105,49 @@ it.each([
             const epoch = replayRetirements.length;
             const direction =
               completedTerminalAck === "completed" ? "outbound" : "inbound";
+            const ownedStorePath = this.store.path === join(copy, files[0]!);
             const inject =
-              this.store.path === join(copy, files[0]!) &&
+              Boolean(completedTerminalAck) &&
+              ownedStorePath &&
               (epoch === 0 ||
                 (completedTerminalAck === "repeat" && epoch === 1));
+            const attachmentOrdinal = Math.min(
+              terminalReplayTraceCap,
+              ++terminalReplayAttachmentOrdinal,
+            );
+            const capturedAuthority = terminalReplayAuthority;
+            const traceable = terminalReplayTraceEnabled && ownedStorePath;
+            const attachmentAlias = `attachment-${attachmentOrdinal}`;
             let attachment: ReturnType<typeof originalAttach> | undefined;
             let withheld: (typeof withheldTerminalFrames)[number] | undefined;
+            const observe = (phase: string, candidate?: string, initialError = false) => {
+              if (!traceable) return;
+              let cursorSample: number | null = null;
+              let authenticatedSample = false;
+              let samplingError = initialError;
+              try {
+                const value = this.store.state.ackedSourceSeq;
+                cursorSample = Number.isSafeInteger(value) ? value : null;
+              } catch {
+                samplingError = true;
+              }
+              try {
+                authenticatedSample = attachment?.isAuthenticated() ?? false;
+              } catch {
+                samplingError = true;
+              }
+              recordTerminalReplayTrace({
+                seam: "wire",
+                phase,
+                attachmentAlias,
+                authority: capturedAuthority,
+                ownedStorePath,
+                direction: candidate ?? direction,
+                cursorSample,
+                authenticatedSample,
+                contentFreeError: samplingError || undefined,
+              });
+            };
             const shouldWithhold = (candidate: typeof direction): boolean => {
               if (
                 !inject ||
@@ -1032,22 +1206,72 @@ it.each([
               withheldTerminalFrames.push(withheld);
               return true;
             };
-            attachment = originalAttach.call(this, {
-              sendJson(value) {
-                if (!shouldWithhold("outbound")) wire.sendJson(value);
-              },
-              close: (code) => wire.close(code),
-              onJson: (listener) =>
-                wire.onJson((value) => {
-                  if (!shouldWithhold("inbound")) listener(value);
-                }),
-              onClose: (listener) => wire.onClose(listener),
-            });
-            return attachment;
+            if (traceable) observe("attachment-invocation");
+            try {
+              attachment = originalAttach.call(this, {
+                sendJson(value) {
+                  if (traceable) observe("sendJson-invocation", "outbound");
+                  try {
+                    if (!shouldWithhold("outbound")) wire.sendJson(value);
+                    if (traceable) observe("sendJson-return", "outbound");
+                  } catch (error) {
+                    if (traceable) observe("sendJson-threw", "outbound", true);
+                    throw error;
+                  }
+                },
+                close: (code) => {
+                  if (traceable) observe("close-invocation");
+                  try {
+                    wire.close(code);
+                    if (traceable) observe("close-return");
+                  } catch (error) {
+                    if (traceable) observe("close-threw", undefined, true);
+                    throw error;
+                  }
+                },
+                onJson: (listener) =>
+                  wire.onJson((value) => {
+                    if (traceable) observe("onJson-invocation", "inbound");
+                    try {
+                      if (!shouldWithhold("inbound")) listener(value);
+                      if (traceable) observe("onJson-return", "inbound");
+                    } catch (error) {
+                      if (traceable) observe("onJson-threw", "inbound", true);
+                      throw error;
+                    }
+                  }),
+                onClose: (listener) =>
+                  wire.onClose((reason) => {
+                    if (traceable) observe("closure-invocation");
+                    try {
+                      listener(reason);
+                      if (traceable) observe("closure-return");
+                    } catch (error) {
+                      if (traceable) observe("closure-threw", undefined, true);
+                      throw error;
+                    }
+                  }),
+              });
+              if (traceable) observe("attachment-return");
+              return attachment;
+            } catch (error) {
+              if (traceable) observe("attachment-threw", undefined, true);
+              throw error;
+            }
           });
         replaySpyRestorers.push(() => attachSpy.mockRestore());
         recordEpoch.mockImplementation(async (receipt) => {
+          if (terminalReplayTraceEnabled) {
+            const authority = terminalReplayAuthorityAlias(receipt);
+            terminalReplayAuthority = authority;
+            recordTerminalReplayTrace({
+              seam: "recordEpoch",
+              phase: terminalReplayPhase(receipt.phase),
+              authority,
+            });
+          }
           if (receipt.phase !== "retired") return;
+          if (!terminalReplayTraceEnabled && !completedTerminalAck) return;
           const snapshot = maintenanceReplaySnapshot(copy);
           expect(snapshot.fingerprint).toBe(receipt.finalFingerprint);
           replayRetirements.push(snapshot);
@@ -1253,9 +1477,80 @@ it.each([
           )
           .digest("hex");
         input.requestId = "maintenance-fixture-continuation";
+        terminalReplayAuthority = terminalReplayAuthorityAlias({
+          requestId: input.requestId,
+          epoch: 0,
+        });
         recordEpoch.mockClear();
         appendEvent.mockClear();
+        recordEpoch.mockImplementation(async (receipt) => {
+          const authority = terminalReplayAuthorityAlias(receipt);
+          terminalReplayAuthority = authority;
+          recordTerminalReplayTrace({
+            seam: "recordEpoch",
+            phase: terminalReplayPhase(receipt.phase),
+            authority,
+          });
+          if (receipt.phase === "retired")
+            replayRetirements.push(maintenanceReplaySnapshot(copy));
+        });
+        const launch = durableControlPlane.spawnRunner;
+        const launchSpy = vi
+          .spyOn(durableControlPlane, "spawnRunner")
+          .mockImplementation((options) => {
+            const authority = terminalReplayAuthority;
+            const launchCallAlias = `launch-call-${Math.min(
+              terminalReplayTraceCap,
+              ++terminalReplayLaunchOrdinal,
+            )}`;
+            recordTerminalReplayTrace({
+              seam: "spawnRunner",
+              phase: "launch-call",
+              launchCallAlias,
+              authority,
+            });
+            let handle: RunnerProcessHandle;
+            try {
+              handle = launch(options);
+            } catch (error) {
+              recordTerminalReplayTrace({
+                seam: "spawnRunner",
+                phase: "launch-threw",
+                launchCallAlias,
+                authority,
+                contentFreeError: true,
+              });
+              throw error;
+            }
+            recordTerminalReplayTrace({
+              seam: "spawnRunner",
+              phase: "launch-return",
+              launchCallAlias,
+              authority,
+            });
+            replayProcessCompletions.push(handle.completion);
+            void handle.completion.then(
+              (result) =>
+                recordTerminalReplayTrace({
+                  seam: "process-completion",
+                  phase: "completion-observed",
+                  authority,
+                  code: result.code,
+                  signal: result.signal,
+                }),
+              () =>
+                recordTerminalReplayTrace({
+                  seam: "process-completion",
+                  phase: "completion-rejected",
+                  authority,
+                  contentFreeError: true,
+                }),
+            );
+            return handle;
+          });
+        replaySpyRestorers.push(() => launchSpy.mockRestore());
       }
+      terminalReplayTraceEnabled = terminalReplay;
       const pendingProof = settleRetainedRunnerdSession(input);
       if (finalRetirementRevocation) {
         await expect(pendingProof).rejects.toThrow(
@@ -1361,6 +1656,9 @@ it.each([
               "utf8",
             ),
           );
+          const replayProcessResults = await Promise.allSettled(
+            replayProcessCompletions,
+          );
           throw new Error(
             JSON.stringify({
               runner: {
@@ -1368,6 +1666,7 @@ it.each([
                 outbox: runner.outbox.length,
                 acked: runner.ackedSourceSeq,
                 next: runner.nextSourceSeq,
+                diagnostics: runner.diagnostics,
                 terminalAckTimedOut: JSON.stringify(
                   runner.diagnostics,
                 ).includes("terminal command result acknowledgement timed out"),
@@ -1407,6 +1706,114 @@ it.each([
                   exitCode: receipt.exitCode,
                   exitSignal: receipt.exitSignal,
                 })),
+              // Only known, content-free classifications leave real stderr;
+              // never expose credentials or arbitrary provider error bodies.
+              replayProcessFailures: replayProcessResults.map((result) =>
+                result.status === "rejected"
+                  ? { completionRejected: true }
+                  : {
+                      exitCode: result.value.code,
+                      exitSignal: result.value.signal,
+                      terminalErrors: [
+                        "old authority event acknowledgement timed out",
+                        "old authority acknowledgement fence received non-ACK control",
+                        "terminal observations remain unacknowledged",
+                        "provider startup ownership remains unadmitted",
+                      ].filter((message) => result.value.stderr.includes(message)),
+                    },
+              ),
+              terminalReplayObservation: {
+                schema: "terminal-replay-observation.v1",
+                recordCap: terminalReplayTraceCap,
+                recordCount: terminalReplayTraceRecords.length,
+                droppedRecords: terminalReplayTraceDropped,
+                aliasCap: terminalReplayTraceCap,
+                droppedAliases: terminalReplayAliasDropped,
+                clock: "fixture-local monotonic milliseconds",
+                records: terminalReplayTraceRecords,
+                limits: [
+                  "callback-body-return is not enclosing commit completion",
+                  "in-memory cursor is not durable save",
+                  "opaque wire invocation is not semantic ACK or delivery",
+                  "process-completion notification is not exact OS/group exit or fence expiry",
+                  "observer overhead is nonzero",
+                ],
+                postRetirementSamples: replayRetirements.map((snapshot) => ({
+                  label: "post-retirement snapshot; not fence-time state",
+                  controllerCursor: snapshot.control.ackedSourceSeq ?? null,
+                  controllerTerminalCommand: (() => {
+                    const command = snapshot.control.commands
+                      .filter((entry: { type: string }) => entry.type === "runner.suspend")
+                      .slice(-1)[0];
+                    return command
+                      ? { status: command.status, controllerSeq: command.controllerSeq }
+                      : null;
+                  })(),
+                  controllerCleanupCommand: (() => {
+                    const command = snapshot.control.commands
+                      .filter((entry: { type: string }) => entry.type === "turn.stop")
+                      .slice(-1)[0];
+                    return command
+                      ? { status: command.status, controllerSeq: command.controllerSeq }
+                      : null;
+                  })(),
+                  runnerCursor: snapshot.runner.ackedSourceSeq ?? null,
+                  runnerNextSourceSeq: snapshot.runner.nextSourceSeq ?? null,
+                  runnerOutboxCount: snapshot.runner.outbox.length,
+                  runnerTerminal: snapshot.runner.pendingTerminalDelivery
+                    ? {
+                        commandType: snapshot.runner.pendingTerminalDelivery.commandType,
+                        lifecycle: snapshot.runner.pendingTerminalDelivery.lifecycle,
+                        controllerSeq: snapshot.runner.pendingTerminalDelivery.controllerSeq,
+                      }
+                    : null,
+                  runnerCleanup: snapshot.runner.pendingProviderCleanup
+                    ? {
+                        commandType: snapshot.runner.pendingProviderCleanup.commandType,
+                        lifecycle: snapshot.runner.pendingProviderCleanup.lifecycle,
+                        controllerSeq: snapshot.runner.pendingProviderCleanup.controllerSeq,
+                      }
+                    : null,
+                  fingerprint: snapshot.fingerprint,
+                })),
+                postFailureSample: {
+                  label: "failure-boundary state sample; not fence-time state",
+                  controllerCursor: control.ackedSourceSeq ?? null,
+                  controllerTerminalCommand: (() => {
+                    const command = control.commands
+                      .filter((entry: { type: string }) => entry.type === "runner.suspend")
+                      .slice(-1)[0];
+                    return command
+                      ? { status: command.status, controllerSeq: command.controllerSeq }
+                      : null;
+                  })(),
+                  controllerCleanupCommand: (() => {
+                    const command = control.commands
+                      .filter((entry: { type: string }) => entry.type === "turn.stop")
+                      .slice(-1)[0];
+                    return command
+                      ? { status: command.status, controllerSeq: command.controllerSeq }
+                      : null;
+                  })(),
+                  runnerCursor: runner.ackedSourceSeq ?? null,
+                  runnerNextSourceSeq: runner.nextSourceSeq ?? null,
+                  runnerOutboxCount: runner.outbox.length,
+                  runnerTerminal: runner.pendingTerminalDelivery
+                    ? {
+                        commandType: runner.pendingTerminalDelivery.commandType,
+                        lifecycle: runner.pendingTerminalDelivery.lifecycle,
+                        controllerSeq: runner.pendingTerminalDelivery.controllerSeq,
+                      }
+                    : null,
+                  runnerCleanup: runner.pendingProviderCleanup
+                    ? {
+                        commandType: runner.pendingProviderCleanup.commandType,
+                        lifecycle: runner.pendingProviderCleanup.lifecycle,
+                        controllerSeq: runner.pendingProviderCleanup.controllerSeq,
+                      }
+                    : null,
+                },
+              },
             }),
             { cause: error },
           );
@@ -1425,6 +1832,25 @@ it.each([
             files.map((file) => readFile(join(failedAttempt!.directory, file))),
           ),
         ).toEqual(failedAttempt.bytes);
+        const delivered = replayRetirements[0]!;
+        const failedRunner = JSON.parse(
+          failedAttempt.bytes[1]!.toString("utf8"),
+        );
+        expect(delivered.runner).toMatchObject({
+          lifecycle: "suspended",
+          outbox: [],
+          pendingTerminalDelivery: null,
+          pendingProviderCleanup: failedRunner.pendingTerminalDelivery,
+        });
+        expect(delivered.runner.ackedSourceSeq).toBe(
+          delivered.runner.nextSourceSeq - 1,
+        );
+        expect(delivered.provider).toEqual(
+          JSON.parse(failedAttempt.bytes[2]!.toString("utf8")),
+        );
+        expect(delivered.control.commands).toEqual(
+          JSON.parse(failedAttempt.bytes[0]!.toString("utf8")).commands,
+        );
         const finalControl = JSON.parse(
           await readFile(join(copy, files[0]!), "utf8"),
         );

@@ -44,7 +44,20 @@ These almost always get merged quickly when they're clean.
 
 PRs that follow this path are **much** more likely to be accepted, even when they're large.
 
+### CI Workflows and Dependency Lockfiles
+
+Pull-request CI uses this fork's reviewed workflows and GitHub-hosted runners. Main PR lanes keep their existing check names and run the complete matrix; do not skip a required lane to work around a failure. Dependency installs use Node 24, pnpm 9.15.4, and the checked-in `pnpm-lock.yaml` with frozen-lockfile installs.
+
+When a dependency change requires a lockfile update, use the pinned repository pnpm version and commit the generated lockfile with the manifest change. CI accepts lockfile changes only when the frozen install succeeds; it does not silently resolve a stale lockfile. The `Refresh Lockfile` workflow can generate an update for `zay/main`.
+
+The `commitperclip PR Review` workflow runs on `pull_request_target`, which executes the workflow definition from the PR's target branch. It checks out the event's trusted base SHA for metadata checks and never executes PR-controlled code with its privileged `GITHUB_TOKEN`. Its dependency review requires an authorized repository owner to enable **Settings → Advanced Security → Dependency Graph**. If that capability is unavailable, the blocking check must fail; do not replace it with a success placeholder or disable the check.
+
+Workflow edits on a PR head do not change an already-existing `pull_request_target` workflow on the target branch. Activating a new trusted review workflow therefore requires an authorized maintainer to bootstrap that workflow onto the target branch through the repository's normal reviewed process before the PR event can use it. Do not push directly to the target branch or treat a head-only workflow edit as activation. Keep the required check identities, including `ci / policy` and `commitperclip PR Review / review`, unchanged.
+
 ## PR Requirements (all PRs)
+
+- Do not submit a PR that moves a code file from less than 1,000 lines of code to more than 1,000 lines of code.
+- Do not submit a PR that includes code comments.
 
 ### Use the PR Template
 
@@ -93,6 +106,14 @@ git push -u origin <descriptive-name>
 # If your tooling already pushed the old branch, delete it from origin:
 git push origin --delete <old-name>
 ```
+
+### Keep Screenshots Out of the Repo
+
+Screenshots, screen recordings, and other review evidence belong in the PR description or a PR comment, not in the repository. Do **not** commit them (for example under `docs/pr-screenshots/`). Committed review images land on `master` permanently and make every clone bigger, even though nobody needs them after the PR merges.
+
+To show a visual change, drag the image into the PR description or a comment on GitHub, which hosts the file for you. If your tooling cannot upload to GitHub, leave the images out and describe what you checked under **Verification**.
+
+Images that are part of the product documentation itself, such as a screenshot embedded in a guide under `doc/`, are fine to commit.
 
 ### Model Used (Required)
 

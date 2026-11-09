@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type FileChooser, type Page, type Route } from "@playwright/test";
 
 import {
   fulfill,
@@ -200,10 +200,10 @@ test.describe("chat destination partial updates", () => {
       page.getByRole("switch", { name: "Enable #general" }),
     ).not.toBeChecked();
     await page.reload();
-    await expect(target).toBeChecked();
     await expect(page.getByRole("switch", { name: /^Enable / })).toHaveCount(
       501,
     );
+    await expect(target).toBeChecked();
   });
 });
 
@@ -218,6 +218,18 @@ test.describe("Board send delivery refresh", () => {
         page,
         request,
       }) => {
+        const dismissAnnouncement = page
+          .getByRole("complementary", {
+            name: "Paperclip announcements",
+            exact: true,
+          })
+          .getByRole("button", {
+            name: "Dismiss announcement",
+            exact: true,
+          });
+        await page.addLocatorHandler(dismissAnnouncement, async (dismiss) => {
+          await dismiss.click();
+        });
         const selected = await seedCompanyAndAgent(request);
         const target = await seedCompanyAndAgent(request);
         const issue = await json<{ id: string; identifier: string }>(
@@ -278,11 +290,23 @@ test.describe("Board send delivery refresh", () => {
         if (!classic) {
           await page.getByRole("button", { name: "Add to composer" }).click();
         }
-        const chooserPromise = page.waitForEvent("filechooser");
-        await (classic
+        const uploadControl = classic
           ? page.getByRole("button", { name: "Upload attachment", exact: true })
-          : page.getByRole("menuitem", { name: "Files and images", exact: true })
-        ).click();
+          : page.getByRole("menuitem", { name: "Files and images", exact: true });
+        await page.removeLocatorHandler(dismissAnnouncement);
+        let chooser: FileChooser;
+        try {
+          const chooserPromise = page.waitForEvent("filechooser");
+          const [, selectedChooser] = await Promise.all([
+            uploadControl.click(),
+            chooserPromise,
+          ]);
+          chooser = selectedChooser;
+        } finally {
+          await page.addLocatorHandler(dismissAnnouncement, async (dismiss) => {
+            await dismiss.click();
+          });
+        }
         const responsePromise = page.waitForResponse(
           (response) =>
             response.request().method() === "POST" &&
@@ -290,7 +314,7 @@ test.describe("Board send delivery refresh", () => {
               new URL(response.url()).pathname,
             ),
         );
-        await (await chooserPromise).setFiles(file);
+        await chooser.setFiles(file);
         const response = await responsePromise;
         expect.soft(response.status(), await response.text()).toBe(201);
         expect
@@ -566,7 +590,7 @@ test.describe("Board send delivery refresh", () => {
     const endpointId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const conversationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     await page.route("**/api/instance/settings/experimental", (route) =>
-      fulfill(route, { enableChatConnectors: true }),
+      fulfill(route, { enableChatConnectors: false, enableGitHubReviewBots: true }),
     );
     await page.route(`**/api/issues/${issue.id}/chat-binding`, (route) =>
       fulfill(route, {
@@ -1042,7 +1066,7 @@ test.describe("Board send delivery refresh", () => {
       );
       await page.route(
         new RegExp(
-          `/api/issues/(${issue.id}|${issue.identifier})/comments(?:\\?|$)`,
+          `/api/issues/(${issue.id}|${issue.identifier})/(?:recent-comments|comments)(?:\\?|$)`,
         ),
         async (route) => {
           if (
@@ -1050,9 +1074,7 @@ test.describe("Board send delivery refresh", () => {
             route.request().url().includes(`/issues/${issue.identifier}/`)
           )
             canonicalCommentReadsAfterSend += 1;
-          await fulfill(
-            route,
-            sends
+          const comments = sends
               ? [
                   {
                     id: publicationId,
@@ -1066,8 +1088,10 @@ test.describe("Board send delivery refresh", () => {
                     updatedAt: new Date().toISOString(),
                   },
                 ]
-              : [],
-          );
+              : [];
+          await fulfill(route, route.request().url().includes("/recent-comments")
+            ? { comments, latestCommentId: comments.at(-1)?.id ?? null, hasMore: false }
+            : comments);
         },
       );
       await page.route(
@@ -1285,7 +1309,7 @@ test.describe("Board send delivery refresh", () => {
   }
 });
 
-test.describe("Exact failed chat run retry", () => {
+test.describe("Failed chat task and exact run retry", () => {
   let seed: Seed;
   let issue: { id: string; identifier: string; title: string };
 
@@ -1405,7 +1429,10 @@ test.describe("Exact failed chat run retry", () => {
             });
             return;
           }
-          if (pathname === `/api/agents/${seed.agentId}/wakeup`) {
+          const retryPath = surface === "Inbox"
+            ? `/api/issues/${issue.id}/retry`
+            : `/api/agents/${seed.agentId}/wakeup`;
+          if (pathname === retryPath) {
             expect(route.request().method()).toBe("POST");
             requests.push({
               companyId: url.searchParams.get("companyId"),
@@ -1424,7 +1451,24 @@ test.describe("Exact failed chat run retry", () => {
               // The durable action exists, but no run has been admitted yet.
               await fulfill(
                 route,
-                { actionId, issueId: issue.id, runId: null, status: outcome },
+                surface === "Inbox"
+                  ? {
+                      requestId: actionId,
+                      accepted: true,
+                      stale: false,
+                      observedRunId: failedRunId,
+                      presentation: {
+                        intentId: actionId,
+                        responsibility: "system",
+                        state: outcome === "queued" ? "working" : "retry_scheduled",
+                        nextRetryAt: null,
+                        canRetry: false,
+                        userAction: null,
+                        sourceRunIds: [failedRunId],
+                        observedRunId: failedRunId,
+                      },
+                    }
+                  : { actionId, issueId: issue.id, runId: null, status: outcome },
                 202,
               );
             }
@@ -1435,24 +1479,57 @@ test.describe("Exact failed chat run retry", () => {
 
         const startPath =
           surface === "agent run"
-            ? `/${seed.prefix}/agents/${seed.agentId}/runs/${failedRunId}`
+            ? `/${seed.prefix}/agents/maya/runs/${failedRunId}`
             : `/${seed.prefix}/inbox/all`;
+        const canonicalAgentResponse =
+          surface === "agent run"
+            ? page.waitForResponse((response) => {
+                const url = new URL(response.url());
+                return (
+                  response.request().method() === "GET" &&
+                  url.pathname === "/api/agents/maya" &&
+                  url.searchParams.get("companyId") === seed.companyId
+                );
+              })
+            : null;
         await page.goto(startPath);
+        if (canonicalAgentResponse) {
+          const response = await canonicalAgentResponse;
+          expect(response.ok()).toBe(true);
+          expect(await response.json()).toMatchObject({
+            id: seed.agentId,
+            companyId: seed.companyId,
+            urlKey: "maya",
+          });
+          await expect(page).toHaveURL(
+            new RegExp(`/${seed.prefix}/agents/maya/runs/${failedRunId}$`),
+          );
+        }
         const retry = page
           .getByRole("button", { name: "Retry", exact: true })
           .filter({ visible: true });
         await expect(retry).toHaveCount(1);
         await retry.click();
         await expect.poll(() => requests.length).toBe(1);
-        expect(requests[0]).toEqual({
-          companyId: seed.companyId,
-          body: {
-            source: "on_demand",
-            triggerDetail: "manual",
-            reason: "retry_failed_run",
-            failedRunId,
-          },
-        });
+        expect(requests[0]).toEqual(surface === "Inbox"
+          ? {
+              companyId: null,
+              body: {
+                idempotencyKey: expect.stringMatching(
+                  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+                ),
+                observedRunId: failedRunId,
+              },
+            }
+          : {
+              companyId: seed.companyId,
+              body: {
+                source: "on_demand",
+                triggerDetail: "manual",
+                reason: "retry_failed_run",
+                failedRunId,
+              },
+            });
         if (outcome === "denied") {
           await expect(page.getByText(denial, { exact: true })).toBeVisible();
           if (surface !== "agent run") {

@@ -26,7 +26,7 @@ use super::{
 
 const SECURE_FRAME_SCHEMA: &str = "paperclip.runner.secure-frame.v1";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
-const WELCOME_TIMEOUT: Duration = Duration::from_secs(2);
+const WELCOME_TIMEOUT: Duration = CONNECT_TOTAL_TIMEOUT;
 const RUNTIME_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1106,8 +1106,9 @@ impl AuthenticatedTransport {
                 max_frame_bytes: config.max_frame_bytes,
             };
             // Ticket validation and lease persistence happen before the server
-            // emits welcome. Keep that work bounded without assuming a loaded
-            // control-plane event loop can always respond within 250 ms.
+            // emits welcome. Give that durable admission the connection setup
+            // budget; a two-second wait can discard a consumed ticket under
+            // controller load. The execution/reconnect deadline still wins.
             let welcome_deadline = bounded_operation_deadline(connect_deadline, WELCOME_TIMEOUT)?;
             let welcome_timeout = welcome_deadline.saturating_duration_since(Instant::now());
             if welcome_timeout.is_zero() {
@@ -1726,7 +1727,7 @@ fn hex_nibble(byte: u8) -> Result<u8, DurableRunnerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -1763,6 +1764,13 @@ mod tests {
 
     fn test_state(config: &DurableRunnerConfig) -> DurableState {
         DurableState::new(config)
+    }
+
+    fn os_normalized_read_timeout(timeout: Duration) -> Option<Duration> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        socket.set_read_timeout(Some(timeout)).unwrap();
+        socket.read_timeout().unwrap()
     }
 
     struct ServerCredential<'a> {
@@ -2359,6 +2367,115 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_welcome_waits_for_bounded_controller_admission() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = config(port);
+        config.max_runtime = Duration::from_secs(10);
+        let state = test_state(&config);
+        let server_config = config.clone();
+        let server_state = state.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            let expires = current_unix_ms().unwrap() + 60_000;
+            let mut secure = server_authenticate(
+                &mut socket,
+                &server_config,
+                &server_state,
+                ServerCredential {
+                    token: "bootstrap-secret",
+                    kind: "bootstrap",
+                    lease_id: None,
+                    expires_at_unix_ms: expires,
+                    revocation_epoch: 0,
+                },
+            );
+            // The authority has the client proof. Durable admission and lease
+            // persistence may take longer than the old two-second welcome wait.
+            thread::sleep(Duration::from_secs(3));
+            send_secure(
+                &mut socket,
+                &mut secure,
+                &server_config,
+                &welcome(
+                    &server_state,
+                    "connection_1",
+                    Some("lease-secret"),
+                    expires,
+                    0,
+                    vec![],
+                ),
+            );
+        });
+        let endpoint = RunnerTransportEndpoint::new(&config.connect_url, &config.run_id).unwrap();
+        let ticket = BootstrapTicket::new("bootstrap-secret".to_owned()).unwrap();
+        let result = AuthenticatedTransport::connect(
+            &endpoint,
+            &config,
+            &state,
+            Some(&ticket),
+            None,
+            Instant::now() + config.max_runtime,
+        );
+        server.join().unwrap();
+        let (transport, greeting) = result.unwrap().unwrap();
+        assert_eq!(greeting.lease.unwrap().expose().unwrap(), "lease-secret");
+        assert_eq!(
+            transport.socket.read_timeout().unwrap(),
+            os_normalized_read_timeout(RUNTIME_READ_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn bootstrap_welcome_retains_the_shorter_lifecycle_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = config(port);
+        let state = test_state(&config);
+        let server_config = config.clone();
+        let server_state = state.clone();
+        let (release, held) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            server_authenticate(
+                &mut socket,
+                &server_config,
+                &server_state,
+                ServerCredential {
+                    token: "bootstrap-secret",
+                    kind: "bootstrap",
+                    lease_id: None,
+                    expires_at_unix_ms: current_unix_ms().unwrap() + 60_000,
+                    revocation_epoch: 0,
+                },
+            );
+            held.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        let endpoint = RunnerTransportEndpoint::new(&config.connect_url, &config.run_id).unwrap();
+        let ticket = BootstrapTicket::new("bootstrap-secret".to_owned()).unwrap();
+        let started = Instant::now();
+        let result = AuthenticatedTransport::connect(
+            &endpoint,
+            &config,
+            &state,
+            Some(&ticket),
+            None,
+            started + Duration::from_secs(1),
+        );
+        release.send(()).unwrap();
+        server.join().unwrap();
+        let failure = match result {
+            Err(error) => error,
+            Ok(_) => panic!("welcome authenticated after the lifecycle deadline"),
+        };
+        assert!(failure.bootstrap_maybe_consumed);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(failure.error.to_string().contains("deadline elapsed"));
+    }
+
+    #[test]
     fn authenticates_bootstrap_and_receives_bound_lease() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2490,7 +2607,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             transport.socket.read_timeout().unwrap(),
-            Some(RUNTIME_READ_TIMEOUT)
+            os_normalized_read_timeout(RUNTIME_READ_TIMEOUT)
         );
         assert_eq!(welcome.connection.lease_id, "lease_1");
         assert_eq!(welcome.lease.unwrap().expose().unwrap(), "lease-secret");

@@ -626,6 +626,13 @@ const support = await getEmbeddedPostgresTestSupport();
           issuePrefix: queuedBeforeStop ? "RCHATQ" : "RCHAT",
           requireBoardApprovalForNewAgents: false,
         });
+      await db.insert(companyMemberships).values({
+        companyId: runtimeCompany,
+        principalType: "user",
+        principalId: "local-board",
+        status: "active",
+        membershipRole: "member",
+      });
       const generations: unknown[] = [];
       const app = express();
       app.use(express.json());
@@ -671,6 +678,7 @@ const support = await getEmbeddedPostgresTestSupport();
         conversationState: "waiting",
         status: "in_review",
       });
+      await db.update(issues).set({ responsibleUserId: "local-board" }).where(eq(issues.id, chat.id));
       const heartbeat = heartbeatService(db);
       const send = async (body: string) => {
         await issueService(db).addComment(

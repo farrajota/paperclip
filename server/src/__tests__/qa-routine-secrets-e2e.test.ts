@@ -345,7 +345,9 @@ describeEmbedded("PAP-9522 QA: routine secrets end-to-end", () => {
       .where(eq(companySecretBindings.targetId, routine.id));
     expect(bindings.map((b) => b.configPath).sort()).toEqual(["env.ALPHA", "env.BETA"]);
 
-    await routines.restoreRevision(routine.id, rev1Id, {});
+    await routines.restoreRevision(routine.id, rev1Id, {
+      authorizationActor: { type: "board", source: "local_implicit" },
+    });
 
     bindings = await db
       .select()
