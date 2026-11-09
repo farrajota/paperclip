@@ -2,7 +2,7 @@ import { Readable } from "node:stream";
 import type { IncomingMessage } from "node:http";
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageService } from "../storage/types.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -237,7 +237,9 @@ describe("issue attachment routes", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerRouteMocks();
-    vi.clearAllMocks();
+  });
+
+  beforeEach(async () => {
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       explanation: "Allowed by test mock",
@@ -732,7 +734,8 @@ describe("issue attachment routes", () => {
     const app = await createApp(storage);
     const res = await request(app).get("/api/attachments/attachment-1/content");
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Issue not found");
     expect(storage.getObject).not.toHaveBeenCalled();
   });
 

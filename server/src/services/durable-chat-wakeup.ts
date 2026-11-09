@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { chatActions, type Db } from "@paperclipai/db";
-import { eq, sql, type SQLWrapper } from "drizzle-orm";
+import { agentWakeupRequests, chatActions, chatDeliveries, chatEndpoints, type Db } from "@paperclipai/db";
+import { and, eq, inArray, or, sql, type SQLWrapper } from "drizzle-orm";
 import { HttpError } from "../errors.js";
 
 export interface CommittedChatResponseAuthorizationInput {
@@ -116,7 +116,7 @@ export async function authorizeFailedChatRunRetryWake(
 ): Promise<boolean> {
   const action = input.wakeupRequestId
     ? await tx
-        .select({ companyId: chatActions.companyId, kind: chatActions.kind })
+        .select({ companyId: chatActions.companyId, kind: chatActions.kind, payload: chatActions.payload })
         .from(chatActions)
         .where(eq(chatActions.id, input.wakeupRequestId))
         .limit(1)
@@ -144,7 +144,9 @@ export async function authorizeFailedChatRunRetryWake(
     !(selector as Record<string, unknown>).failedRunId ||
     (selector as Record<string, unknown>).failedRunId !==
       input.contextSnapshot.retryOfRunId ||
-    input.contextSnapshot.forceFreshSession === true ||
+    (input.contextSnapshot.forceFreshSession === true &&
+      (typeof action.payload.taskRetryIntentId !== "string" ||
+        input.contextSnapshot.taskRetryRequestId !== action.payload.taskRetryIntentId)) ||
     ["resumeFromRunId", "resumeSessionParams", "resumeSessionDisplayId"].some(
       (key) => Object.hasOwn(input.contextSnapshot, key),
     )
@@ -209,6 +211,7 @@ export interface DurableChatWakeupRequest {
   readonly idempotencyKey: string;
   readonly failedRunRetry?: { readonly failedRunId: string };
   readonly authorize: (tx: Db) => Promise<void>;
+  readonly onAdmitted?: (tx: Db, receipt: { runId: string | null }) => Promise<void>;
 }
 
 const trustedRequests = new WeakSet<object>();
@@ -286,4 +289,64 @@ export function assertDurableChatWakeupReceipt(
   ) {
     throw new Error("chat_inbound_wakeup_receipt_conflict");
   }
+}
+
+export function withDurableChatAdmission<T extends { kind: string; admitted?: boolean }>(request: DurableChatWakeupRequest | undefined,
+  admit: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<T>) {
+  return async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
+    const outcome = await admit(tx);
+    // An existing deferred receipt is not proof this transaction passed its
+    // gates. Only dispatch or an explicitly persisted wait admits the input.
+    if (request?.onAdmitted && (outcome.admitted === true || ["queued", "durable", "coalesced"].includes(outcome.kind))) {
+      const [receipt] = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, request.companyId), eq(agentWakeupRequests.id, request.id),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution", "coalesced"]),
+      ));
+      if (receipt) {
+        assertDurableChatWakeupReceipt(request, receipt);
+        await request.onAdmitted(tx as unknown as Db, { runId: receipt.runId });
+      }
+    }
+    return outcome;
+  };
+}
+
+/** Work-start policy only: ongoing tool and publication authorization must not
+ * revoke an already-started run when the operator enables mention gating. */
+export async function slackMentionAllowsRunStart(
+  db: Db,
+  run: { id: string; companyId: string; agentId: string; wakeupRequestId: string | null },
+): Promise<boolean> {
+  if (!run.wakeupRequestId) return true;
+  const inputs = await db.select({ event: chatDeliveries.normalizedEvent })
+    .from(agentWakeupRequests)
+    .innerJoin(chatActions, and(
+      eq(chatActions.id, agentWakeupRequests.id),
+      eq(chatActions.companyId, run.companyId),
+      eq(chatActions.kind, "inbound_wakeup"),
+    ))
+    .innerJoin(chatEndpoints, and(
+      eq(chatEndpoints.id, chatActions.endpointId),
+      eq(chatEndpoints.companyId, run.companyId),
+      eq(chatEndpoints.provider, "slack"),
+      eq(chatEndpoints.requireAtMention, true),
+    ))
+    .innerJoin(chatDeliveries, and(
+      eq(chatDeliveries.id, chatActions.deliveryId),
+      eq(chatDeliveries.endpointId, chatEndpoints.id),
+      eq(chatDeliveries.companyId, run.companyId),
+    ))
+    .where(and(
+      eq(agentWakeupRequests.companyId, run.companyId),
+      eq(agentWakeupRequests.agentId, run.agentId),
+      or(
+        eq(agentWakeupRequests.runId, run.id),
+        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        sql`${agentWakeupRequests.payload}->>'coalescedIntoWakeupRequestId' = ${run.wakeupRequestId}`,
+      ),
+    ));
+  return inputs.every(({ event }) =>
+    (event.conversation as { isDirectMessage?: boolean } | undefined)?.isDirectMessage === true ||
+    event.trigger === "mention" ||
+    (event.message as { mentionedBot?: boolean } | undefined)?.mentionedBot === true);
 }

@@ -1,22 +1,22 @@
-import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { agents, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 
 export function listAttentionExhaustedRuns(db: Db, companyId: string) {
-  // Recovery can revisit an exhausted run. Deduplicate its historical events
-  // before joining run data so duplicate events never multiply the wire payload.
+  // Find only the latest matching exhaustion receipt for each outer run.
   const latestExhaustion = db
-    .selectDistinctOn([heartbeatRunEvents.runId], {
-      runId: heartbeatRunEvents.runId,
+    .select({
       eventId: heartbeatRunEvents.id,
       message: heartbeatRunEvents.message,
     })
     .from(heartbeatRunEvents)
     .where(and(
       eq(heartbeatRunEvents.companyId, companyId),
+      eq(heartbeatRunEvents.runId, heartbeatRuns.id),
       eq(heartbeatRunEvents.eventType, "lifecycle"),
       sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
     ))
-    .orderBy(asc(heartbeatRunEvents.runId), desc(heartbeatRunEvents.id))
+    .orderBy(desc(heartbeatRunEvents.id))
+    .limit(1)
     .as("latest_exhaustion");
 
   return db
@@ -41,7 +41,7 @@ export function listAttentionExhaustedRuns(db: Db, companyId: string) {
     })
     .from(heartbeatRuns)
     .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-    .innerJoin(latestExhaustion, eq(latestExhaustion.runId, heartbeatRuns.id))
+    .innerJoinLateral(latestExhaustion, sql`true`)
     .where(and(
       eq(heartbeatRuns.companyId, companyId),
       eq(agents.companyId, companyId),

@@ -9,7 +9,7 @@ import {
 
 // Real local Board UI, upload storage, comment HTTP routes, and disposable DB.
 // Only the interface flag and explicit transport/upload rejection faults are mocked.
-// Tasks belong to the Board user: no agent, runner, or provider is contacted.
+// Tasks have no recipient: no agent, runner, or provider is contacted.
 type Attachment = {
   id: string;
   issueCommentId: string | null;
@@ -26,7 +26,19 @@ async function body<T>(
   return response.json() as Promise<T>;
 }
 
+function announcementDismissButton(page: Page) {
+  return page
+    .getByRole("complementary", { name: "Paperclip announcements", exact: true })
+    .getByRole("button", { name: "Dismiss announcement", exact: true });
+}
+
 async function setup(page: Page, request: APIRequestContext, classic: boolean) {
+  // Announcements can appear after navigation or reload and cover the classic
+  // composer's attachment button. Dismiss through the same UI as a Board user.
+  const dismissAnnouncement = announcementDismissButton(page);
+  await page.addLocatorHandler(dismissAnnouncement, async (dismiss) => {
+    await dismiss.click();
+  });
   const company = await body<{ id: string; issuePrefix: string }>(
     await request.post("/api/companies", {
       data: { name: `Board receipt browser ${randomUUID()}` },
@@ -37,7 +49,9 @@ async function setup(page: Page, request: APIRequestContext, classic: boolean) {
       data: {
         title: "Inspect the newly uploaded Board files",
         status: "todo",
-        assigneeUserId: "local-board",
+        // Keep attachment sends on the comment route. A task assigned to the
+        // current human now suggests an empty recipient and sends a reassignment.
+        assigneeUserId: null,
       },
     }),
   );
@@ -71,6 +85,15 @@ async function setup(page: Page, request: APIRequestContext, classic: boolean) {
     composer,
     editor,
     send,
+    dismissAnnouncement,
+    sendComment: async () => {
+      await send.click();
+      if (classic) {
+        const confirm = page.getByTestId("issue-chat-no-assignee-send-anyway");
+        await expect(confirm).toBeVisible();
+        await confirm.click();
+      }
+    },
     attachments: () =>
       request
         .get(`/api/issues/${issue.id}/attachments`)
@@ -96,11 +119,27 @@ const files = [
   },
 ];
 
-async function openAttachmentChooser(page: Page, composer: Locator) {
+async function openAttachmentChooser(
+  page: Page,
+  composer: Locator,
+  dismissAnnouncement: Locator,
+) {
+  const menuItem = page.getByRole("menuitem", {
+    name: "Files and images",
+    exact: true,
+  });
   await composer.getByRole("button", { name: "Add to composer" }).click();
+  // Keep the dismissal handler from acting inside the open attachment menu.
+  await page.removeLocatorHandler(dismissAnnouncement);
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("menuitem", { name: "Files and images", exact: true }).click();
-  return chooser;
+  try {
+    const [, selectedChooser] = await Promise.all([menuItem.click(), chooser]);
+    return selectedChooser;
+  } finally {
+    await page.addLocatorHandler(dismissAnnouncement, async (dismiss) => {
+      await dismiss.click();
+    });
+  }
 }
 
 async function upload(
@@ -108,7 +147,11 @@ async function upload(
   fixture: Awaited<ReturnType<typeof setup>>,
   file: (typeof files)[number],
 ) {
-  const chooser = await openAttachmentChooser(page, fixture.composer);
+  const chooser = await openAttachmentChooser(
+    page,
+    fixture.composer,
+    fixture.dismissAnnouncement,
+  );
   const response = page.waitForResponse(
     (res) =>
       res.request().method() === "POST" &&
@@ -176,7 +219,7 @@ for (const classic of [false, true]) {
         req.method() === "POST" &&
         new URL(req.url()).pathname.endsWith("/comments"),
     );
-    await fixture.send.click();
+    await fixture.sendComment();
     expect((await outbound).postDataJSON().attachmentIds.sort()).toEqual(
       receipts.map((row) => row.id).sort(),
     );
@@ -237,7 +280,7 @@ for (const classic of [false, true]) {
       accepted = true;
       await route.abort("connectionreset");
     });
-    await fixture.send.click();
+    await fixture.sendComment();
     await expect.poll(() => accepted).toBe(true);
     expect(await fixture.comments()).toHaveLength(1);
     expect(acceptedRequestId).toEqual(expect.any(String));
@@ -269,7 +312,7 @@ for (const classic of [false, true]) {
     await fixture.editor.fill(
       "A deliberately new comment after the original receipt settled.",
     );
-    await fixture.send.click();
+    await fixture.sendComment();
     await expect.poll(async () => (await fixture.comments()).length).toBe(2);
   });
 
@@ -291,14 +334,14 @@ for (const classic of [false, true]) {
         body: JSON.stringify({ error: "Fixture policy rejected this attempt" }),
       });
     });
-    await fixture.send.click();
+    await fixture.sendComment();
     await expect(fixture.editor).toContainText("Known rejection,");
     await expect(fixture.send).toBeEnabled();
     expect(await fixture.comments()).toHaveLength(0);
     await page.reload();
     await expect(fixture.editor).toContainText("Known rejection,");
     await expect(fixture.composer.getByRole("alert")).toHaveCount(0);
-    await fixture.send.click();
+    await fixture.sendComment();
     await expect.poll(async () => (await fixture.comments()).length).toBe(1);
     expect(
       (await fixture.attachments()).find((row) => row.id === receipt.id)
@@ -332,7 +375,7 @@ for (const classic of [false, true]) {
       await route.fulfill({ response }).catch(() => {});
     });
     try {
-      await fixture.send.click();
+      await fixture.sendComment();
       await expect.poll(() => accepted).toBe(true);
       expect(await fixture.comments()).toHaveLength(1);
       await fixture.editor.fill("A newer draft written while delivery was pending.");
@@ -347,7 +390,7 @@ for (const classic of [false, true]) {
       expect(await fixture.comments()).toHaveLength(1);
       expect(acceptedRequestId).toEqual(expect.any(String));
       expect((await fixture.comments())[0]!.clientRequestId).toBe(acceptedRequestId);
-      await fixture.send.click();
+      await fixture.sendComment();
       await expect.poll(async () => (await fixture.comments()).length).toBe(2);
       expect(attempts).toBe(2);
       expect((await fixture.comments()).map((comment) => comment.body).sort()).toEqual([
@@ -381,7 +424,11 @@ for (const classic of [false, true])
         await route.fulfill({ response });
       },
     );
-    const chooser = await openAttachmentChooser(page, fixture.composer);
+    const chooser = await openAttachmentChooser(
+      page,
+      fixture.composer,
+      fixture.dismissAnnouncement,
+    );
     await chooser.setFiles(files[1]!);
     await expect.poll(() => arrived).toBe(true);
     await expect(fixture.send).toBeDisabled();
@@ -405,7 +452,7 @@ for (const classic of [false, true])
           req.method() === "POST" &&
           new URL(req.url()).pathname.endsWith("/comments"),
       );
-      await fixture.send.click();
+      await fixture.sendComment();
       expect((await outbound).postDataJSON().attachmentIds).toBeUndefined();
       await expect.poll(async () => (await fixture.comments()).length).toBe(1);
       expect((await fixture.comments())[0]!.body).not.toContain(
@@ -432,7 +479,11 @@ test("legacy failed upload can be removed before sending the retained text", asy
         body: JSON.stringify({ error: "Fixture upload rejected" }),
       }),
   );
-  const chooser = await openAttachmentChooser(page, fixture.composer);
+  const chooser = await openAttachmentChooser(
+    page,
+    fixture.composer,
+    fixture.dismissAnnouncement,
+  );
   await chooser.setFiles(files[0]!);
   await expect(
     fixture.composer.getByText("Fixture upload rejected", { exact: true }),
@@ -443,7 +494,7 @@ test("legacy failed upload can be removed before sending the retained text", asy
   });
   await expect(remove).toBeVisible();
   await remove.click();
-  await fixture.send.click();
+  await fixture.sendComment();
   await expect.poll(async () => (await fixture.comments()).length).toBe(1);
   expect((await fixture.comments())[0]!.body).toBe(
     "Keep this text after removing the failed file.",

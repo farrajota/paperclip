@@ -9,6 +9,8 @@ export {
   readZipArchive,
 } from "@paperclipai/shared/portability-zip";
 
+import { crc32 } from "node:zlib";
+
 // STORE-only zip writer used to package a local folder in memory for the
 // chunked import transfer path. STORE keeps the writer dependency-free; the
 // transfer slices the raw archive bytes, so compression only trades CPU for
@@ -29,17 +31,6 @@ function writeUint32(target: Uint8Array, offset: number, value: number) {
   target[offset + 1] = (value >>> 8) & 0xff;
   target[offset + 2] = (value >>> 16) & 0xff;
   target[offset + 3] = (value >>> 24) & 0xff;
-}
-
-function crc32(bytes: Uint8Array) {
-  let crc = 0xffffffff;
-  for (const byte of bytes) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc & 1) === 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
-    }
-  }
-  return (crc ^ 0xffffffff) >>> 0;
 }
 
 /**

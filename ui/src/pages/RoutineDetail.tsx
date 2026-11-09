@@ -21,6 +21,7 @@ import { useToastActions } from "../context/ToastContext";
 import { useStreamlinedUiEnabled } from "../hooks/useStreamlinedUiEnabled";
 import { queryKeys } from "../lib/queryKeys";
 import { copyTextToClipboard } from "../lib/clipboard";
+import { routineOverviewCopyText } from "../lib/routine-description-copy";
 import { buildMarkdownMentionOptions } from "../lib/company-members";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { EmptyState } from "../components/EmptyState";
@@ -37,6 +38,7 @@ import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects"
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { RoutineOverview } from "../components/RoutineOverview";
+import { RoutineSectionHeading } from "../components/RoutineSectionHeading";
 import { RoutineSectionPicker, RoutineSubSidebar } from "../components/RoutineSubSidebar";
 import {
   isRoutineDetailView,
@@ -71,6 +73,7 @@ import type {
   RoutineEnvConfig,
   RoutineVariable,
 } from "@paperclipai/shared";
+import { RoutineOccurrences } from "../components/RoutineOccurrences";
 
 export function buildRoutineProjectOptions(
   projects: ReadonlyArray<{ id: string; name: string; description?: string | null; archivedAt?: Date | string | null }>,
@@ -899,9 +902,16 @@ export function RoutineDetail() {
                   : "w-full"
             }
           >
-            <h2 id="routine-section-title" className="mb-4 text-lg font-semibold">
-              {SECTION_TITLES[section]}
-            </h2>
+            <RoutineSectionHeading
+              title={SECTION_TITLES[section]}
+              copyText={section === "overview"
+                ? routineOverviewCopyText({
+                    editing: overviewEditing,
+                    draft: editDraft.description,
+                    saved: routine.description,
+                  })
+                : null}
+            />
 
             {section === "overview" && (overviewEditing ? <OverviewSection /> : <RoutineOverview />)}
             {section === "triggers" && <TriggersSection />}
@@ -909,6 +919,7 @@ export function RoutineDetail() {
             {section === "secrets" && <SecretsSection />}
             {section === "delivery" && <DeliverySection />}
             {section === "runs" && <RunsSection />}
+            {section === "runs" && <RoutineOccurrences routineId={routine.id} />}
             {section === "activity" && <ActivitySection isLoading={activityLoading} error={activityError} />}
             {section === "history" && <HistorySection />}
 

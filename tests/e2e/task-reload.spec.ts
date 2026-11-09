@@ -59,7 +59,13 @@ test("an interrupted app bundle offers a retry that restores the saved task", as
     await expect(page.getByRole("heading", { name: "Paperclip couldn’t start" })).toBeVisible();
     expect(await page.locator("#root").evaluate(root => root.childElementCount)).toBe(0);
     await page.unroute("**/assets/*.js");
+    const selectedTaskResponse = page.waitForResponse(response =>
+      response.request().method() === "GET"
+      && new URL(response.url()).pathname.endsWith(`/api/issues/${issue.identifier}`)
+      && response.ok(),
+    );
     await page.getByRole("button", { name: "Reload page" }).click();
+    await selectedTaskResponse;
     await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
     await expect(page.getByText(comment, { exact: true })).toBeVisible();
     await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();

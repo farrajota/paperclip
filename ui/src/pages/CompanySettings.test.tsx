@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
-import { createRoot } from "react-dom/client";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AGENT_ADAPTER_TYPES, getEnvironmentCapabilities } from "@paperclipai/shared";
@@ -102,18 +102,10 @@ class ResizeObserverStub {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).ResizeObserver = (globalThis as any).ResizeObserver ?? ResizeObserverStub;
 
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
-
 async function flushReact() {
   await act(async () => {
     await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
   });
 }
 
@@ -163,6 +155,8 @@ function renderCompanyEnvironments(queryClient: QueryClient, initialPath = ENVIR
 
 describe("CompanyEnvironments", () => {
   let container: HTMLDivElement;
+  let roots: Root[] = [];
+  let queryClients: QueryClient[] = [];
 
   beforeEach(() => {
     container = document.createElement("div");
@@ -186,17 +180,28 @@ describe("CompanyEnvironments", () => {
     });
   });
 
-  afterEach(() => {
-    container.remove();
-    document.body.innerHTML = "";
-    vi.clearAllMocks();
+  afterEach(async () => {
+    try {
+      await act(async () => {
+        for (const root of roots) root.unmount();
+      });
+    } finally {
+      for (const queryClient of queryClients) queryClient.clear();
+      roots = [];
+      queryClients = [];
+      container.remove();
+      document.body.innerHTML = "";
+      vi.clearAllMocks();
+    }
   });
 
   it("hides sandbox creation when no run-capable sandbox provider plugins are installed", async () => {
     const root = createRoot(container);
+    roots.push(root);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
+    queryClients.push(queryClient);
 
     await act(async () => {
       root.render(renderCompanyEnvironments(queryClient));
@@ -210,16 +215,15 @@ describe("CompanyEnvironments", () => {
     expect(container.textContent).not.toContain("Fake sandbox");
     expect(container.textContent).not.toContain("Fake is the deterministic test provider");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("omits the Local driver option and lists Sandbox before SSH", async () => {
     const root = createRoot(container);
+    roots.push(root);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
+    queryClients.push(queryClient);
     mockEnvironmentsApi.capabilities.mockResolvedValue(
       getEnvironmentCapabilities(AGENT_ADAPTER_TYPES, {
         sandboxProviders: {
@@ -262,16 +266,15 @@ describe("CompanyEnvironments", () => {
     expect(driverOptionValues).not.toContain("local");
     expect(driverOptionValues).toEqual(["sandbox", "ssh"]);
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("shows the Local driver option when editing an existing local environment", async () => {
     const root = createRoot(container);
+    roots.push(root);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
+    queryClients.push(queryClient);
     mockEnvironmentsApi.list.mockResolvedValue([
       {
         id: "env-local",
@@ -313,16 +316,15 @@ describe("CompanyEnvironments", () => {
     expect(driverOptionValues).toContain("local");
     expect(driverSelect!.value).toBe("local");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("preserves sandbox config when re-selecting the same provider while editing", async () => {
     const root = createRoot(container);
+    roots.push(root);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
+    queryClients.push(queryClient);
     mockEnvironmentsApi.list.mockResolvedValue([
       {
         id: "env-1",
@@ -394,8 +396,5 @@ describe("CompanyEnvironments", () => {
       .find((input) => (input as HTMLInputElement).value === "saved-template") as HTMLInputElement | undefined;
     expect(templateInput?.value).toBe("saved-template");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 });

@@ -3,7 +3,9 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  agentWakeupRequests,
   companies,
+  companyMemberships,
   createDb,
   documentRevisions,
   documents,
@@ -62,11 +64,13 @@ describeEmbeddedPostgres("routine run telemetry", () => {
     await db.delete(documents);
     await db.delete(documentRevisions);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -85,6 +89,13 @@ describeEmbeddedPostgres("routine run telemetry", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "operator",
     });
 
     await db.insert(agents).values({
@@ -123,6 +134,14 @@ describeEmbeddedPostgres("routine run telemetry", () => {
             triggerDetail: wakeupOpts.triggerDetail ?? null,
             status: "queued",
             contextSnapshot: { ...(wakeupOpts.contextSnapshot ?? {}), issueId },
+          });
+          await db.insert(agentWakeupRequests).values({
+            companyId,
+            agentId: wakeupAgentId,
+            source: wakeupOpts.source ?? "assignment",
+            status: "queued",
+            runId: queuedRunId,
+            idempotencyKey: wakeupOpts.idempotencyKey ?? null,
           });
           await db
             .update(issues)

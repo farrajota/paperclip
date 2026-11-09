@@ -8,6 +8,12 @@ export default defineConfig({
   resolve: {
     alias: [
       {
+        find: /^@paperclipai\/paperclip-runner\/live$/,
+        replacement: fileURLToPath(
+          new URL("../packages/paperclip-runner/src/live/index.ts", import.meta.url),
+        ),
+      },
+      {
         find: /^@paperclipai\/paperclip-runner$/,
         replacement: fileURLToPath(
           new URL("../packages/paperclip-runner/src/index.ts", import.meta.url),
@@ -42,7 +48,6 @@ export default defineConfig({
     isolate: true,
     maxConcurrency: 1,
     maxWorkers: 1,
-    minWorkers: 1,
     pool: "forks",
     // Server suites share process state and one embedded Postgres instance,
     // so tests inside a file must run one at a time. Do not set

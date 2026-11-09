@@ -1,5 +1,13 @@
 # @paperclipai/db
 
+## Unreleased
+
+### Minor Changes
+
+- Persist immutable goal outcome periods, target revisions, observation correction chains and check-ins with same-company native references and retained historical ownership. Add revisioned issue planning dates with explicit timed/all-day and timezone semantics.
+- Persist Case milestone criteria revisions, stored evidence provenance, independent reviewer/executor decisions, business events and internal follow-up receipts unique by company, milestone, accepted revision and stable action key.
+- Persist owned recurring-exception clocks, accumulated paused duration, append-only transition history and deduplicated native escalation receipts without a second scheduling or accounting ledger.
+
 ## 0.3.1
 
 ### Patch Changes

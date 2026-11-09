@@ -9,6 +9,7 @@ import type {
   RoutineTrigger,
   RoutineTriggerSecretMaterial,
 } from "@paperclipai/shared";
+import type { RoutineOccurrence, RoutineOccurrencePage } from "@paperclipai/shared/governance-occurrences";
 import { activityApi } from "./activity";
 import { api } from "./client";
 
@@ -56,6 +57,13 @@ export const routinesApi = {
       body,
     ),
   listRuns: (id: string, limit: number = 50) => api.get<RoutineRunSummary[]>(`/routines/${id}/runs?limit=${limit}`),
+  listOccurrences: (id: string, options: { limit?: number; cursor?: string } = {}) => {
+    const params = new URLSearchParams({ limit: String(options.limit ?? 50) });
+    if (options.cursor) params.set("cursor", options.cursor);
+    return api.get<RoutineOccurrencePage>(`/routines/${id}/occurrences?${params}`);
+  },
+  setOccurrenceDisposition: (id: string, occurrenceId: string, body: { disposition: "skipped" | "waived"; reason: string; ownerUserId?: string | null }) =>
+    api.post<RoutineOccurrence>(`/routines/${id}/occurrences/${occurrenceId}/disposition`, body),
   createTrigger: (id: string, data: Record<string, unknown>) =>
     api.post<RoutineTriggerResponse>(`/routines/${id}/triggers`, data),
   updateTrigger: (id: string, data: Record<string, unknown>) =>
@@ -70,12 +78,14 @@ export const routinesApi = {
     routineId: string,
     related?: { triggerIds?: string[]; runIds?: string[] },
   ) => {
+    const occurrencePage = await routinesApi.listOccurrences(routineId);
     const requests = [
       activityApi.list(companyId, { entityType: "routine", entityId: routineId }),
       ...(related?.triggerIds ?? []).map((triggerId) =>
         activityApi.list(companyId, { entityType: "routine_trigger", entityId: triggerId })),
       ...(related?.runIds ?? []).map((runId) =>
         activityApi.list(companyId, { entityType: "routine_run", entityId: runId })),
+      ...occurrencePage.items.map((occurrence) => activityApi.list(companyId, { entityType: "routine_occurrence", entityId: occurrence.id })),
     ];
     const events = (await Promise.all(requests)).flat();
     const deduped = new Map(events.map((event) => [event.id, event]));

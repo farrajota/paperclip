@@ -42,11 +42,18 @@ export type CancelStaleQueuedRunInput = {
 };
 
 export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {
+  reservationId: string;
+  recoveryLeaseOwner?: string;
+  enforceContinuationOwnership?: boolean;
+  /** Revalidate task execution gates under native issue locks before provider handoff. */
+  businessWorkAdmission?: boolean;
+  nativeRecoveryKind?: "reattach_existing_runner" | "reattach_remote_runner" | "resume_dead_runner" | "bootstrap_incomplete";
   dispatch: (markDispatchStarted: () => void) => Promise<T>;
 };
 
 export type DispatchResolvedInteractionOutcome<T> =
   | { dispatched: true; resultPromise: Promise<T> }
+  | { dispatched: false; admissionBlockReason: string }
   | { dispatched: false; cancellation: CancelStaleQueuedRunOutcome };
 
 /** Semantic database operations; persistence rows and transaction handles stay inside the adapter. */

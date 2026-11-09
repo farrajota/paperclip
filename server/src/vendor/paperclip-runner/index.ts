@@ -10,6 +10,8 @@
 type RunnerModule = typeof import("@paperclipai/paperclip-runner");
 
 export type {
+  DotHarnessDriver,
+  DotAssignment,
   PaperclipJsonValue,
   PaperclipQuestionResponse,
   PaperclipSemanticActionBinding,
@@ -26,12 +28,21 @@ export type {
   ControlPlanePort,
   HarnessRuntimeRequestKind,
   HarnessRuntimeRequestResolution,
+  LinuxProcessStartOptions,
   NativeAcpxAgent,
   NativeAcpxPermissionMode,
   NativeCodexApprovalPolicy,
   NativeExecutionInput,
   NativeExecutionInputV4,
   NativeExecutionInputV5,
+  NativeExecutionInputV6,
+  NativeExecutionInputV8,
+  NativeExecutionInputV9,
+  MuseBindingSnapshot,
+  DotBindingSnapshot,
+  ExternalProviderPort,
+  ExternalProviderOperation,
+  NativeExecutionInputV7,
   NativeCompletionSource,
   NativeCompletionSources,
   NativeInteractionResponseEnvelope,
@@ -54,6 +65,9 @@ export type {
   PrpVerificationReasonCode,
   PrpWireConnection,
   ReplayControlPlaneEventsInput,
+  RunnerExecutionDriver,
+  RunnerLaunchPreparer,
+  DurableRecoveryIdentity,
   RunnerProcessHandle,
   RunnerProcessLaunchSpec,
   StrictCompletionContractInput,
@@ -96,10 +110,25 @@ const [
   questionContracts,
   acpxProfiles,
   replayContracts,
+  linuxProcessStart,
+  openCodeRecovery,
+  runnerBinary,
+  providerMode,
+  claudeEffort,
+  generatedProfiles,
+  codexCommand,
+  installationIntegrity,
+  profileInstallation,
+  remoteProviderPack,
+  externalProvider,
+  semanticReceipts,
+  configuredEnvironmentSource,
 ] = await Promise.all([
   loadRunnerSource<
     | "inspectWarmRunTransition"
     | "DurablePrpControlPlane"
+    | "RUNNER_PRP_PROTOCOL_MIN"
+    | "RUNNER_PRP_PROTOCOL_MAX"
   >("control-plane/durable-prp-control-plane.ts"),
   loadRunnerSource<
     | "readRunnerdArtifactBinding"
@@ -110,6 +139,7 @@ const [
     | "resolveSourceCodexHome"
     | "defaultCapabilityRunnerdBinary"
     | "createRunnerdCodexTransport"
+    | "probeNativeRunnerEnvironment"
   >("live/runnerd-codex-transport.ts"),
   loadRunnerSource<
     | "nativeRestartInterruptedTurnId"
@@ -145,24 +175,56 @@ const [
   >("native-session-runtime.ts"),
   loadRunnerSource<"normalizePrpResultSignals">("protocol/result-normalization.ts"),
   loadRunnerSource<"parseCodexTurnDiff">("drivers/codex/codex-turn-diff.ts"),
-  loadRunnerSource<"parseNativeExecutionInput">("contracts/native-execution.ts"),
+  loadRunnerSource<"parseNativeExecutionInput" | "buildNativeModelEnvelope">("contracts/native-execution.ts"),
   loadRunnerSource<
     | "parsePaperclipQuestionSet"
     | "parsePaperclipQuestionResponse"
   >("contracts/question-set.ts"),
-  loadRunnerSource<"resolveQualifiedAcpxProfile">("drivers/acpx/qualified-profiles.ts"),
+  loadRunnerSource<
+    | "resolveQualifiedAcpxProfile"
+    | "QUALIFIED_ACPX_PROFILES"
+    | "QUALIFIED_ACPX_VERSION"
+  >("drivers/acpx/qualified-profiles.ts"),
   loadRunnerSource<
     | "validatePrpEvent"
     | "validatePrpStructuredRunResult"
   >("protocol/replay-contract.ts"),
+  loadRunnerSource<"readLinuxProcessStartedAt">("live/linux-process-start.ts"),
+  loadRunnerSource<
+    | "OPENCODE_ISOLATED_HOMES_DIRECTORY"
+    | "opencodeRuntimeSessionDirectoryName"
+  >("drivers/opencode/opencode-server-driver.ts"),
+  loadRunnerSource<"runnerBinaryTarget">("live/runner-binary.ts"),
+  loadRunnerSource<"isProviderMode">("contracts/provider-mode.ts"),
+  loadRunnerSource<"resolveClaudeEffort">("drivers/acpx/claude-effort.ts"),
+  loadRunnerSource<"CURSOR_DISTRIBUTION_PINS">("drivers/acpx/generated-profiles.ts"),
+  loadRunnerSource<"resolveCodexCommand" | "resolvePinnedCodexCommand">("drivers/codex/codex-command.ts"),
+  loadRunnerSource<"probeAcpxClaudeInstallation" | "probeAcpxGrokInstallation">("drivers/acpx/installation-integrity.ts"),
+  loadRunnerSource<"probeAcpxPiInstallation">("drivers/acpx/profile-installation.ts"),
+  loadRunnerSource<
+    | "PROVIDER_PACK_COMPATIBILITY"
+    | "bundledRemoteProviderPackManifestPath"
+    | "bundledRemoteRunnerBinary"
+  >("live/bundled-remote-provider-pack.ts"),
+  loadRunnerSource<"externalOperationDigest">("contracts/external-provider.ts"),
+  loadRunnerSource<"digestPaperclipSemanticContent">("semantic-tools/receipts.ts"),
+  loadRunnerSource<
+    | "CONFIGURED_ENVIRONMENT_KEYS"
+    | "GENERATED_RUNTIME_ENVIRONMENT_KEYS"
+    | "configuredEnvironmentProjection"
+    | "configuredEnvironment"
+  >("configured-environment.ts"),
   // Preserve canonical operation validation without loading unused aggregate APIs.
   import(new URL("catalog/canonical-operations.ts", sourceRootUrl).href),
 ]);
 
 export const DurablePrpControlPlane = controlPlane.DurablePrpControlPlane;
+export const RUNNER_PRP_PROTOCOL_MIN = controlPlane.RUNNER_PRP_PROTOCOL_MIN;
+export const RUNNER_PRP_PROTOCOL_MAX = controlPlane.RUNNER_PRP_PROTOCOL_MAX;
 export const runnerCodexDynamicToolsFit = runnerdTransport.runnerCodexDynamicToolsFit;
 export const inspectWarmRunTransition = controlPlane.inspectWarmRunTransition;
 export const readRunnerdArtifactBinding = runnerdTransport.readRunnerdArtifactBinding;
+export const readLinuxProcessStartedAt = linuxProcessStart.readLinuxProcessStartedAt;
 export const NativeSessionCleanupQuarantinedError =
   backendContracts.NativeSessionCleanupQuarantinedError;
 export const NativeSessionProtocolIntegrityError =
@@ -179,6 +241,10 @@ export const PAPERCLIP_EXECUTION_PROMPT_REVISION =
   runtimeContext.PAPERCLIP_EXECUTION_PROMPT_REVISION;
 export const acpxRuntimeSessionDirectoryName =
   acpxRecovery.acpxRuntimeSessionDirectoryName;
+export const OPENCODE_ISOLATED_HOMES_DIRECTORY =
+  openCodeRecovery.OPENCODE_ISOLATED_HOMES_DIRECTORY;
+export const opencodeRuntimeSessionDirectoryName =
+  openCodeRecovery.opencodeRuntimeSessionDirectoryName;
 export const canonicalNativeRuntimeContextDigest =
   runtimeContext.canonicalNativeRuntimeContextDigest;
 export const createNativeSessionBackend = backendFactory.createNativeSessionBackend;
@@ -191,6 +257,7 @@ export const createRunnerdCodexTransport: (
   runnerdTransport.createRunnerdCodexTransport;
 export const defaultCapabilityRunnerdBinary =
   runnerdTransport.defaultCapabilityRunnerdBinary;
+export const runnerBinaryTarget = runnerBinary.runnerBinaryTarget;
 export const executeNativeSession = sessionRuntime.executeNativeSession;
 export const applyNativeSessionGoalControl =
   sessionRuntime.applyNativeSessionGoalControl;
@@ -206,12 +273,20 @@ export const parseCodexTurnDiff = codexTurnDiff.parseCodexTurnDiff;
 export const parseHarnessRuntimeRequestResolution =
   harnessContracts.parseHarnessRuntimeRequestResolution;
 export const parseNativeExecutionInput = executionContracts.parseNativeExecutionInput;
+export const buildNativeModelEnvelope = executionContracts.buildNativeModelEnvelope;
+export const isProviderMode = providerMode.isProviderMode;
 export const parseNativeRuntimeContext = runtimeContext.parseNativeRuntimeContext;
 export const parsePaperclipQuestionSet = questionContracts.parsePaperclipQuestionSet;
 export const parsePaperclipQuestionResponse =
   questionContracts.parsePaperclipQuestionResponse;
 export const resolveQualifiedAcpxProfile = acpxProfiles.resolveQualifiedAcpxProfile;
+export const resolveClaudeEffort = claudeEffort.resolveClaudeEffort;
+export const QUALIFIED_ACPX_PROFILES = acpxProfiles.QUALIFIED_ACPX_PROFILES;
+export const QUALIFIED_ACPX_VERSION = acpxProfiles.QUALIFIED_ACPX_VERSION;
+export const CURSOR_DISTRIBUTION_PINS = generatedProfiles.CURSOR_DISTRIBUTION_PINS;
 export const resolveSourceCodexHome = runnerdTransport.resolveSourceCodexHome;
+export const resolveCodexCommand = codexCommand.resolveCodexCommand;
+export const resolvePinnedCodexCommand = codexCommand.resolvePinnedCodexCommand;
 export const validatePrpEvent = replayContracts.validatePrpEvent;
 export const validatePrpStructuredRunResult =
   replayContracts.validatePrpStructuredRunResult;
@@ -221,3 +296,19 @@ export const nativeRestartInterruptedTurnId = backendContracts.nativeRestartInte
 
 export const completeTerminatedRemoteNativeSessionCleanup = sessionRuntime.completeTerminatedRemoteNativeSessionCleanup;
 export const completeTerminatedLocalNativeSessionCleanup = sessionRuntime.completeTerminatedLocalNativeSessionCleanup;
+
+export const probeAcpxClaudeInstallation = installationIntegrity.probeAcpxClaudeInstallation;
+export const probeAcpxGrokInstallation = installationIntegrity.probeAcpxGrokInstallation;
+export const probeAcpxPiInstallation = profileInstallation.probeAcpxPiInstallation;
+export const PROVIDER_PACK_COMPATIBILITY = remoteProviderPack.PROVIDER_PACK_COMPATIBILITY;
+export const bundledRemoteProviderPackManifestPath = remoteProviderPack.bundledRemoteProviderPackManifestPath;
+export const bundledRemoteRunnerBinary = remoteProviderPack.bundledRemoteRunnerBinary;
+
+export const externalOperationDigest = externalProvider.externalOperationDigest;
+export const digestPaperclipSemanticContent = semanticReceipts.digestPaperclipSemanticContent;
+export const CONFIGURED_ENVIRONMENT_KEYS = configuredEnvironmentSource.CONFIGURED_ENVIRONMENT_KEYS;
+export const GENERATED_RUNTIME_ENVIRONMENT_KEYS = configuredEnvironmentSource.GENERATED_RUNTIME_ENVIRONMENT_KEYS;
+export const configuredEnvironmentProjection = configuredEnvironmentSource.configuredEnvironmentProjection;
+export const configuredEnvironment = configuredEnvironmentSource.configuredEnvironment;
+
+export const probeNativeRunnerEnvironment = runnerdTransport.probeNativeRunnerEnvironment;
