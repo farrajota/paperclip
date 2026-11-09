@@ -192,6 +192,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 
 const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const embeddedPostgresSupport = externalTestDatabaseUrl
@@ -61771,6 +61772,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
   it("orders reversed GitHub edit and delete callbacks behind their durable root", async () => {
     const fixture = await seedCompany();
+    // The drained callbacks hand the ordered conversation drain to background
+    // tasks, so these waits measure real database work. Vitest's implicit
+    // 1-second waitFor budget is the upstream budget; scale it on slower
+    // runners like the other wall-clock fixtures.
+    const backgroundWait = { timeout: scaleTestTimeout(1_000) };
     const deferred: Array<() => void | Promise<void>> = [];
     const { callbacks, endpoint, service, wakeup, webhookSecret } =
       await configuredGitHubEndpoint(fixture, {
@@ -61885,7 +61891,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(
         deliveries.every((delivery) => delivery.state === "processed"),
       ).toBe(true);
-    });
+    }, backgroundWait);
 
     const [conversation] = await db
       .select()
@@ -61913,7 +61919,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toMatchObject({ ok: true });
     expect(deferred).toHaveLength(1);
     await drainDeferred();
-    await vi.waitFor(() => expect(deferred).toHaveLength(1));
+    await vi.waitFor(() => expect(deferred).toHaveLength(1), backgroundWait);
     await drainDeferred();
     await vi.waitFor(async () => {
       await expect(
@@ -61939,7 +61945,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           state: "filtered",
         },
       ]);
-    });
+    }, backgroundWait);
     await expect(
       db
         .select({ body: issueComments.body })
