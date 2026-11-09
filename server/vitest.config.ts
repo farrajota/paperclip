@@ -2,6 +2,8 @@ import { fileURLToPath } from "node:url";
 
 import { defineConfig } from "vitest/config";
 
+import { scaleTestTimeout } from "./src/__tests__/helpers/test-timeout-factor.js";
+
 export default defineConfig({
   resolve: {
     alias: [
@@ -28,9 +30,12 @@ export default defineConfig({
     // producing flaky "Hook timed out in 10000ms" afterAll failures on CI. Give
     // the boot/teardown hooks generous headroom; 30s is far above the observed
     // worst-case teardown yet still catches a genuinely hung hook. teardownTimeout
-    // mirrors it for the same reason.
-    hookTimeout: 30000,
-    teardownTimeout: 30000,
+    // mirrors it for the same reason. Slower sandboxed runners scale these
+    // budgets with the opt-in PAPERCLIP_TEST_TIMEOUT_FACTOR: a beforeEach that
+    // re-imports src/routes/issues.ts pays the cold transform inside the hook
+    // budget, and under gVisor that alone has exceeded 30s.
+    hookTimeout: scaleTestTimeout(30000),
+    teardownTimeout: scaleTestTimeout(30000),
     // The route/authz suites import very large modules (for example
     // src/routes/issues.ts and its dependency graph). The first test in each
     // file pays the one-time transform cost inside its own timeout budget. On
@@ -39,7 +44,7 @@ export default defineConfig({
     // fire-and-forget wake leak into the next test. Give each test generous
     // headroom; 15s is far above the observed module-load cost yet still
     // catches a genuinely hung test well inside the 20 minute job limit.
-    testTimeout: 15000,
+    testTimeout: scaleTestTimeout(15000),
     isolate: true,
     maxConcurrency: 1,
     maxWorkers: 1,

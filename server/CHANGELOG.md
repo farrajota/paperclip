@@ -4,6 +4,7 @@
 
 ### Patch Changes
 - Select each failed or timed-out run's latest matching exhaustion receipt through a run-correlated lateral query, preserving tenant and lifecycle filters, compact payload fields and feed ordering; no measured speedup or CI qualification is claimed.
+- Scale the server suite's 15-second per-test and 30-second hook/teardown Vitest budgets by the same opt-in `PAPERCLIP_TEST_TIMEOUT_FACTOR`; on the gVisor runner a `beforeEach` that re-imports the issue routes spent over 30 seconds in its cold module transform. Default budgets and every assertion are unchanged, and an invalid factor refuses to load the config.
 - Scale the full streaming fixture's 180-second test budget and 120-second Git command budgets by the opt-in `PAPERCLIP_TEST_TIMEOUT_FACTOR` (1-10, default 1) for slower sandboxed CI runners; the 40,000-file workload and every assertion are unchanged, and an invalid factor fails the test instead of silently using another budget.
 - Load the native session executor at native execution, recovery, cancellation, steering and runtime-request operations instead of eager server setup, preserving canonical error identities, durable admission, warm ownership, cleanup and required recovery before readiness.
 - Keep Discord compatibility errors available to root-thread receipt validation without importing the optional Chat SDK or Teams adapter, preserving the error's identity, code and message.
