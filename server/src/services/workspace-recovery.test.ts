@@ -30,6 +30,7 @@ import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/e
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-test-database.js";
+import { scaleTestTimeout } from "../__tests__/helpers/test-timeout-factor.js";
 import { prepareNativeWorkspaceSync } from "./native-runtime/native-workspace-sync.js";
 import { nativeWorkspaceFinalizationLockKey } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -243,7 +244,9 @@ describe("automatic retained workspace recovery", () => {
       expect(JSON.stringify(reloaded.body)).toContain('"state":"complete"');
       expect(errors).not.toHaveBeenCalled();
     } finally { await coordinator.stop(); await worker.stop(); }
-  }, 30_000);
+    // Six seeded fixtures and five real recoveries take about 26 s on a
+    // 4-CPU workstation, so 30 s left almost no headroom.
+  }, scaleTestTimeout(60_000));
 
   it("reconstructs a resolved files-only preservation obligation at startup without replay", async () => {
     const f = await seed("legacy");
@@ -352,7 +355,7 @@ describe("automatic retained workspace recovery", () => {
     const preserving = recoverRetainedWorkspace(f.input);
     let requestId: string | null | undefined;
     try {
-      await expect.poll(() => f.runtime.resumeRunLease.mock.calls.length).toBe(1);
+      await expect.poll(() => f.runtime.resumeRunLease.mock.calls.length, { timeout: 20_000 }).toBe(1);
       const request = { db, companyId: f.companyId, issueId: f.issueId, actorId: "board",
         idempotencyKey: randomUUID(), observedRunId: f.runId };
       const first = await requestTaskRetry(request);
