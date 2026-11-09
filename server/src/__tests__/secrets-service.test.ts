@@ -930,7 +930,7 @@ describeEmbeddedPostgres("secretService", () => {
       displayName: "AWS production",
       config: { region: "us-east-1", namespace: "prod-use1" },
     });
-    vi.spyOn(awsSecretsManagerProvider, "createSecret").mockResolvedValue({
+    const createSecretSpy = vi.spyOn(awsSecretsManagerProvider, "createSecret").mockResolvedValue({
       material: {
         scheme: "aws_secrets_manager_v1",
         secretId: "arn:aws:secretsmanager:us-east-1:123456789012:secret:paperclip/prod-use1/company/aws-secret",
@@ -943,34 +943,64 @@ describeEmbeddedPostgres("secretService", () => {
       providerVersionRef: "aws-version-1",
     });
 
+    const originalProviderWrite = createSecretSpy.getMockImplementation()!;
+    const uncontendedEntryDurationMs = await measureUncontendedEntryDurationMs(
+      createSecretSpy,
+      originalProviderWrite,
+      () => svc.create(companyId, {
+        name: `aws-baseline-${randomUUID()}`,
+        provider: "aws_secrets_manager",
+        providerConfigId: awsVault.id,
+        value: "baseline-runtime-secret",
+      }),
+    );
+
     const events: string[] = [];
+    const cleanupEntered = deferred<void>();
+    const providerEntered = deferred<void>();
+    createSecretSpy.mockImplementationOnce(async (input) => {
+      events.push("aws-provider-enter");
+      providerEntered.resolve();
+      return originalProviderWrite(input);
+    });
     let releaseCleanup!: () => void;
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
       events.push("cleanup-enter");
+      cleanupEntered.resolve();
       await cleanupGate;
       events.push("cleanup-exit");
     });
-    // Give the cleanup a chance to acquire the lock before the AWS create
-    // starts racing for the same lock.
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const createCall = svc.create(companyId, {
-      name: `aws-secret-${randomUUID()}`,
-      provider: "aws_secrets_manager",
-      providerConfigId: awsVault.id,
-      value: "runtime-secret",
-    });
-    // The AWS create must stay queued behind the held lock, the same way a
-    // `local_encrypted` create does.
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(events).toEqual(["cleanup-enter"]);
-
-    releaseCleanup();
-    await cleanupCall;
-    const created = await createCall;
-    expect(events).toEqual(["cleanup-enter", "cleanup-exit"]);
+    let createCall: ReturnType<typeof svc.create> | undefined;
+    let outcomes: PromiseSettledResult<unknown>[] = [];
+    try {
+      // Start the AWS create only once the cleanup confirmably holds the
+      // lock; a fixed delay here fails on a slow filesystem, where taking
+      // the directory lock can outlast it.
+      await awaitEntryOrOperationFailure(cleanupEntered.promise, cleanupCall, "cleanupCall");
+      createCall = svc.create(companyId, {
+        name: `aws-secret-${randomUUID()}`,
+        provider: "aws_secrets_manager",
+        providerConfigId: awsVault.id,
+        value: "runtime-secret",
+      });
+      void createCall.catch(() => {});
+      // The AWS create must stay queued behind the held lock, the same way a
+      // `local_encrypted` create does, so its provider write must not start.
+      await waitEntryDetectionWindow(uncontendedEntryDurationMs, providerEntered.promise);
+      expect(events).toEqual(["cleanup-enter"]);
+      expect(createSecretSpy).toHaveBeenCalledTimes(ENTRY_DETECTION_BASELINE_SAMPLE_COUNT);
+    } finally {
+      releaseCleanup();
+      outcomes = await Promise.allSettled([cleanupCall, createCall]);
+    }
+    for (const outcome of outcomes) {
+      if (outcome.status === "rejected") throw outcome.reason;
+    }
+    const created = await createCall!;
+    expect(events).toEqual(["cleanup-enter", "cleanup-exit", "aws-provider-enter"]);
     expect(created.status).toBe("active");
   });
 
@@ -997,7 +1027,7 @@ describeEmbeddedPostgres("secretService", () => {
       externalRef: "arn:aws:secretsmanager:us-east-1:123456789012:secret:paperclip/prod-use1/company/aws-secret-rotate",
       providerVersionRef: "aws-version-1",
     });
-    vi.spyOn(awsSecretsManagerProvider, "createVersion").mockResolvedValue({
+    const createVersionSpy = vi.spyOn(awsSecretsManagerProvider, "createVersion").mockResolvedValue({
       material: {
         scheme: "aws_secrets_manager_v1",
         secretId: "arn:aws:secretsmanager:us-east-1:123456789012:secret:paperclip/prod-use1/company/aws-secret-rotate",
@@ -1016,25 +1046,55 @@ describeEmbeddedPostgres("secretService", () => {
       value: "runtime-secret",
     });
 
+    const baselineSecret = await svc.create(companyId, {
+      name: `aws-baseline-${randomUUID()}`,
+      provider: "aws_secrets_manager",
+      providerConfigId: awsVault.id,
+      value: "baseline-runtime-secret",
+    });
+    const originalProviderWrite = createVersionSpy.getMockImplementation()!;
+    const uncontendedEntryDurationMs = await measureUncontendedEntryDurationMs(
+      createVersionSpy,
+      originalProviderWrite,
+      () => svc.rotate(baselineSecret.id, { value: "baseline-rotated-runtime-secret" }),
+    );
+
     const events: string[] = [];
+    const cleanupEntered = deferred<void>();
+    const providerEntered = deferred<void>();
+    createVersionSpy.mockImplementationOnce(async (input) => {
+      events.push("aws-provider-enter");
+      providerEntered.resolve();
+      return originalProviderWrite(input);
+    });
     let releaseCleanup!: () => void;
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
       events.push("cleanup-enter");
+      cleanupEntered.resolve();
       await cleanupGate;
       events.push("cleanup-exit");
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const rotateCall = svc.rotate(existing.id, { value: "rotated-runtime-secret" });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(events).toEqual(["cleanup-enter"]);
-
-    releaseCleanup();
-    await cleanupCall;
-    const rotated = await rotateCall;
-    expect(events).toEqual(["cleanup-enter", "cleanup-exit"]);
+    let rotateCall: ReturnType<typeof svc.rotate> | undefined;
+    let outcomes: PromiseSettledResult<unknown>[] = [];
+    try {
+      await awaitEntryOrOperationFailure(cleanupEntered.promise, cleanupCall, "cleanupCall");
+      rotateCall = svc.rotate(existing.id, { value: "rotated-runtime-secret" });
+      void rotateCall.catch(() => {});
+      await waitEntryDetectionWindow(uncontendedEntryDurationMs, providerEntered.promise);
+      expect(events).toEqual(["cleanup-enter"]);
+      expect(createVersionSpy).toHaveBeenCalledTimes(ENTRY_DETECTION_BASELINE_SAMPLE_COUNT);
+    } finally {
+      releaseCleanup();
+      outcomes = await Promise.allSettled([cleanupCall, rotateCall]);
+    }
+    for (const outcome of outcomes) {
+      if (outcome.status === "rejected") throw outcome.reason;
+    }
+    const rotated = await rotateCall!;
+    expect(events).toEqual(["cleanup-enter", "cleanup-exit", "aws-provider-enter"]);
     expect(rotated.latestVersion).toBe(2);
   });
 
@@ -1057,10 +1117,12 @@ describeEmbeddedPostgres("secretService", () => {
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
+    const cleanupEntered = deferred<void>();
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
+      cleanupEntered.resolve();
       await cleanupGate;
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await awaitEntryOrOperationFailure(cleanupEntered.promise, cleanupCall, "cleanupCall");
 
     let updateResolved = false;
     const updateCall = svc.update(secret.id, { status: "archived" }).then((result) => {
@@ -1094,10 +1156,12 @@ describeEmbeddedPostgres("secretService", () => {
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
+    const cleanupEntered = deferred<void>();
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
+      cleanupEntered.resolve();
       await cleanupGate;
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await awaitEntryOrOperationFailure(cleanupEntered.promise, cleanupCall, "cleanupCall");
 
     let removeResolved = false;
     const removeCall = svc.remove(secret.id).then((result) => {
@@ -1147,15 +1211,17 @@ describeEmbeddedPostgres("secretService", () => {
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
+    const cleanupEntered = deferred<void>();
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
       events.push("cleanup-enter");
+      cleanupEntered.resolve();
       await cleanupGate;
       await rm(accountHomeDir, { recursive: true, force: true });
       events.push("cleanup-exit");
     });
-    // Give the cleanup a chance to acquire the lock before the adapter
-    // config normalization starts racing for the same lock.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Start the adapter config normalization only once the cleanup
+    // confirmably holds the lock.
+    await awaitEntryOrOperationFailure(cleanupEntered.promise, cleanupCall, "cleanupCall");
     const normalizeCall = svc.normalizeAdapterConfigForPersistence(
       companyId,
       { apiKey: accountHomeDir },
