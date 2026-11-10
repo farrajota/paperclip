@@ -51,6 +51,8 @@ export default defineConfig({
       concurrent: false,
       hooks: "list",
     },
-    setupFiles: ["./src/__tests__/setup-supertest.ts"],
+    // setup-test-timeout-factor scales every vi.waitFor budget by the same
+    // opt-in factor; with no factor set it changes nothing.
+    setupFiles: ["./src/__tests__/setup-supertest.ts", "./src/__tests__/setup-test-timeout-factor.ts"],
   },
 });

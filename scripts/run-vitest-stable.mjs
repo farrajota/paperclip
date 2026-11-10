@@ -170,6 +170,33 @@ function fail(message) {
   process.exit(1);
 }
 
+// The workspace projects set no testTimeout of their own, so they run at
+// Vitest's default. Vitest does not apply the root config's test options to a
+// project folder without a config file, but it applies --testTimeout from the
+// command line to every project. Slower runners that opt in through
+// PAPERCLIP_TEST_TIMEOUT_FACTOR (the rule in
+// server/src/__tests__/helpers/test-timeout-factor.ts) therefore get the same
+// proportional budget here; without the factor nothing is added.
+const testTimeoutFactorEnv = "PAPERCLIP_TEST_TIMEOUT_FACTOR";
+const vitestDefaultTestTimeoutMs = 5_000;
+
+function readTestTimeoutFactor(env) {
+  const raw = env[testTimeoutFactorEnv];
+  if (raw === undefined || raw.trim() === "") return 1;
+  const factor = Number(raw);
+  if (!Number.isFinite(factor) || factor < 1 || factor > 10) {
+    fail(`${testTimeoutFactorEnv} must be a number from 1 to 10; received ${JSON.stringify(raw)}`);
+  }
+  return factor;
+}
+
+function workspaceTimeoutArgsFor(env) {
+  const factor = readTestTimeoutFactor(env);
+  return factor === 1 ? [] : [`--testTimeout=${Math.ceil(vitestDefaultTestTimeoutMs * factor)}`];
+}
+
+const workspaceTimeoutArgs = workspaceTimeoutArgsFor(process.env);
+
 function readOptionValue(argv, index, argName) {
   const value = argv[index + 1];
   if (value === undefined) {
@@ -426,7 +453,7 @@ function runProjectGroup(projects, groupName, shardIndex = null, shardCount = nu
   for (let index = 0; index < projects.length; index += 1) {
     const project = projects[index];
     runVitest(
-      ["--project", project, ...shardArgs],
+      ["--project", project, ...shardArgs, ...workspaceTimeoutArgs],
       `${groupName} project ${project}${shardSuffix}`,
       null,
       failureRecordsOutput,
@@ -605,6 +632,13 @@ if (options.dryRun) {
               : options.group === generalWorkspacesCGroupName
                 ? generalWorkspacesCProjects
                 : null,
+        workspaceTimeoutArgs: [
+          generalWorkspacesAGroupName,
+          generalWorkspacesBGroupName,
+          generalWorkspacesCGroupName,
+        ].includes(options.group)
+          ? workspaceTimeoutArgs
+          : null,
         workspacesVitestShard:
           options.group === generalWorkspacesAGroupName &&
           options.shardCount !== null &&

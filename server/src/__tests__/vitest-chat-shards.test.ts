@@ -4,8 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+// Each child is a cold nested Vitest run, so its deadline and the test budget
+// that holds three of them scale with the runner like the Vitest timeouts do.
+const childTimeoutMs = scaleTestTimeout(45_000);
+const testTimeoutMs = scaleTestTimeout(120_000);
 
 it("runs every active nested/parameterized fixture case exactly once through the real chat shard CLI", () => {
   const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "pc-shards-")));
@@ -36,7 +41,7 @@ it("runs every active nested/parameterized fixture case exactly once through the
     const run = (index: number, count: number) => spawnSync(process.execPath, [
       path.join(repoRoot, "scripts/run-vitest-stable.mjs"), "--mode", "general", "--group", "general-chat",
       "--shard-index", String(index), "--shard-count", String(count),
-    ], { cwd: root, env: { ...process.env, CI: "true" }, encoding: "utf8", timeout: 45_000, maxBuffer: 4 * 1024 * 1024 });
+    ], { cwd: root, env: { ...process.env, CI: "true" }, encoding: "utf8", timeout: childTimeoutMs, maxBuffer: 4 * 1024 * 1024 });
     for (const index of [0, 1]) {
       const result = run(index, 2);
       expect(result.error, result.stderr).toBeUndefined();
@@ -57,4 +62,4 @@ it("runs every active nested/parameterized fixture case exactly once through the
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-}, 120_000);
+}, testTimeoutMs);

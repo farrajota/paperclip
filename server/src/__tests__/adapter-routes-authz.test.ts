@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 import type { ServerAdapterModule } from "../adapters/index.js";
 
 const mocks = vi.hoisted(() => {
@@ -300,7 +301,7 @@ describe("adapter management route authorization", () => {
     mocks.reloadExternalAdapter.mockImplementation(async (type: string) =>
       createAdapter(type),
     );
-  }, 20_000);
+  }, scaleTestTimeout(20_000));
 
   afterEach(() => {
     unregisterServerAdapter(EXTERNAL_ADAPTER_TYPE);
