@@ -230,6 +230,7 @@ import {
 import { claimNativeSessionResumptions } from "../services/native-runtime/native-finalization-reconciler.ts";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 import { recordNativeAttentionAssessment } from "../services/native-runtime/work-assessments.js";
 import { routeNativeAttention } from "../services/native-runtime/native-interaction-bridge.js";
 import * as paperclipRunner from "../vendor/paperclip-runner/index.js";
@@ -2164,7 +2165,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
               expect(mockRetainedNativeCleanup).toHaveBeenCalledTimes(1);
               expect(startupFinished).toBe(true);
             },
-            { timeout: 2_000 },
+            { timeout: scaleTestTimeout(2_000) },
           );
           expect((await startup).claims).toEqual([]);
           expect(physicalCleanupFinished).toBe(false);
@@ -2179,7 +2180,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             return result;
           });
           await vi.waitFor(() => expect(reapFinished).toBe(true), {
-            timeout: 2_000,
+            timeout: scaleTestTimeout(2_000),
           });
           expect((await reap).reaped).toBe(1);
           expect(await heartbeat.getRun(unrelated.runId)).toMatchObject({
