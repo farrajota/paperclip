@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { scaleTestTimeout } from "./test-timeout-factor.js";
+import { installScaledWaitFor, scaleTestTimeout, scaleWaitForOptions } from "./test-timeout-factor.js";
 
 describe("scaleTestTimeout", () => {
   it("keeps the upstream budget when the factor is unset", () => {
@@ -26,4 +26,64 @@ describe("scaleTestTimeout", () => {
       );
     },
   );
+});
+
+describe("scaleWaitForOptions", () => {
+  const doubled = { PAPERCLIP_TEST_TIMEOUT_FACTOR: "2" };
+
+  it("scales Vitest's 1 s default when no options are given", () => {
+    expect(scaleWaitForOptions(undefined, doubled)).toEqual({ timeout: 2_000 });
+  });
+
+  it("scales a numeric timeout", () => {
+    expect(scaleWaitForOptions(300, doubled)).toEqual({ timeout: 600 });
+  });
+
+  it("scales the default and keeps the polling interval when only the interval is given", () => {
+    expect(scaleWaitForOptions({ interval: 10 }, doubled)).toEqual({ interval: 10, timeout: 2_000 });
+  });
+
+  it("scales an explicit timeout and keeps the polling interval", () => {
+    expect(scaleWaitForOptions({ timeout: 5_000, interval: 25 }, doubled)).toEqual({
+      timeout: 10_000,
+      interval: 25,
+    });
+  });
+
+  it("keeps a zero timeout at zero", () => {
+    expect(scaleWaitForOptions({ timeout: 0 }, doubled)).toEqual({ timeout: 0 });
+  });
+});
+
+describe("installScaledWaitFor", () => {
+  function recordingTarget() {
+    const calls: unknown[] = [];
+    const waitFor = (_callback: () => unknown, options?: unknown) => {
+      calls.push(options);
+      return Promise.resolve("done");
+    };
+    return { target: { waitFor }, original: waitFor, calls };
+  }
+
+  it("leaves waitFor untouched when the factor is unset", () => {
+    const { target, original } = recordingTarget();
+    installScaledWaitFor(target, {});
+    expect(target.waitFor).toBe(original);
+  });
+
+  it("passes scaled options to the original waitFor and returns its result", async () => {
+    const { target, calls } = recordingTarget();
+    installScaledWaitFor(target, { PAPERCLIP_TEST_TIMEOUT_FACTOR: "2" });
+    await expect(target.waitFor(() => undefined)).resolves.toBe("done");
+    await target.waitFor(() => undefined, { timeout: 3_000, interval: 5 });
+    expect(calls).toEqual([{ timeout: 2_000 }, { timeout: 6_000, interval: 5 }]);
+  });
+
+  it("does not scale twice when installed twice", async () => {
+    const { target, calls } = recordingTarget();
+    installScaledWaitFor(target, { PAPERCLIP_TEST_TIMEOUT_FACTOR: "2" });
+    installScaledWaitFor(target, { PAPERCLIP_TEST_TIMEOUT_FACTOR: "2" });
+    await target.waitFor(() => undefined, 500);
+    expect(calls).toEqual([{ timeout: 1_000 }]);
+  });
 });
