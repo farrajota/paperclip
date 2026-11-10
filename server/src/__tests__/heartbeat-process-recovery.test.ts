@@ -1,4 +1,5 @@
 import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { createSystemRecovery } from "../services/system-recovery-state.js";
 import * as conversationContinuation from "../services/conversation-continuation.js";
@@ -2833,7 +2834,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
               expect(mockRetainedNativeCleanup).toHaveBeenCalledTimes(1);
               expect(startupFinished).toBe(true);
             },
-            { timeout: 2_000 },
+            // Startup and reap each run several real database round trips and
+            // a lazy executor import; 2 s failed under CPU contention on the
+            // wrapper runner and on a 1-CPU workstation container.
+            { timeout: scaleTestTimeout(10_000) },
           );
           expect((await startup).claims).toEqual([]);
           expect(physicalCleanupFinished).toBe(false);
@@ -2848,7 +2852,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             return result;
           });
           await vi.waitFor(() => expect(reapFinished).toBe(true), {
-            timeout: 2_000,
+            timeout: scaleTestTimeout(10_000),
           });
           expect((await reap).reaped).toBe(1);
           expect(await heartbeat.getRun(unrelated.runId)).toMatchObject({
