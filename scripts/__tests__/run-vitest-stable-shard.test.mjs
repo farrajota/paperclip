@@ -465,3 +465,29 @@ test("shard flags are rejected for the workspaces-c group", () => {
   const result = dryRun(["--mode", "general", "--group", "general-workspaces-c", "--shard-index", "0", "--shard-count", "3"]);
   assert.notEqual(result.status, 0, "workspaces-c must not accept shard flags");
 });
+
+// The workspace projects have no testTimeout of their own, so they run at
+// Vitest's 5 s default. Vitest does not pass root test options to project
+// folders without a config file, so the runner scales that default on the
+// command line, like the server config scales its own budgets.
+const workspaceGroups = ["general-workspaces-a", "general-workspaces-b", "general-workspaces-c"];
+
+test("workspace groups scale Vitest's default test timeout by the timeout factor", () => {
+  for (const group of workspaceGroups) {
+    const plan = dryRunJson(["--mode", "general", "--group", group], { PAPERCLIP_TEST_TIMEOUT_FACTOR: "2" });
+    assert.deepEqual(plan.workspaceTimeoutArgs, ["--testTimeout=10000"], group);
+  }
+});
+
+test("workspace groups keep Vitest's default test timeout without a timeout factor", () => {
+  for (const group of workspaceGroups) {
+    const plan = dryRunJson(["--mode", "general", "--group", group], { PAPERCLIP_TEST_TIMEOUT_FACTOR: "" });
+    assert.deepEqual(plan.workspaceTimeoutArgs, [], group);
+  }
+});
+
+test("an out-of-range timeout factor fails the runner before any Vitest run", () => {
+  const result = dryRun(["--mode", "general", "--group", "general-workspaces-b"], { PAPERCLIP_TEST_TIMEOUT_FACTOR: "0.5" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /PAPERCLIP_TEST_TIMEOUT_FACTOR must be a number from 1 to 10/);
+});

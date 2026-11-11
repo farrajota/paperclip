@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 
 /**
  * Operator-hidden Access surface floor (`instance.access` in
@@ -57,7 +58,7 @@ describe("operator-hidden access admin floor", () => {
   // cost is not charged to the first test's timeout on slow CI runners.
   beforeAll(async () => {
     app = await createApp();
-  }, 30_000);
+  }, scaleTestTimeout(30_000));
 
   afterEach(() => {
     delete process.env.PAPERCLIP_HIDDEN_SETTINGS;

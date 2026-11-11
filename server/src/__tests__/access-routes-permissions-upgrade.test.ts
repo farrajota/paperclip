@@ -3,6 +3,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { scaleTestTimeout } from "./helpers/test-timeout-factor.js";
 import {
   activityLog,
   agents,
@@ -92,7 +93,7 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
   // consume the first permission assertion's timeout budget.
   beforeAll(async () => {
     await import("../routes/access.js");
-  }, 30_000);
+  }, scaleTestTimeout(30_000));
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-access-routes-permissions-upgrade-");
