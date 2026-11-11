@@ -10136,6 +10136,88 @@ registerCurrentRoute({
   summary: "Run an issue monitor check now",
 });
 
+// Mirrors issueOneTimeScheduleSchema in routes/issues.ts, which is the
+// validator the POST handler runs; keep the two in step.
+const issueOneTimeScheduleBodySchema = z
+  .object({
+    timestamp: z.string().trim().min(1),
+    timeZone: z.string().trim().min(1),
+  })
+  .strict();
+
+// Mirrors IssueOneTimeSchedule in @paperclipai/shared, which is the shape
+// readScheduleWith returns. Timestamps are Dates in the service and ISO
+// strings on the wire.
+const issueOneTimeScheduleResponseSchema = z
+  .object({
+    id: z.string().uuid(),
+    issueId: z.string().uuid(),
+    agentId: z.string().uuid(),
+    dueAt: z.string().datetime(),
+    timeZone: z.string(),
+    status: z.enum([
+      "scheduled",
+      "queued",
+      "waiting",
+      "running",
+      "completed",
+      "failed",
+      "cancelled",
+    ]),
+    cancellationReason: z.string().nullable(),
+    wakeupRequestId: z.string().uuid().nullable(),
+    runId: z.string().uuid().nullable(),
+    runStatus: z.string().nullable(),
+    error: z.string().nullable(),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  })
+  .strict();
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/one-time-schedule",
+  tags: ["issues"],
+  summary: "Get the issue one-time run schedule",
+  responses: {
+    // The handler responds 200 with a null body when the issue has no schedule.
+    200: r.ok(issueOneTimeScheduleResponseSchema.nullable()),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/one-time-schedule",
+  tags: ["issues"],
+  summary: "Schedule a one-time run for an issue",
+  body: issueOneTimeScheduleBodySchema,
+  responses: {
+    201: r.ok(issueOneTimeScheduleResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registerCurrentRoute({
+  method: "delete",
+  path: "/api/issues/{id}/one-time-schedule/{scheduleId}",
+  tags: ["issues"],
+  summary: "Cancel an issue one-time run schedule",
+  responses: {
+    200: r.ok(issueOneTimeScheduleResponseSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
 registerCurrentRoute({
   method: "post",
   path: "/api/issues/{id}/interactions/{interactionId}/cancel",
