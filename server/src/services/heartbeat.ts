@@ -17526,12 +17526,14 @@ export function heartbeatService(
         return null;
       }
 
-      const dependencyReadiness = await issuesSvc.listDependencyReadiness(
+      // Same wake-aware readiness as the enqueue gate, so a queued
+      // child-completion wake is not cancelled for a cancelled direct child.
+      const readiness = await issuesSvc.getDependencyReadinessForWake(
         run.companyId,
-        [issueId],
+        issueId,
+        readNonEmptyString(context.wakeReason),
       );
-      const readiness = dependencyReadiness.get(issueId);
-      const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
+      const unresolvedBlockerCount = readiness.unresolvedBlockerCount;
       if (
         unresolvedBlockerCount > 0 &&
         !allowsIssueInteractionWake(
@@ -17542,7 +17544,7 @@ export function heartbeatService(
         await cancelQueuedRunForBlockedDependencies(
           run,
           issueId,
-          readiness?.unresolvedBlockerIssueIds ?? [],
+          readiness.unresolvedBlockerIssueIds,
         );
         logger.info(
           { runId: run.id, issueId, unresolvedBlockerCount },
@@ -28401,9 +28403,15 @@ export function heartbeatService(
             }
           }
 
-          const dependencyReadiness = await issuesSvc
-            .listDependencyReadiness(issue.companyId, [issue.id], tx)
-            .then((rows) => rows.get(issue.id) ?? null);
+          // The wake reason matters: a parent's child-completion wake is not
+          // suppressed by its own cancelled direct children (see
+          // getDependencyReadinessForWake).
+          const dependencyReadiness = await issuesSvc.getDependencyReadinessForWake(
+            issue.companyId,
+            issue.id,
+            readNonEmptyString(enrichedContextSnapshot.wakeReason),
+            tx,
+          );
 
           // Blocked descendants should stay idle until the final blocker resolves.
           // Human comment/mention wakes are the exception: they may run in a
