@@ -53,3 +53,11 @@ Track task progress through:
 - **Status changes** — visible in the activity log
 - **Dashboard** — shows task counts by status and highlights stale work
 - **Run history** — see each heartbeat execution on the agent detail page
+
+## Navigating Long Conversations
+
+The default task-chat reader includes a compact **Conversation navigation** rail beside the transcript on desktop and above the native composer on narrow screens. Its entries summarize the same authorized messages, saved plans, reviews, and turn summaries that the transcript can render.
+
+Hover an entry or focus its button to preview capped text without moving the conversation or dispatching work. Activate the button, or tap it on a touch screen, to use the existing native anchor and disclosure. An opened announcement is shown only after the selected target is confirmed in view; an unavailable target is not reported as opened.
+
+**Loaded** means only loaded history is indexed; **All** means the conversation history is loaded. Use the transcript's existing older-history control to load more. Previewing an entry does not fetch additional history, acknowledge content, or mark it read. The native transcript remains the source of truth; the rail does not create another history store.
