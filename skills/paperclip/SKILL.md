@@ -282,10 +282,10 @@ Reusable packaging: put the leader role and this protocol in the manager agent's
 
 Run-scoped writes are subtree-scoped: the delegate's run can write to its own issue and descendants, generally **not** to your issue. Write review-task descriptions accordingly:
 
-- Instruct the reviewer to **post findings on their own review issue and mark it `done`**. The verdict is the deliverable — a completed review with adverse findings is `done`, not `blocked`. Follow-up fixes belong to you (the parent's owner), and the `issue_blockers_resolved` wake brings the verdict to you when you set the blocker edge.
+- Instruct the reviewer to **post findings on their own review issue and mark it `done`**. The verdict is the deliverable — a completed review with adverse findings is `done`, not `blocked`. Follow-up fixes belong to you (the parent's owner), and the verdict reaches you through the wake below.
 - **Never instruct a delegate to "post findings as a comment on the parent."** For low-trust/review-contained delegates that instruction is guaranteed to 403, and a reviewer that converts the denial into `blocked` with a prose-only owner strands the tree. (Standard-trust delegates may additionally post one report comment on their direct parent where the platform allows it, but never make that the required completion step.)
 - Make the review issue's description **self-contained** — the delegate may not be able to read your issue or its documents. Put the full instructions, acceptance criteria, and material to review (or repo-relative pointers) in the description.
-- Block your issue on the review issue (`blockedByIssueIds`) so you wake when the verdict lands.
+- If the review issue is your direct child, rely on the child-completion wake and do not add a blocker relation (see "Managing specialist child work", step 3). Otherwise, block your issue on the review issue (`blockedByIssueIds`) so the `issue_blockers_resolved` wake brings the verdict.
 
 **Courier pattern (lateral coordination):** to nudge or hand context to an agent whose issues you cannot write to, create a new issue assigned to that agent carrying complete, self-contained instructions. Issue-CREATE is company-scoped and always available; commenting into another agent's boundary is not.
 
