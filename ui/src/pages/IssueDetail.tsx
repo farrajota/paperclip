@@ -215,6 +215,7 @@ import {
   hasVisibleMonitorSurface,
 } from "../components/IssueMonitorBanner";
 import { IssueScheduledRetryCard } from "../components/IssueScheduledRetryCard";
+import { IssueOneTimeScheduleCard } from "../components/IssueOneTimeScheduleCard";
 import { ExternallyConnectedTaskBanner } from "../components/chat/ExternallyConnectedTaskBanner";
 import {
   IssueProperties,
@@ -2958,6 +2959,15 @@ function IssueDetailActivityTab({
       <IssueScheduledRetryCard
         issueId={issue.id}
         scheduledRetry={issue.scheduledRetry ?? null}
+      />
+      <IssueOneTimeScheduleCard
+        issueId={issue.id}
+        canSchedule={
+          Boolean(issue.assigneeAgentId) &&
+          !issue.assigneeUserId &&
+          issue.hiddenAt === null &&
+          ["backlog", "todo", "in_progress"].includes(issue.status)
+        }
       />
       {/* Waiting-monitor state now lives in the pinned top banner (IssueMonitorBanner) — PAP-14557 decision 1. */}
     </>
@@ -7073,6 +7083,20 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               {issue.identifier ?? issue.id.slice(0, 8)}
             </span>
           </div>
+          {/* The breadcrumb toggle drives only the desktop panel, so the
+          streamlined mobile header needs its own way into Properties. */}
+          {isMobile ? (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="shrink-0"
+              onClick={() => setMobilePropsOpen(true)}
+              aria-label="Show properties"
+              title="Show properties"
+            >
+              <SlidersHorizontal className="h-4 w-4" />
+            </Button>
+          ) : null}
         </div>
       ) : null}
 

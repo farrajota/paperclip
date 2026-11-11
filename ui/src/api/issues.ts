@@ -20,6 +20,7 @@ import type {
   IssueLabel,
   IssueRecoveryAction,
   IssueRetryNowResponse,
+  IssueOneTimeSchedule,
   StalledReviewDecision,
   StalledReviewDecisionResponse,
   IssueThreadInteraction,
@@ -341,6 +342,17 @@ export const issuesApi = {
     ),
   checkMonitorNow: (id: string) =>
     api.post<{ ok: true }>(`/issues/${id}/monitor/check-now`, {}),
+  getOneTimeSchedule: (id: string) =>
+    api.get<IssueOneTimeSchedule | null>(`/issues/${id}/one-time-schedule`),
+  createOneTimeSchedule: (
+    id: string,
+    input: { timestamp: string; timeZone: string },
+  ) =>
+    api.post<IssueOneTimeSchedule>(`/issues/${id}/one-time-schedule`, input),
+  cancelOneTimeSchedule: (id: string, scheduleId: string) =>
+    api.delete<IssueOneTimeSchedule>(
+      `/issues/${id}/one-time-schedule/${scheduleId}`,
+    ),
   retryScheduledRetryNow: (id: string) =>
     api.post<IssueRetryNowResponse>(
       `/issues/${id}/scheduled-retry/retry-now`,

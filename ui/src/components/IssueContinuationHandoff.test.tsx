@@ -1,111 +1,150 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
-import type { ComponentProps } from "react";
-import { createRoot } from "react-dom/client";
-import type { IssueDocument } from "@paperclipai/shared";
-import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, type ComponentProps } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, describe, expect, it } from "vitest";
+import type { IssueDocument, IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 import { IssueContinuationHandoff } from "./IssueContinuationHandoff";
 
-vi.mock("./MarkdownBody", () => ({
-  MarkdownBody: ({ children, className }: { children: string; className?: string }) => (
-    <div className={className}>{children}</div>
-  ),
-}));
+let root: Root | null = null;
+let container: HTMLDivElement | null = null;
 
-vi.mock("@/components/ui/button", () => ({
-  Button: ({ children, onClick, type = "button", ...props }: ComponentProps<"button">) => (
-    <button type={type} onClick={onClick} {...props}>{children}</button>
-  ),
-}));
+afterEach(() => {
+  if (root) act(() => root?.unmount());
+  root = null;
+  container?.remove();
+  container = null;
+});
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+const policy: IssueExecutionPolicy = {
+  mode: "normal",
+  commentRequired: true,
+  stages: [
+    { id: "review", type: "review", approvalsNeeded: 1, participants: [{ id: "r", type: "agent", agentId: "reviewer", userId: null }] },
+    { id: "acceptance", type: "approval", approvalsNeeded: 1, participants: [{ id: "a", type: "user", userId: "approver", agentId: null }] },
+  ],
+};
+const state: IssueExecutionState = {
+  status: "changes_requested",
+  currentStageId: "review",
+  currentStageIndex: 0,
+  currentStageType: "review",
+  currentParticipant: { type: "agent", agentId: "reviewer" },
+  returnAssignee: { type: "agent", agentId: "developer" },
+  reviewRequest: null,
+  completedStageIds: [],
+  lastDecisionId: "decision-123",
+  lastDecisionOutcome: "changes_requested",
+};
+const pendingReviewState: IssueExecutionState = {
+  ...state,
+  status: "pending",
+  reviewRequest: { instructions: "Check the updated error handling" },
+  lastDecisionId: null,
+  lastDecisionOutcome: null,
+};
+const completedAcceptanceState: IssueExecutionState = {
+  ...state,
+  status: "completed",
+  currentStageId: null,
+  currentStageIndex: null,
+  currentStageType: null,
+  currentParticipant: null,
+  reviewRequest: null,
+  completedStageIds: ["review", "acceptance"],
+  lastDecisionId: "decision-final-acceptance",
+  lastDecisionOutcome: "approved",
+};
+const handoffDocument = {
+  id: "handoff-document",
+  title: "Review return brief",
+  body: "Implement the requested correction.",
+  latestRevisionNumber: 9,
+  updatedAt: new Date("2026-10-23T12:00:00.000Z"),
+} as unknown as IssueDocument;
 
-function createHandoffDocument(): IssueDocument {
-  return {
-    id: "document-handoff",
-    companyId: "company-1",
-    issueId: "issue-1",
-    key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
-    title: "Continuation Summary",
-    format: "markdown",
-    body: "# Handoff\n\nResume from the activity tab.",
-    latestRevisionId: "revision-1",
-    latestRevisionNumber: 1,
-    createdByAgentId: "agent-1",
-    createdByUserId: null,
-    updatedByAgentId: "agent-1",
-    updatedByUserId: null,
-    lockedAt: null,
-    lockedByAgentId: null,
-    lockedByUserId: null,
-    createdAt: new Date("2026-04-19T12:00:00.000Z"),
-    updatedAt: new Date("2026-04-19T12:05:00.000Z"),
-  };
+function renderHandoff(props: ComponentProps<typeof IssueContinuationHandoff>) {
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  act(() => root?.render(<IssueContinuationHandoff {...props} />));
+  return container;
 }
 
 describe("IssueContinuationHandoff", () => {
-  let container: HTMLDivElement;
+  it("renders active review instructions without calling them requested rework", () => {
+    const view = renderHandoff({ document: handoffDocument, executionPolicy: policy, executionState: pendingReviewState });
 
-  beforeEach(() => {
-    container = document.createElement("div");
-    document.body.appendChild(container);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText: vi.fn(async () => undefined) },
-    });
+    expect(view.textContent).toContain("Agent reviewer");
+    expect(view.textContent).toContain("Next stage: Approval");
+    expect(view.textContent).toContain("Review instructions: Check the updated error handling");
+    expect(view.textContent).not.toContain("Requested rework");
+    expect(view.textContent).not.toContain("Rework reason");
   });
 
-  afterEach(() => {
-    container.remove();
+  it("renders the native returned actor and durable decision while marking the unavailable reason unknown", () => {
+    const view = renderHandoff({ document: handoffDocument, executionPolicy: policy, executionState: state });
+
+    expect(view.textContent).toContain("Agent developer");
+    expect(view.textContent).toContain("Next stage: Review");
+    expect(view.textContent).toContain("Agent reviewer");
+    expect(view.textContent).toContain("Rework reason: Unknown");
+    expect(view.textContent).not.toContain("Requested rework");
+    expect(view.textContent).toContain("decision-123");
+    expect(view.textContent).toContain("Handoff document revision: 9");
+    expect(view.textContent).toContain("Reviewed work-product revision: Unknown (not recorded)");
+    expect(view.textContent).toContain("not evidence that a prior process stopped");
   });
 
-  it("renders compact metadata by default with copy access", async () => {
-    const root = createRoot(container);
-    const handoff = createHandoffDocument();
-
-    await act(async () => {
-      root.render(<IssueContinuationHandoff document={handoff} />);
+  it("explains the absence of a workflow actor during idle without claiming completion", () => {
+    const view = renderHandoff({
+      document: undefined,
+      executionPolicy: policy,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
     });
 
-    expect(container.textContent).toContain("Continuation Summary");
-    expect(container.textContent).toContain("handoff");
-    expect(container.textContent).not.toContain("Resume from the activity tab.");
-
-    const copyButton = Array.from(container.querySelectorAll("button"))
-      .find((button) => button.getAttribute("aria-label") === "Continue with an agent");
-    expect(copyButton).toBeTruthy();
-
-    await act(async () => {
-      copyButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(handoff.body);
-    expect(container.textContent).toContain("Copied");
-    expect(document.querySelector('pre[aria-label="Setup prompt"]')?.textContent).toBe(handoff.body);
-
-    await act(async () => {
-      root.unmount();
-    });
+    expect(view.textContent).toContain("Execution status: idle");
+    expect(view.textContent).toContain("Current responsible actor: None (workflow idle)");
+    expect(view.textContent).not.toContain("execution completed");
+    expect(view.textContent).toContain("Next stage: Review");
+    expect(view.textContent).toContain("Next stage audience: Agent reviewer");
+    expect(view.textContent).toContain("Return destination: Unknown");
+    expect(view.textContent).toContain("Handoff document revision: Unknown");
+    expect(view.textContent).toContain("Reviewed work-product revision: Unknown (not recorded)");
+    expect(view.textContent).toContain("Last durable decision: Unknown");
+    expect(view.textContent).toContain("an audience, not a confirmed dispatch");
   });
 
-  it("expands and anchors the handoff body when focused from a document deep link", async () => {
-    const root = createRoot(container);
-    const scrollIntoView = vi.fn();
-    Element.prototype.scrollIntoView = scrollIntoView;
+  it("shows terminal acceptance with no next stage or audience", () => {
+    const view = renderHandoff({ document: handoffDocument, executionPolicy: policy, executionState: completedAcceptanceState });
 
-    await act(async () => {
-      root.render(<IssueContinuationHandoff document={createHandoffDocument()} focusSignal={1} />);
-    });
+    expect(view.textContent).toContain("Execution status: completed");
+    expect(view.textContent).toContain("Current responsible actor: None (execution completed)");
+    expect(view.textContent).toContain("Next stage: None");
+    expect(view.textContent).toContain("Next stage audience: None");
+    expect(view.textContent).toContain("decision-final-acceptance");
+    expect(view.textContent).not.toContain("Next stage audience: Agent reviewer");
+    expect(view.textContent).not.toContain("Next stage audience: User approver");
+  });
 
-    expect(container.querySelector(`#document-${ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY}`)).toBeTruthy();
-    expect(container.textContent).toContain("Resume from the activity tab.");
-    expect(scrollIntoView).toHaveBeenCalled();
+  it("shows unknown handoff and execution facts rather than hiding or inventing them", () => {
+    const view = renderHandoff({ document: null, executionPolicy: null, executionState: null });
 
-    await act(async () => {
-      root.unmount();
-    });
+    expect(view.textContent).toContain("Execution handoff context");
+    expect(view.textContent).toContain("Handoff document: Unknown");
+    expect(view.textContent).toContain("Current responsible actor: Unknown");
+    expect(view.textContent).toContain("Reviewed work-product revision: Unknown (not recorded)");
+    expect(view.textContent).toContain("Last durable decision: Unknown");
   });
 });

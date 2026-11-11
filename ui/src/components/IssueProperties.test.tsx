@@ -8,6 +8,7 @@ import type {
   IssueExecutionPolicy,
   IssueExecutionState,
   IssueLabel,
+  IssueOneTimeSchedule,
   Project,
   WorkspaceRuntimeService,
 } from "@paperclipai/shared";
@@ -16,6 +17,8 @@ import type { Issue, IssueDocument } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getLastProjectId } from "../lib/recent-projects";
 import { IssueProperties } from "./IssueProperties";
+import { TaskSidePanel } from "./task-side-panel/TaskSidePanel";
+import { TooltipProvider } from "./ui/tooltip";
 import { queryKeys } from "../lib/queryKeys";
 
 const mockAgentsApi = vi.hoisted(() => ({
@@ -45,6 +48,9 @@ const mockIssuesApi = vi.hoisted(() => ({
   upsertWatchdog: vi.fn(),
   deleteWatchdog: vi.fn(),
   unarchiveFromInbox: vi.fn(),
+  getOneTimeSchedule: vi.fn(),
+  createOneTimeSchedule: vi.fn(),
+  cancelOneTimeSchedule: vi.fn(),
 }));
 
 const mockAuthApi = vi.hoisted(() => ({
@@ -99,6 +105,10 @@ vi.mock("../api/access", () => ({
 
 vi.mock("../api/instanceSettings", () => ({
   instanceSettingsApi: mockInstanceSettingsApi,
+}));
+
+vi.mock("../api/browser-use", () => ({
+  browserUseApi: { list: vi.fn(async () => []) },
 }));
 
 vi.mock("../context/ToastContext", () => ({
@@ -159,6 +169,7 @@ vi.mock("@/lib/router", () => ({
   }: { children: ReactNode; to: string; state?: unknown; disableIssueQuicklook?: boolean; issuePrefetch?: unknown } & ComponentProps<"a">) => <a href={to} {...props}>{children}</a>,
   useCaseHref: () => (caseId: string) => `/cases/${caseId}`,
   useLocation: () => ({ hash: "", pathname: "/", search: "", state: null, key: "test" }),
+  useNavigate: () => vi.fn(),
 }));
 
 vi.mock("@/components/ui/separator", () => ({
@@ -481,6 +492,9 @@ describe("IssueProperties", () => {
     mockIssuesApi.listDocuments.mockResolvedValue([]);
     mockIssuesApi.listWorkProducts.mockResolvedValue([]);
     mockIssuesApi.listInteractions.mockResolvedValue([]);
+    mockIssuesApi.getOneTimeSchedule.mockReset().mockResolvedValue(null);
+    mockIssuesApi.createOneTimeSchedule.mockReset();
+    mockIssuesApi.cancelOneTimeSchedule.mockReset();
     mockIssuesApi.listLabels.mockResolvedValue([]);
     mockIssuesApi.createLabel.mockResolvedValue(createLabel({
       id: "label-new",
@@ -513,6 +527,148 @@ describe("IssueProperties", () => {
 
   afterEach(() => {
     document.body.innerHTML = "";
+  });
+
+  it.each([false, true])("creates, rereads and cancels a schedule through default task Properties (mobile=%s)", async (mobile) => {
+    window.localStorage.clear();
+    mockSidebarState.isMobile = mobile;
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableClassicTaskInterface: false,
+      enableStreamlinedUi: true,
+    });
+    vi.stubGlobal("ResizeObserver", class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    const scrollIntoView = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
+    const scrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTo");
+    let lastScrollTo: { element: HTMLElement; top: number } | null = null;
+    Object.defineProperty(Element.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+      configurable: true,
+      value: vi.fn(function (this: HTMLElement, options: ScrollToOptions) {
+        const top = options.top ?? this.scrollTop;
+        this.scrollTop = top;
+        lastScrollTo = { element: this, top };
+      }),
+    });
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    const issue = createIssue({ assigneeAgentId: "agent-1" });
+    const onUpdate = vi.fn();
+    const scheduled: IssueOneTimeSchedule = {
+      id: "schedule-1",
+      issueId: issue.id,
+      agentId: "agent-1",
+      dueAt: "2026-10-26T13:00:00.000Z",
+      timeZone: "America/New_York",
+      status: "scheduled",
+      cancellationReason: null,
+      wakeupRequestId: null,
+      runId: null,
+      runStatus: null,
+      error: null,
+      createdAt: "2026-10-23T00:00:00.000Z",
+      updatedAt: "2026-10-23T00:00:00.000Z",
+    };
+    // Only API boundaries are doubled; the panel, Properties, card and query owners are real.
+    let persisted: IssueOneTimeSchedule | null = null;
+    mockIssuesApi.getOneTimeSchedule.mockImplementation(async () => persisted);
+    mockIssuesApi.createOneTimeSchedule.mockImplementation(async () => {
+      persisted = scheduled;
+      return persisted;
+    });
+    mockIssuesApi.cancelOneTimeSchedule.mockImplementation(async () => {
+      persisted = { ...scheduled, status: "cancelled", cancellationReason: "Cancelled by user" };
+      return persisted;
+    });
+    let queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const root = createRoot(container);
+    const renderReader = () => act(() => root.render(
+      <QueryClientProvider client={queryClient}>
+        <TooltipProvider>
+          <TaskSidePanel issue={issue} accountScope="schedule-reader" onUpdate={onUpdate}
+            fileTabsEnabled={false} inline mobile={mobile} streamlinedTabs />
+        </TooltipProvider>
+      </QueryClientProvider>,
+    ));
+    const scheduleCard = () => container.querySelector('[aria-label="One-time run schedule"]');
+    const button = (testId: string) => {
+      const element = scheduleCard()?.querySelector<HTMLButtonElement>(`[data-testid="${testId}"]`);
+      if (!element) throw new Error(`Missing schedule action ${testId} in default Properties`);
+      return element;
+    };
+    try {
+      await renderReader();
+      await waitForAssertion(() => {
+        expect(container.querySelector("#side-panel-tab-properties")?.textContent).toContain("Properties");
+        expect(scheduleCard()).not.toBeNull();
+        expect(button("one-time-schedule-create").disabled).toBe(false);
+      });
+      const restoredScroll = lastScrollTo as { element: HTMLElement; top: number } | null;
+      if (!restoredScroll) throw new Error("The real panel did not restore its content scroll position");
+      expect(restoredScroll.element.scrollTop).toBe(restoredScroll.top);
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      if (!setValue) throw new Error("Missing native input value setter");
+      for (const [name, value] of Object.entries({
+        dueLocalTime: "2026-10-26T09:00",
+        utcOffset: "-04:00",
+        timeZone: "America/New_York",
+      })) {
+        const input = scheduleCard()?.querySelector<HTMLInputElement>(`[name="${name}"]`);
+        if (!input) throw new Error(`Missing schedule input ${name}`);
+        await act(() => {
+          setValue.call(input, value);
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+      }
+      await act(() => button("one-time-schedule-create").click());
+      await waitForAssertion(() => {
+        expect(mockIssuesApi.createOneTimeSchedule).toHaveBeenCalledExactlyOnceWith(issue.id, {
+          timestamp: "2026-10-26T09:00-04:00", timeZone: "America/New_York",
+        });
+        expect(scheduleCard()?.textContent).toContain("Scheduled");
+        expect(queryClient.getQueryData(queryKeys.issues.oneTimeSchedule(issue.id))).toEqual(scheduled);
+      });
+      expect(onUpdate).not.toHaveBeenCalled();
+
+      // A fresh query cache must recover the persisted schedule, not just mutation-local state.
+      await act(() => root.render(null));
+      queryClient.clear();
+      queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+      mockIssuesApi.getOneTimeSchedule.mockClear();
+      await renderReader();
+      await waitForAssertion(() => {
+        expect(mockIssuesApi.getOneTimeSchedule).toHaveBeenCalledWith(issue.id);
+        expect(scheduleCard()?.textContent).toContain("Scheduled");
+        expect(scheduleCard()?.textContent).toContain("America/New_York");
+        expect(scheduleCard()?.querySelector("time")?.getAttribute("datetime")).toBe("2026-10-26T13:00:00.000Z");
+        expect(button("one-time-schedule-cancel").disabled).toBe(false);
+      });
+      await act(() => button("one-time-schedule-cancel").click());
+      await waitForAssertion(() => {
+        expect(mockIssuesApi.cancelOneTimeSchedule).toHaveBeenCalledExactlyOnceWith(issue.id, scheduled.id);
+        expect(scheduleCard()?.textContent).toContain("Cancelled by user");
+        expect(scheduleCard()?.querySelector('[data-testid="one-time-schedule-cancel"]')).toBeNull();
+        expect(button("one-time-schedule-create").disabled).toBe(false);
+        expect(queryClient.getQueryData(queryKeys.issues.oneTimeSchedule(issue.id))).toEqual(persisted);
+      });
+      expect(onUpdate).not.toHaveBeenCalled();
+    } finally {
+      await act(() => root.unmount());
+      queryClient.clear();
+      window.localStorage.clear();
+      vi.unstubAllGlobals();
+      if (scrollIntoView) Object.defineProperty(Element.prototype, "scrollIntoView", scrollIntoView);
+      else Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+      if (scrollTo) Object.defineProperty(HTMLElement.prototype, "scrollTo", scrollTo);
+      else Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
+      vi.restoreAllMocks();
+    }
   });
 
   it("marks the task-detail property typography and section rhythm", () => {

@@ -12,11 +12,8 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useQuery } from "@tanstack/react-query";
-import {
-  isArtifactReviewDocumentKey,
-  type Issue,
-  type IssueDocument,
-} from "@paperclipai/shared";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, isArtifactReviewDocumentKey } from "@paperclipai/shared";
+import type { Issue, IssueDocument } from "@paperclipai/shared";
 import {
   Globe,
   Box,
@@ -30,6 +27,9 @@ import {
   SlidersHorizontal,
   X,
 } from "lucide-react";
+import { ApiError } from "@/api/client";
+import { issuesApi } from "@/api/issues";
+import { IssueContinuationHandoff } from "@/components/IssueContinuationHandoff";
 import { fileResourcesApi } from "@/api/file-resources";
 import { IssueProperties } from "@/components/IssueProperties";
 import { PROPERTIES_PANE_HEADER_SLOT_ID } from "@/components/PropertiesPanel";
@@ -275,6 +275,19 @@ export function TaskSidePanel({
   const showRelatedTasks = showSubtasksTab && !conversationAgentId;
   const viewer = useTaskSidePanelFileRouting();
   const { data: documentsData } = useIssueDocuments(issue.id);
+  const { data: continuationHandoff } = useQuery({
+    queryKey: queryKeys.issues.document(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
+    queryFn: async () => {
+      try {
+        return await issuesApi.getDocument(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY);
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
+      }
+    },
+    enabled: Boolean(issue.id) && !issue.id.startsWith("chat:"),
+    retry: false,
+  });
   const documents = documentsData ?? EMPTY_ISSUE_DOCUMENTS;
   const { data: planDocument } = useIssuePlanDocument(issue.id);
   const restoredRef = useRef(
@@ -738,6 +751,13 @@ export function TaskSidePanel({
         onRetryExternalObjects={onRetryExternalObjects}
         onCheckMonitorNow={onCheckMonitorNow}
         checkingMonitorNow={checkingMonitorNow}
+        executionHandoffContent={(
+          <IssueContinuationHandoff
+            document={continuationHandoff}
+            executionPolicy={issue.executionPolicy}
+            executionState={issue.executionState}
+          />
+        )}
         sidePanelContentOnly
       />
     );

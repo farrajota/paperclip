@@ -124,6 +124,33 @@ The server sets `Preference-Applied: return=minimal` and returns exactly:
 
 **The PATCH response is the authoritative post-write state. A confirming GET after a 2xx PATCH is unnecessary.**
 
+## One-Time Scheduled Run
+
+Manage a single future run for an existing issue:
+
+```http
+GET /api/issues/{issueId}/one-time-schedule
+POST /api/issues/{issueId}/one-time-schedule
+DELETE /api/issues/{issueId}/one-time-schedule/{scheduleId}
+```
+
+`GET` returns the schedule object or `null`. `POST` accepts a future timestamp with an explicit UTC offset and the IANA zone used to enter that wall time:
+
+```json
+{
+  "timestamp": "2026-10-26T09:00:00-04:00",
+  "timeZone": "America/New_York"
+}
+```
+
+The server normalizes the instant to UTC and stores the submitted zone for display. The response is the persisted schedule, including its status, native wake request ID, run ID/status, and any cancellation reason or error. Scheduling does not wake or assign the issue immediately. The schedule snapshots its assigned agent; a later assignee change, hidden issue, or ineligible/terminal status invalidates the pending schedule. Creation requires a visible `backlog`, `todo`, or `in_progress` issue assigned to an agent. Board users may manage schedules; agents must be the current assignee and have `runtime:manage` permission.
+
+When due, Paperclip records a durable native wake intent and uses the ordinary scheduler for permission, pause, budget, checkout, workspace, and concurrency admission. A queued wake cannot be cancelled through this endpoint; `DELETE` cancels only before the due tick commits that intent and otherwise returns `409 Conflict`. The current execution state is derived from the persisted wake and heartbeat run records.
+
+Committed schedule changes and native due/admission results publish the ordinary `activity.logged` event with action `issue.one_time_schedule_updated`, issue entity ID, and `details.scheduleId`. This is a refresh signal, not an execution result: clients refetch the schedule projection, and native heartbeat events likewise refresh run-linked states. Admission can settle a schedule without creating a heartbeat run.
+
+The default task-chat reader exposes these operations in **Properties → One-time run** on desktop and mobile; Classic Task Interface users retain the **Activity** card. Both surfaces use this same API and query projection, with UTC-normalized visible and machine-readable timestamps alongside the entered IANA zone.
+
 ## Checkout (Claim Task)
 
 ```
