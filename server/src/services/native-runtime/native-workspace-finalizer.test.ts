@@ -23,6 +23,7 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { scaleTestTimeout } from "../../__tests__/helpers/test-timeout-factor.js";
 import { resumeNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
 
 describe("native workspace finalization recovery", () => {
@@ -350,7 +351,7 @@ describe("native workspace finalization recovery", () => {
       await started;
       const second = resumeNativeWorkspaceFinalization({ db, runId: seeded.runId });
       // A second invocation must return busy without waiting for or executing the slow I/O.
-      const outcome = await Promise.race([second, new Promise((resolve) => setTimeout(() => resolve("still-running"), 1_000))]);
+      const outcome = await Promise.race([second, new Promise((resolve) => setTimeout(() => resolve("still-running"), scaleTestTimeout(1_000)))]);
       release();
       await Promise.all([first, second]);
       expect(outcome).toBeNull();
