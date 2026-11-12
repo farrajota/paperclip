@@ -230,7 +230,11 @@ jobs:
           full_ci='true'
           reason='ordinary pull request'
 
-          if jq -e 'type == "object"' <<< "$STACK_JSON" >/dev/null 2>&1; then
+          # Fork release line: every merge into zay/stable-image is a release
+          # gate, so a stacked middle PR still runs the full suite.
+          if [[ "$PR_BASE_REF" == 'zay/stable-image' ]]; then
+            reason='zay/stable-image release gate'
+          elif jq -e 'type == "object"' <<< "$STACK_JSON" >/dev/null 2>&1; then
             stack_position="$(jq -r '.position // empty' <<< "$STACK_JSON")"
             stack_size="$(jq -r '.size // empty' <<< "$STACK_JSON")"
             stack_base_ref="$(jq -r '.base.ref // empty' <<< "$STACK_JSON")"

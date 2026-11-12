@@ -29,11 +29,16 @@ function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+    /^\s+uses: \.\/\.github\/workflows\/pr-trusted\.yml\s*$/m,
+    "pr.yml must call the fork-local PR workflow",
   );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
-  return readFileSync(trustedPrWorkflow, "utf8");
+  const workflow = readFileSync(trustedPrWorkflow, "utf8");
+  assert.doesNotMatch(
+    `${caller}\n${workflow}`,
+    /paperclipai\/paperclip\/\.github\/workflows\/[\w.-]+@master/,
+    "PR workflow routing must not depend on mutable upstream master",
+  );
+  return workflow;
 }
 
 function readWorkflowJobs(workflow) {
@@ -157,8 +162,18 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
+test("pr.yml routes to the fork-local PR workflow", () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
+});
+
+test("pr.yml fork-gate job requires the called workflow to succeed even when it fails or is skipped", () => {
+  const caller = readFileSync(prCallerWorkflow, "utf8");
+  const forkGate = readWorkflowJobs(caller).get("fork-gate");
+  assert.ok(forkGate, "pr.yml must define a fork-gate job");
+  assert.match(forkGate, /^ {4}needs: \[ci\]$/m);
+  assert.match(forkGate, /^ {4}if: \$\{\{ always\(\) \}\}$/m);
+  assert.match(forkGate, /CI_RESULT: \$\{\{ needs\.ci\.result \}\}/);
+  assert.match(forkGate, /run: test "\$CI_RESULT" = "success"/);
 });
 
 test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
@@ -284,6 +299,12 @@ test("the stacked PR scope selector runs full CI only where intended", () => {
     runStackScope({ position: "invalid", size: 11, base: { ref: "master" } }, "stack-5").full_ci,
     "true",
   );
+});
+
+test("the stacked PR scope selector treats every PR into zay/stable-image as a release gate", () => {
+  const middle = { position: 6, size: 11, base: { ref: "master" } };
+  assert.equal(runStackScope(middle, "zay/stable-image").full_ci, "true");
+  assert.equal(runStackScope(middle, "stack-5").full_ci, "false");
 });
 
 test("the trusted PR workflow passes the shard's spec filter to Playwright without a literal --", () => {
