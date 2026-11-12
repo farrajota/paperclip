@@ -3739,6 +3739,10 @@ export function recoveryService(
     const context = parseObject(run?.contextSnapshot);
     if (!run || !parseObject(context.legacyDispositionEpisode).id) return null;
     if (!["queued", "running", "scheduled_retry"].includes(run.status)) return "repair_not_active";
+    // A child-completion wake coalesced into this repair is the parent's own
+    // wake, already admitted by the dependency gates. The repair's disposition
+    // checks (for example a parent that is now blocked) must not discard it.
+    if (readNonEmptyString(context.wakeReason) === "issue_children_completed") return null;
     const episode = legacyDispositionEpisode(run);
     // Infrastructure retries retain the successful disposition source even
     // though their immediate retryOfRunId points at a failed repair attempt.

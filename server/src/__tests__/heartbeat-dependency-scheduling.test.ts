@@ -29,6 +29,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { legacyDispositionFingerprint } from "../services/recovery/legacy-continuation.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -1574,5 +1575,85 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .then((rows) => rows[0] ?? null);
     expect(run).toMatchObject({ status: "succeeded" });
     expect(run?.errorCode).not.toBe("issue_dependencies_blocked");
+  });
+
+  it("runs the manager once when the child-completion wake is coalesced into a scheduled disposition repair", async () => {
+    const { companyId, managerId, parentId, childId } = await seedManagerParentWithCancelledChildBlocker();
+    // The successful manager run that recovery is repairing, and the repair it
+    // scheduled before the operator cancelled the child (demo 4B, 2026-11-12).
+    const sourceRunId = randomUUID();
+    const episode = { id: randomUUID(), attempt: 1, maxAttempts: 2 };
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "succeeded",
+      runtimeMode: "legacy",
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: parentId, legacyDispositionEpisode: episode },
+    });
+    const repairRunId = randomUUID();
+    const repairWakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: repairWakeupRequestId,
+      companyId,
+      agentId: managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_disposition_repair",
+      payload: { issueId: parentId },
+      status: "queued",
+      requestedByActorType: "system",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: repairRunId,
+      wakeupRequestId: repairWakeupRequestId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      runtimeMode: "legacy",
+      retryOfRunId: sourceRunId,
+      scheduledRetryAt: new Date(Date.now() - 1_000),
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "issue_disposition_repair",
+      contextSnapshot: {
+        ...childrenCompletedContext(parentId, childId),
+        retryReason: "issue_disposition_repair",
+        retryOfRunId: sourceRunId,
+        dispositionRepairSourceRunId: sourceRunId,
+        dispositionRepairAttempt: 2,
+        dispositionRepairFingerprint: legacyDispositionFingerprint(companyId, parentId, managerId, episode.id),
+        legacyDispositionEpisode: { ...episode, attempt: 2 },
+      },
+    });
+
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: repairRunId })
+      .where(eq(agentWakeupRequests.id, repairWakeupRequestId));
+
+    const promoted = await heartbeat.promoteDueScheduledRetries(new Date());
+    expect(promoted.runIds).toContain(repairRunId);
+    await heartbeat.resumeQueuedRuns();
+
+    const settled = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, repairRunId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded" || run?.status === "cancelled";
+    }, 10_000);
+    expect(settled).toBe(true);
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, repairRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).toMatchObject({ status: "succeeded" });
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
 });

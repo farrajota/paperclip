@@ -46,6 +46,31 @@ describe("legacy continuation persisted authority", () => {
   const parentBlockerIds = (f: Fixture) => db.select({ id: issueRelations.issueId }).from(issueRelations)
     .where(and(eq(issueRelations.relatedIssueId, f.issueId), eq(issueRelations.type, "blocks"))).then(rows => rows.map(row => row.id));
   const parentStatus = (f: Fixture) => db.select({ status: issues.status }).from(issues).where(eq(issues.id, f.issueId)).then(rows => rows[0]?.status);
+  async function scheduledSecondRepair(f: Fixture) {
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    const first = (await f.runs()).find(r => r.id !== f.runId)!;
+    await f.finish(first);
+    await f.createRecovery().reconcileLegacyContinuation(first.id);
+    return (await f.runs()).find(r => r.status === "scheduled_retry")!;
+  }
+  // The demo state: recovery had made the parent wait on its own child, the
+  // operator then cancelled that child, and the child-completion wake was
+  // coalesced into the parent's already scheduled disposition repair.
+  async function coalesceChildrenCompletedWakeAfterCancelledChildBlocker(f: Fixture, second: typeof heartbeatRuns.$inferSelect, blockerIsChild = true) {
+    const childId = randomUUID();
+    await db.insert(issues).values({ id: childId, companyId: f.companyId, parentId: f.issueId, title: "Compute the quote hash", status: "cancelled", responsibleUserId: "fixture-owner" });
+    const blockerId = blockerIsChild ? childId : randomUUID();
+    if (!blockerIsChild) await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Unrelated prerequisite", status: "cancelled", responsibleUserId: "fixture-owner" });
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId, relatedIssueId: f.issueId, type: "blocks" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: {
+      ...second.contextSnapshot,
+      source: "issue.children_completed",
+      wakeReason: "issue_children_completed",
+      completedChildIssueId: childId,
+      childIssueIds: [childId],
+    } }).where(eq(heartbeatRuns.id, second.id));
+  }
   it("treats a healthy open direct child as the parent's wait instead of repairing the parent", async () => {
     const f = await fixture();
     await addHealthyChild(f);
@@ -72,6 +97,23 @@ describe("legacy continuation persisted authority", () => {
     await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: childId, kind: "request_confirmation", status: "pending", addresseeAgentId: f.agentId, payload: { version: 1, prompt: "Review this delivery" } });
     expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
     expect(await f.actions()).toHaveLength(1);
+  });
+  it("promotes a repair carrying a coalesced child-completion wake past a cancelled direct child blocker", async () => {
+    const f = await fixture();
+    const second = await scheduledSecondRepair(f);
+    await coalesceChildrenCompletedWakeAfterCancelledChildBlocker(f, second);
+    const promoted = await heartbeatService(db).promoteDueScheduledRetries(new Date(second.scheduledRetryAt!.getTime() + 1));
+    expect(promoted.runIds).toContain(second.id);
+    expect((await f.runs()).find(r => r.id === second.id)).toMatchObject({ status: "queued", errorCode: null });
+    expect(await f.createRecovery().legacyRepairDispatchBlock(second.id)).toBeNull();
+  });
+  it("keeps a cancelled non-child blocker gating a repair that carries a child-completion wake", async () => {
+    const f = await fixture();
+    const second = await scheduledSecondRepair(f);
+    await coalesceChildrenCompletedWakeAfterCancelledChildBlocker(f, second, false);
+    const promoted = await heartbeatService(db).promoteDueScheduledRetries(new Date(second.scheduledRetryAt!.getTime() + 1));
+    expect(promoted.runIds).not.toContain(second.id);
+    expect((await f.runs()).find(r => r.id === second.id)).toMatchObject({ status: "cancelled", errorCode: "issue_dependencies_blocked" });
   });
   it.each([1, 2, 3, 4, 5])("deduplicates concurrent replay with stale prose-derived liveness (%s)", async () => {
     const f = await fixture();
