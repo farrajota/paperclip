@@ -14,8 +14,6 @@ permissions:
 
 jobs:
   review:
-    # Needs upstream's review service credentials; the fork has none.
-    if: ${{ github.repository == 'paperclipai/paperclip' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
