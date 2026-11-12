@@ -103,6 +103,7 @@ import {
 } from "../chat-control-recovery-stop.js";
 import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
+  dependencyReadinessWakeReason,
   issueService,
   executeIssuePostCommitActions,
   type IssuePostCommitAction,
@@ -3795,7 +3796,7 @@ export function recoveryService(
     // A child-completion wake coalesced into this repair is the parent's own
     // wake, already admitted by the dependency gates. The repair's disposition
     // checks (for example a parent that is now blocked) must not discard it.
-    if (readNonEmptyString(context.wakeReason) === "issue_children_completed") return null;
+    if (dependencyReadinessWakeReason(context) === "issue_children_completed") return null;
     const episode = legacyDispositionEpisode(run);
     // Infrastructure retries retain the successful disposition source even
     // though their immediate retryOfRunId points at a failed repair attempt.

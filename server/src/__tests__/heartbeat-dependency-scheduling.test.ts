@@ -28,7 +28,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { heartbeatService, mergeCoalescedContextSnapshot } from "../services/heartbeat.ts";
 import { legacyDispositionFingerprint } from "../services/recovery/legacy-continuation.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
@@ -1655,6 +1655,61 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .then((rows) => rows[0] ?? null);
     expect(run).toMatchObject({ status: "succeeded" });
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("claims a queued child-completion run after a later wake was coalesced into it", async () => {
+    const { companyId, managerId, parentId, childId } = await seedManagerParentWithCancelledChildBlocker();
+    const wakeupRequestId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId: managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: parentId, completedChildIssueId: childId, childIssueIds: [childId] },
+      status: "queued",
+    });
+    // Coalescing keeps only the latest wakeReason; the child-completion
+    // fields of the earlier wake stay in the context.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: mergeCoalescedContextSnapshot(childrenCompletedContext(parentId, childId), {
+        issueId: parentId,
+        taskId: parentId,
+        wakeReason: "issue_status_changed",
+        source: "issue.status_changed",
+      }),
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    await heartbeat.resumeQueuedRuns();
+
+    const settled = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded" || run?.status === "cancelled";
+    }, 10_000);
+    expect(settled).toBe(true);
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).toMatchObject({ status: "succeeded" });
   });
 
   it("runs a reserved repair once when its parent's child became live, then delivers the child-completion wake", async () => {

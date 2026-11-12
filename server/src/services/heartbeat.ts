@@ -423,7 +423,7 @@ import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
-import { issueService } from "./issues.js";
+import { dependencyReadinessWakeReason, issueService } from "./issues.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -17547,7 +17547,7 @@ export function heartbeatService(
       const readiness = await issuesSvc.getDependencyReadinessForWake(
         run.companyId,
         issueId,
-        readNonEmptyString(context.wakeReason),
+        dependencyReadinessWakeReason(context),
       );
       const unresolvedBlockerCount = readiness.unresolvedBlockerCount;
       if (

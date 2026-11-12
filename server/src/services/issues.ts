@@ -2682,6 +2682,20 @@ async function listIssueDependencyReadinessMap(
 const ISSUE_CHILDREN_COMPLETED_WAKE_REASON = "issue_children_completed";
 
 /**
+ * The wake reason a run's dependency readiness is judged by. Coalescing keeps
+ * only the latest `wakeReason`, but a merged child-completion wake leaves its
+ * `completedChildIssueId` in the context, so that wake still counts.
+ */
+export function dependencyReadinessWakeReason(context: Record<string, unknown>): string | null {
+  if (typeof context.completedChildIssueId === "string" && context.completedChildIssueId.length > 0) {
+    return ISSUE_CHILDREN_COMPLETED_WAKE_REASON;
+  }
+  return typeof context.wakeReason === "string" && context.wakeReason.trim().length > 0
+    ? context.wakeReason
+    : null;
+}
+
+/**
  * Dependency readiness as seen by one wake of `issueId`'s assignee.
  *
  * The child-completion wake is the barrier a manager waits on for its own

@@ -24,7 +24,7 @@ import { collectDispositionRepairSourceState } from "../../../services/recovery/
 import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
-import { issueService } from "../../../services/issues.js";
+import { dependencyReadinessWakeReason, issueService } from "../../../services/issues.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
@@ -434,7 +434,7 @@ export function createPostgresRunDispatchAdapter(
     const readiness = await issuesSvcForRead.getDependencyReadinessForWake(
       input.companyId,
       issueId,
-      readNonEmptyString(input.contextSnapshot.wakeReason),
+      dependencyReadinessWakeReason(input.contextSnapshot),
     );
     facts.dependenciesBlocked =
       readiness && !readiness.isDependencyReady

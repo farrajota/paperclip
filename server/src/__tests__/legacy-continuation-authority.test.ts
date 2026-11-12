@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues } from "@paperclipai/db";
-import { heartbeatService } from "../services/heartbeat.js";
+import { heartbeatService, mergeCoalescedContextSnapshot } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -112,6 +112,19 @@ describe("legacy continuation persisted authority", () => {
     const f = await fixture();
     const second = await scheduledSecondRepair(f);
     await coalesceChildrenCompletedWakeAfterCancelledChildBlocker(f, second);
+    const promoted = await heartbeatService(db).promoteDueScheduledRetries(new Date(second.scheduledRetryAt!.getTime() + 1));
+    expect(promoted.runIds).toContain(second.id);
+    expect((await f.runs()).find(r => r.id === second.id)).toMatchObject({ status: "queued", errorCode: null });
+    expect(await f.createRecovery().legacyRepairDispatchBlock(second.id)).toBeNull();
+  });
+  it("keeps the child-completion exemption after a later wake is coalesced into the same repair", async () => {
+    const f = await fixture();
+    const second = await scheduledSecondRepair(f);
+    await coalesceChildrenCompletedWakeAfterCancelledChildBlocker(f, second);
+    const [merged] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, second.id));
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: mergeCoalescedContextSnapshot(merged.contextSnapshot, { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_status_changed", source: "issue.status_changed" }),
+    }).where(eq(heartbeatRuns.id, second.id));
     const promoted = await heartbeatService(db).promoteDueScheduledRetries(new Date(second.scheduledRetryAt!.getTime() + 1));
     expect(promoted.runIds).toContain(second.id);
     expect((await f.runs()).find(r => r.id === second.id)).toMatchObject({ status: "queued", errorCode: null });
