@@ -10,6 +10,23 @@ permissions:
 
 jobs:
   ci:
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # The fork's release line is older than upstream master, so it runs the
+    # CI definition from its own tree; upstream's master workflow expects
+    # scripts and actions this tree does not have.
+    uses: ./.github/workflows/pr-trusted.yml
+
+  fork-gate:
+    # The single required check for zay/stable-image. The upstream aggregates
+    # (`verify`, `e2e`) leave out the serialized suites and the canary, and a
+    # skipped matrix job counts as passing, so gate on the whole called
+    # workflow instead.
+    name: fork-gate
+    if: ${{ always() }}
+    needs: [ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          CI_RESULT: ${{ needs.ci.result }}
+        run: test "$CI_RESULT" = "success"
