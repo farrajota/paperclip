@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -33,6 +33,46 @@ describe("legacy continuation persisted authority", () => {
     }
     return { companyId, agentId, issueId, runId, createRecovery, runs, actions, finish };
   }
+  type Fixture = Awaited<ReturnType<typeof fixture>>;
+  // A specialist child of the parent with a queued run of its own, which is
+  // what recovery calls a healthy open child.
+  async function addHealthyChild(f: Fixture) {
+    const specialistId = randomUUID(), childId = randomUUID();
+    await db.insert(agents).values({ id: specialistId, companyId: f.companyId, name: "Specialist", role: "engineer", status: "idle", adapterType: "codex_local", runtimeConfig: { heartbeat: { wakeOnDemand: true } } });
+    await db.insert(issues).values({ id: childId, companyId: f.companyId, parentId: f.issueId, title: "Compute the quote hash", status: "todo", assigneeAgentId: specialistId, responsibleUserId: "fixture-owner" });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: specialistId, invocationSource: "automation", status: "queued", runtimeMode: "legacy", contextSnapshot: { issueId: childId } });
+    return childId;
+  }
+  const parentBlockerIds = (f: Fixture) => db.select({ id: issueRelations.issueId }).from(issueRelations)
+    .where(and(eq(issueRelations.relatedIssueId, f.issueId), eq(issueRelations.type, "blocks"))).then(rows => rows.map(row => row.id));
+  const parentStatus = (f: Fixture) => db.select({ status: issues.status }).from(issues).where(eq(issues.id, f.issueId)).then(rows => rows[0]?.status);
+  it("treats a healthy open direct child as the parent's wait instead of repairing the parent", async () => {
+    const f = await fixture();
+    await addHealthyChild(f);
+    expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
+    expect(await f.actions()).toHaveLength(0);
+    expect((await f.runs()).filter(r => r.agentId === f.agentId)).toHaveLength(1);
+    expect(await parentBlockerIds(f)).toEqual([]);
+  });
+  it("does not make a healthy child that appears during a pending repair a blocker of its parent", async () => {
+    const f = await fixture();
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    const repair = (await f.runs()).find(r => r.id !== f.runId)!;
+    await addHealthyChild(f);
+    await f.createRecovery().reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    expect(await parentBlockerIds(f)).toEqual([]);
+    expect(await parentStatus(f)).toBe("in_progress");
+    expect((await f.actions())[0]).toMatchObject({ status: "resolved", resolutionNote: "durable_path_restored:healthy_child" });
+    expect(await f.createRecovery().legacyRepairDispatchBlock(repair.id)).toBe("durable_wait");
+  });
+  it("still repairs a parent whose only open child is parked waiting on the parent's assignee", async () => {
+    const f = await fixture();
+    const childId = randomUUID();
+    await db.insert(issues).values({ id: childId, companyId: f.companyId, parentId: f.issueId, title: "Review the delivery", status: "in_review", responsibleUserId: "fixture-owner" });
+    await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: childId, kind: "request_confirmation", status: "pending", addresseeAgentId: f.agentId, payload: { version: 1, prompt: "Review this delivery" } });
+    expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
+    expect(await f.actions()).toHaveLength(1);
+  });
   it.each([1, 2, 3, 4, 5])("deduplicates concurrent replay with stale prose-derived liveness (%s)", async () => {
     const f = await fixture();
     const recovery = f.createRecovery();

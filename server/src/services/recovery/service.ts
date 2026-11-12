@@ -2881,7 +2881,11 @@ export function recoveryService(
       );
   }
 
-  async function healthyOpenChildIssues(issue: typeof issues.$inferSelect, sameWorkspaceOnly = false) {
+  async function healthyOpenChildIssues(
+    issue: typeof issues.$inferSelect,
+    sameWorkspaceOnly = false,
+    liveOnly = sameWorkspaceOnly,
+  ) {
     if (sameWorkspaceOnly && !issue.projectWorkspaceId) return [];
     const childCandidates = await db
       .select()
@@ -2902,7 +2906,7 @@ export function recoveryService(
       });
       if (
         childState.hasActiveExecutionPath ||
-        (!sameWorkspaceOnly && childState.hasDurableWaitingPath)
+        (!liveOnly && childState.hasDurableWaitingPath)
       ) {
         openChildren.push({ id: child.id, identifier: child.identifier });
       }
@@ -3466,21 +3470,11 @@ export function recoveryService(
         healthyChildren.length > 0 ||
         hasNewSourcePath
       ) {
-        if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(
-            issue.companyId,
-            issue.id,
-          );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
-        }
+        // A healthy direct child is itself the parent's wait: the parent's
+        // assignee gets the issue_children_completed wake once every child is
+        // terminal. Recording the child as a blocker as well would strand the
+        // parent if the child is cancelled, because cancelled blockers never
+        // resolve, so the parent is left as its owner set it.
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
           sourceIssueId: action.sourceIssueId,
@@ -3705,7 +3699,7 @@ export function recoveryService(
     if ((readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId)) !== issue.id) {
       return { kind: "skip" as const, reason: "invalid_issue_binding" };
     }
-    const [agent, pause, budget, stop, active, routine, goal, latest, durableWait, workspaceChildren] = await Promise.all([
+    const [agent, pause, budget, stop, active, routine, goal, latest, durableWait, workspaceChildren, waitingOnChildren] = await Promise.all([
       getAgent(run.agentId),
       isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
       isInvocationBudgetBlocked(issue, run.agentId),
@@ -3716,6 +3710,7 @@ export function recoveryService(
       getLatestIssueRun(issue.companyId, issue.id),
       hasPersistedDurableWaitPath(issue, run),
       parseObject(context.paperclipWorkspace).mode === "shared_workspace" ? healthyOpenChildIssues(issue, true) : Promise.resolve([]),
+      healthyOpenChildIssues(issue, false, true),
     ]);
     const ownsRepair = active?.kind === "deliberate_wait_without_target" && active.ownerType === "agent";
     return decideLegacyContinuation({
@@ -3723,7 +3718,11 @@ export function recoveryService(
       gates: {
         stopped: stop.kind !== "clear" || isOperatorCancelledRun(run, run.agentId),
         paused: pause, budgetBlocked: budget,
-        pendingWait: state.hasDurableWaitingPath || durableWait || parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt),
+        // An open child with a live run or wake is a native wait target: the
+        // child-completion wake, not a disposition repair, is the parent's
+        // next step. A child that is only parked in a durable wait may be
+        // waiting on this parent's assignee, so it does not count.
+        pendingWait: state.hasDurableWaitingPath || durableWait || parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt) || waitingOnChildren.length > 0,
         activeExecution: state.hasActiveExecutionPath || latest?.id !== (dispatchRunId ?? run.id),
         ownedLifecycle: run.issueCommentStatus === "retry_queued" || run.issueCommentStatus === "retry_exhausted" ||
           Boolean(readNonEmptyString(context.goalControlRequestId)) || context.resumeSessionGoalHeartbeat === true ||
