@@ -80,6 +80,13 @@ async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
   `));
 }
 
+// Scoped to one run: a follow-up run of the same agent may reach the adapter
+// before a test reads the count.
+function adapterCallsForRun(runId: string) {
+  return (mockAdapterExecute.mock.calls as unknown as Array<[{ runId?: string } | undefined]>)
+    .filter(([input]) => input?.runId === runId).length;
+}
+
 async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1388,6 +1395,21 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     return { companyId, managerId, parentId, childId };
   }
 
+  // Every run that carries this child's completion wake for the parent,
+  // including one it was coalesced into.
+  function childCompletionRunIds(parentId: string, childId: string) {
+    return db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${parentId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'completedChildIssueId' = ${childId}`,
+        ),
+      )
+      .then((rows) => rows.map((row) => row.id));
+  }
+
   function childrenCompletedContext(parentId: string, childId: string) {
     return {
       issueId: parentId,
@@ -1654,7 +1676,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .where(eq(heartbeatRuns.id, repairRunId))
       .then((rows) => rows[0] ?? null);
     expect(run).toMatchObject({ status: "succeeded" });
-    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    expect(adapterCallsForRun(repairRunId)).toBe(1);
+    expect(await childCompletionRunIds(parentId, childId)).toEqual([repairRunId]);
   });
 
   it("claims a queued child-completion run after a later wake was coalesced into it", async () => {
@@ -1873,7 +1896,6 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .set({ status: "cancelled" })
       .where(sql`${agentWakeupRequests.payload} ->> 'issueId' = ${childId}`);
     await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, childId));
-    const callsBeforeWake = mockAdapterExecute.mock.calls.length;
     const wake = await heartbeat.wakeup(managerId, {
       source: "automation",
       triggerDetail: "system",
@@ -1891,6 +1913,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       return run?.status === "succeeded";
     }, 10_000);
     expect(delivered).toBe(true);
-    expect(mockAdapterExecute.mock.calls.length - callsBeforeWake).toBe(1);
+    expect(adapterCallsForRun(wake!.id)).toBe(1);
+    expect(await childCompletionRunIds(parentId, childId)).toEqual([wake!.id]);
   });
 });
