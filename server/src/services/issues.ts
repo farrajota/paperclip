@@ -2679,6 +2679,59 @@ async function listIssueDependencyReadinessMap(
   return readinessMap;
 }
 
+const ISSUE_CHILDREN_COMPLETED_WAKE_REASON = "issue_children_completed";
+
+/**
+ * Dependency readiness as seen by one wake of `issueId`'s assignee.
+ *
+ * The child-completion wake is the barrier a manager waits on for its own
+ * direct children, and it fires once every child is terminal, `cancelled`
+ * included. A cancelled child that is also a blocker of the parent never
+ * resolves, so without this exception the wake that tells the manager about
+ * the cancellation would be suppressed and the parent stranded. Only that
+ * wake reason, and only cancelled direct children of `issueId`, are excused:
+ * every other blocker, every other wake reason, and the issue's own
+ * readiness (checkout, status) keep the general rule. A done child is already
+ * resolved unless its workspace has not finalized, and that barrier stays.
+ */
+async function getIssueDependencyReadinessForWake(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  issueId: string,
+  wakeReason: string | null,
+): Promise<IssueDependencyReadiness> {
+  const readiness =
+    (await listIssueDependencyReadinessMap(dbOrTx, companyId, [issueId])).get(issueId) ??
+    createIssueDependencyReadiness(issueId);
+  if (wakeReason !== ISSUE_CHILDREN_COMPLETED_WAKE_REASON || readiness.isDependencyReady) {
+    return readiness;
+  }
+  const excusedBlockerIssueIds = new Set(
+    await dbOrTx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.id, readiness.unresolvedBlockerIssueIds),
+          eq(issues.parentId, issueId),
+          eq(issues.status, "cancelled"),
+        ),
+      )
+      .then((rows) => rows.map((row) => row.id)),
+  );
+  if (excusedBlockerIssueIds.size === 0) return readiness;
+  const unresolvedBlockerIssueIds = readiness.unresolvedBlockerIssueIds.filter(
+    (blockerIssueId) => !excusedBlockerIssueIds.has(blockerIssueId),
+  );
+  return {
+    ...readiness,
+    unresolvedBlockerIssueIds,
+    unresolvedBlockerCount: unresolvedBlockerIssueIds.length,
+    isDependencyReady: unresolvedBlockerIssueIds.length === 0,
+  };
+}
+
 async function listUnresolvedBlockerDetails(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -9093,6 +9146,15 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
     ) => {
       return listIssueDependencyReadinessMap(dbOrTx, companyId, issueIds);
+    },
+
+    getDependencyReadinessForWake: async (
+      companyId: string,
+      issueId: string,
+      wakeReason: string | null,
+      dbOrTx: any = db,
+    ) => {
+      return getIssueDependencyReadinessForWake(dbOrTx, companyId, issueId, wakeReason);
     },
 
     listBlockerAttention: async (

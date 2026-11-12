@@ -5010,6 +5010,78 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       childIssueSummaryTruncated: false,
     });
   });
+
+  async function seedParentBlockedByCancelledChildAndOutsider() {
+    const companyId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const outsiderId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Parent", status: "blocked", priority: "medium" },
+      { id: childId, companyId, parentId, title: "Child", status: "cancelled", priority: "medium" },
+      { id: outsiderId, companyId, title: "Outsider", status: "cancelled", priority: "medium" },
+    ]);
+    return { companyId, parentId, childId, outsiderId };
+  }
+
+  it("excuses a cancelled direct child blocker only for the parent's children-completed wake", async () => {
+    const { companyId, parentId, childId } = await seedParentBlockedByCancelledChildAndOutsider();
+    await db.insert(issueRelations).values({
+      companyId, issueId: childId, relatedIssueId: parentId, type: "blocks",
+    });
+
+    await expect(
+      svc.getDependencyReadinessForWake(companyId, parentId, "issue_children_completed"),
+    ).resolves.toMatchObject({
+      issueId: parentId,
+      blockerIssueIds: [childId],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      isDependencyReady: true,
+    });
+    await expect(
+      svc.getDependencyReadinessForWake(companyId, parentId, "issue_blockers_resolved"),
+    ).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [childId],
+      isDependencyReady: false,
+    });
+  });
+
+  it("keeps a cancelled non-child blocker unresolved for the parent's children-completed wake", async () => {
+    const { companyId, parentId, childId, outsiderId } = await seedParentBlockedByCancelledChildAndOutsider();
+    await db.insert(issueRelations).values([
+      { companyId, issueId: childId, relatedIssueId: parentId, type: "blocks" },
+      { companyId, issueId: outsiderId, relatedIssueId: parentId, type: "blocks" },
+    ]);
+
+    await expect(
+      svc.getDependencyReadinessForWake(companyId, parentId, "issue_children_completed"),
+    ).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [outsiderId],
+      unresolvedBlockerCount: 1,
+      isDependencyReady: false,
+    });
+  });
+
+  it("still reports a cancelled direct child blocker as unresolved in general readiness", async () => {
+    const { companyId, parentId, childId } = await seedParentBlockedByCancelledChildAndOutsider();
+    await db.insert(issueRelations).values({
+      companyId, issueId: childId, relatedIssueId: parentId, type: "blocks",
+    });
+
+    await expect(svc.getDependencyReadiness(parentId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [childId],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+  });
 });
 
 describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
