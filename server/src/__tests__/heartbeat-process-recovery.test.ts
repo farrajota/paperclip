@@ -15,7 +15,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq, or, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, or, inArray, sql } from "drizzle-orm";
 import {
   afterAll,
   afterEach,
@@ -9752,25 +9752,135 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const reviewerWakes = await db.select().from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
       expect(reviewerWakes.filter((wake) => wake.status === "skipped")).toEqual([]);
-      const reviewerRun = await waitForValue(async () => (await db.select().from(heartbeatRuns)
-        .where(eq(heartbeatRuns.agentId, reviewerAgentId)))[0], 8_000);
-      expect(reviewerRun?.contextSnapshot).toMatchObject({
+      // A later sweep must not dispatch the same handoff again.
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      // This fixture's review turn records no decision, so its own release
+      // queues one participant-recovery retry of it. Read in creation order: an
+      // unordered read returns whichever row the heap yields first.
+      const reviewerRuns = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, reviewerAgentId)).orderBy(asc(heartbeatRuns.createdAt));
+      const [handoffRun, ...laterRuns] = reviewerRuns;
+      expect(handoffRun?.contextSnapshot).toMatchObject({
         issueId,
         wakeReason: "execution_review_requested",
         interruptedRunId: runId,
         executionStage: { wakeRole: "reviewer", stageId },
       });
-      expect((await db.select().from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.agentId, reviewerAgentId))).map((wake) => wake.runId)).toContain(reviewerRun!.id);
+      expect(laterRuns.map((run) => ({ retryOfRunId: run.retryOfRunId, wakeReason: run.contextSnapshot?.wakeReason })))
+        .toEqual([{ retryOfRunId: handoffRun!.id, wakeReason: "execution_review_participant_recovery" }]);
+      const handoffReceipts = (await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, reviewerAgentId)))
+        .filter((wake) => wake.payload?.interruptedRunId === runId);
+      // The deferred intent is settled as coalesced into the run its
+      // readmission queued; that admission's own receipt completed with it.
+      expect(handoffReceipts.map((wake) => ({ status: wake.status, runId: wake.runId }))
+        .sort((left, right) => left.status.localeCompare(right.status))).toEqual([
+        { status: "coalesced", runId: handoffRun!.id },
+        { status: "completed", runId: handoffRun!.id },
+      ]);
+    } finally {
+      factory.mockRestore();
+    }
+  });
 
-      // A later sweep must not dispatch the same handoff again. (This fixture's
-      // review turn records no decision, so participant recovery may add its
-      // own retry; that is a different wake.)
+  it("coalesces a readmitted review handoff into the reviewer turn participant recovery already started", async () => {
+    const { companyId, agentId: executorAgentId, issueId, runId } = await seedRunFixture({
+      runtimeMode: "legacy", adapterType: "codex_local", agentStatus: "idle", runStatus: "queued",
+    });
+    const reviewerAgentId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId, companyId, name: "CodexReviewer", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    const stageWake = reviewStageHandoffWake({
+      issueId, stageId, executorAgentId, reviewerAgentId, interruptedRunId: runId,
+    });
+    let heartbeat: ReturnType<typeof heartbeatService>;
+    let cancellation: ReturnType<typeof heartbeat.cancelRun> | undefined;
+    let wakeResult: Awaited<ReturnType<typeof heartbeat.wakeup>> | undefined;
+    let recoveryRun: Awaited<ReturnType<typeof heartbeat.wakeup>> | undefined;
+    const originalFactory = environmentOrchestrator.environmentRunOrchestrator;
+    // The handoff defers against the executor's lease. Between the lease
+    // release and cleanup's readmission, a participant-recovery sweep (shaped
+    // like recovery/service.ts enqueueStrandedIssueRecovery) finds no queued
+    // reviewer wake and dispatches the reviewer first.
+    const release = vi.fn(async (input: { heartbeatRunId: string }) => {
+      if (input.heartbeatRunId === runId && wakeResult === undefined) {
+        wakeResult = await heartbeat.wakeup(reviewerAgentId, stageWake);
+      }
+      await db.update(environmentLeases).set({ status: "expired", cleanupStatus: "success", releasedAt: new Date() })
+        .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, input.heartbeatRunId)));
+      if (input.heartbeatRunId === runId && recoveryRun === undefined) {
+        recoveryRun = await heartbeat.wakeup(reviewerAgentId, {
+          source: "automation", triggerDetail: "system", reason: "execution_review_participant_recovery",
+          payload: { issueId, currentStageId: stageId, currentStageType: "review" },
+          requestedByActorType: "system", requestedByActorId: null,
+          contextSnapshot: {
+            issueId, taskId: issueId, wakeReason: "execution_review_participant_recovery",
+            retryReason: "execution_review_participant_recovery", source: "issue.execution_review_recovery",
+            currentStageId: stageId, currentStageType: "review",
+          },
+        });
+      }
+      return { released: [], errors: [] };
+    });
+    const factory = vi.spyOn(environmentOrchestrator, "environmentRunOrchestrator").mockImplementation((...args) => ({
+      ...originalFactory(...args), releaseForRun: release,
+    }) as ReturnType<typeof originalFactory>);
+    heartbeat = heartbeatService(db);
+    mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
+      const invocation = input as { onCancellationReady: () => Promise<void>; onDispatch: () => void };
+      await invocation.onCancellationReady();
+      invocation.onDispatch();
+      cancellation = heartbeat.cancelRun(runId, "Cancelled before issue reassignment", {
+        errorCode: "issue_reassigned",
+        resultJson: { reassignmentStopConfirmed: true },
+        eventMessage: "run cancelled before issue reassignment",
+        eventPayload: { issueId },
+      });
+      void cancellation.catch(() => undefined);
+      await waitForValue(async () => adapterExecutionControls.get(runId)?.controller.signal.aborted);
+      await db.update(issues).set({
+        status: "in_review",
+        assigneeAgentId: reviewerAgentId,
+        executionState: pendingReviewState({ stageId, executorAgentId, reviewerAgentId }),
+      }).where(eq(issues.id, issueId));
+      return { exitCode: null, signal: "SIGTERM", timedOut: false, errorMessage: "Cancelled before issue reassignment",
+        resultJson: { executionCancellation: { state: "acknowledged" } },
+        summary: "Submitted for review", provider: "test", model: "test-model" };
+    });
+    // Hold the recovery turn open until cleanup has settled the deferred
+    // handoff, so the readmission always meets a reviewer turn in progress.
+    const handoffSettled = async () => (await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, reviewerAgentId),
+      eq(agentWakeupRequests.status, "coalesced"),
+      sql`${agentWakeupRequests.payload}->>'interruptedRunId' = ${runId}`,
+    ))).length >= 2;
+    mockAdapterExecute.mockImplementation(async () => {
+      expect(await waitForValue(handoffSettled, 8_000)).toBe(true);
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Reviewed", provider: "test", model: "test-model" };
+    });
+    try {
       await heartbeat.resumeQueuedRuns();
       await heartbeat.drainActiveRunExecutions();
-      const handoffRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, reviewerAgentId)))
-        .filter((run) => run.contextSnapshot?.wakeReason === "execution_review_requested");
-      expect(handoffRuns.map((run) => run.id)).toEqual([reviewerRun!.id]);
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      expect((await cancellation)?.status).toBe("cancelled");
+      expect(wakeResult).toBeNull();
+      expect(recoveryRun?.id).toBeTruthy();
+
+      const reviewerRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, reviewerAgentId));
+      expect(reviewerRuns.map((run) => run.id)).toEqual([recoveryRun!.id]);
+      const handoffReceipts = (await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, reviewerAgentId)))
+        .filter((wake) => wake.payload?.interruptedRunId === runId);
+      expect(handoffReceipts.map((wake) => ({ status: wake.status, runId: wake.runId }))).toEqual([
+        { status: "coalesced", runId: recoveryRun!.id },
+        { status: "coalesced", runId: recoveryRun!.id },
+      ]);
     } finally {
       factory.mockRestore();
     }
