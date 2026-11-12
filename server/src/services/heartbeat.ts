@@ -7399,6 +7399,22 @@ async function resolveAcceptedPlanWakeRoutingDecision(args: {
   };
 }
 
+// executeRun rewrites the whole snapshot from the context it read at claim. An
+// execution-stage wake that coalesced into this run after that read (a stage
+// handoff readmitted into a turn participant recovery already started) exists
+// only on the row, and no later turn input can deliver it. Keep its stage block
+// and interrupted run as one pair, unless this run has its own stage block.
+function runContextSnapshotWrite(context: Record<string, unknown>) {
+  if (context.executionStage !== undefined) return context;
+  return sql`${JSON.stringify(context)}::jsonb || (
+    select coalesce(jsonb_object_agg(handoff.key, handoff.value), '{}'::jsonb)
+    from jsonb_each(case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+      then ${heartbeatRuns.contextSnapshot} else '{}'::jsonb end) as handoff
+    where handoff.key in ('executionStage', 'interruptedRunId')
+      and ${heartbeatRuns.contextSnapshot} ? 'executionStage'
+  )`;
+}
+
 export function mergeCoalescedContextSnapshot(
   existingRaw: unknown,
   incoming: Record<string, unknown>,
@@ -22695,7 +22711,7 @@ export function heartbeatService(
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: runContextSnapshotWrite(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -23066,7 +23082,7 @@ export function heartbeatService(
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: context,
+          contextSnapshot: runContextSnapshotWrite(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -23359,7 +23375,7 @@ export function heartbeatService(
             startedAt,
             sessionIdBefore:
               runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-            contextSnapshot: context,
+            contextSnapshot: runContextSnapshotWrite(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id))
@@ -23581,7 +23597,7 @@ export function heartbeatService(
           await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: context,
+              contextSnapshot: runContextSnapshotWrite(context),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));
@@ -25463,7 +25479,7 @@ export function heartbeatService(
           await db
             .update(heartbeatRuns)
             .set({
-              contextSnapshot: context,
+              contextSnapshot: runContextSnapshotWrite(context),
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));

@@ -9874,6 +9874,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
       const reviewerRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, reviewerAgentId));
       expect(reviewerRuns.map((run) => run.id)).toEqual([recoveryRun!.id]);
+      // The run that served the handoff keeps the handoff's context after it
+      // finishes, not only its own recovery context.
+      expect(reviewerRuns[0]?.status).toBe("succeeded");
+      expect(reviewerRuns[0]?.contextSnapshot).toMatchObject({
+        issueId,
+        interruptedRunId: runId,
+        executionStage: { wakeRole: "reviewer", stageId, stageType: "review" },
+      });
       const handoffReceipts = (await db.select().from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.agentId, reviewerAgentId)))
         .filter((wake) => wake.payload?.interruptedRunId === runId);
