@@ -88,7 +88,17 @@ describe("legacy continuation persisted authority", () => {
     expect(await parentBlockerIds(f)).toEqual([]);
     expect(await parentStatus(f)).toBe("in_progress");
     expect((await f.actions())[0]).toMatchObject({ status: "resolved", resolutionNote: "durable_path_restored:healthy_child" });
-    expect(await f.createRecovery().legacyRepairDispatchBlock(repair.id)).toBe("durable_wait");
+    // Suppressing an already reserved repair at dispatch leaves a cancelled
+    // legacy run that recovery must reconcile, so it runs once instead.
+    expect(await f.createRecovery().legacyRepairDispatchBlock(repair.id)).toBeNull();
+  });
+  it("still repairs a parent whose only live child belongs to a paused agent", async () => {
+    const f = await fixture();
+    const childId = await addHealthyChild(f);
+    const [child] = await db.select().from(issues).where(eq(issues.id, childId));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, child.assigneeAgentId!));
+    expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
+    expect(await f.actions()).toHaveLength(1);
   });
   it("still repairs a parent whose only open child is parked waiting on the parent's assignee", async () => {
     const f = await fixture();

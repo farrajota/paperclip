@@ -1656,4 +1656,186 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(run).toMatchObject({ status: "succeeded" });
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
+
+  it("runs a reserved repair once when its parent's child became live, then delivers the child-completion wake", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const specialistId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "Manager",
+        role: "manager",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: specialistId,
+        companyId,
+        name: "Specialist",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Managed parent",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: managerId,
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: childId,
+        companyId,
+        parentId,
+        title: "Specialist child",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: specialistId,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    // The repair was reserved while the child was parked; the child has
+    // since become live again through a queued wake of its own.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: specialistId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: childId },
+      status: "queued",
+      requestedByActorType: "system",
+    });
+    const sourceRunId = randomUUID();
+    const episode = { id: randomUUID(), attempt: 1, maxAttempts: 2 };
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "succeeded",
+      runtimeMode: "legacy",
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: parentId, legacyDispositionEpisode: episode },
+    });
+    const repairRunId = randomUUID();
+    const repairWakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: repairWakeupRequestId,
+      companyId,
+      agentId: managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_disposition_repair",
+      payload: { issueId: parentId },
+      status: "queued",
+      requestedByActorType: "system",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: repairRunId,
+      wakeupRequestId: repairWakeupRequestId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      runtimeMode: "legacy",
+      retryOfRunId: sourceRunId,
+      scheduledRetryAt: new Date(Date.now() - 1_000),
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "issue_disposition_repair",
+      contextSnapshot: {
+        issueId: parentId,
+        taskId: parentId,
+        wakeReason: "issue_disposition_repair",
+        retryReason: "issue_disposition_repair",
+        retryOfRunId: sourceRunId,
+        dispositionRepairSourceRunId: sourceRunId,
+        dispositionRepairAttempt: 2,
+        dispositionRepairFingerprint: legacyDispositionFingerprint(companyId, parentId, managerId, episode.id),
+        legacyDispositionEpisode: { ...episode, attempt: 2 },
+      },
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: repairRunId })
+      .where(eq(agentWakeupRequests.id, repairWakeupRequestId));
+
+    await heartbeat.promoteDueScheduledRetries(new Date());
+    await heartbeat.resumeQueuedRuns();
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, repairRunId))
+        .then((rows) => rows[0] ?? null);
+      return ["succeeded", "cancelled", "failed"].includes(run?.status ?? "");
+    }, 10_000);
+    await heartbeat.waitForRunExecutionDrain(repairRunId);
+    const repair = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, repairRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(repair).toMatchObject({ status: "succeeded" });
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const activeActions = await db
+      .select({ kind: issueRecoveryActions.kind, cause: issueRecoveryActions.cause })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.sourceIssueId, parentId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      );
+    expect(activeActions).toEqual([]);
+
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "cancelled" })
+      .where(sql`${agentWakeupRequests.payload} ->> 'issueId' = ${childId}`);
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, childId));
+    const callsBeforeWake = mockAdapterExecute.mock.calls.length;
+    const wake = await heartbeat.wakeup(managerId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: parentId, completedChildIssueId: childId, childIssueIds: [childId] },
+      contextSnapshot: childrenCompletedContext(parentId, childId),
+    });
+    expect(wake).not.toBeNull();
+    const delivered = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, wake!.id))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    }, 10_000);
+    expect(delivered).toBe(true);
+    expect(mockAdapterExecute.mock.calls.length - callsBeforeWake).toBe(1);
+  });
 });

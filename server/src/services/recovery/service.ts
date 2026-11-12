@@ -22,6 +22,7 @@ import {
   isNotNull,
   isNull,
   not,
+  exists,
   notExists,
   notInArray,
   or,
@@ -2881,11 +2882,7 @@ export function recoveryService(
       );
   }
 
-  async function healthyOpenChildIssues(
-    issue: typeof issues.$inferSelect,
-    sameWorkspaceOnly = false,
-    liveOnly = sameWorkspaceOnly,
-  ) {
+  async function healthyOpenChildIssues(issue: typeof issues.$inferSelect, sameWorkspaceOnly = false) {
     if (sameWorkspaceOnly && !issue.projectWorkspaceId) return [];
     const childCandidates = await db
       .select()
@@ -2906,12 +2903,64 @@ export function recoveryService(
       });
       if (
         childState.hasActiveExecutionPath ||
-        (!liveOnly && childState.hasDurableWaitingPath)
+        (!sameWorkspaceOnly && childState.hasDurableWaitingPath)
       ) {
         openChildren.push({ id: child.id, identifier: child.identifier });
       }
     }
     return openChildren;
+  }
+
+  // Open direct children with a run or wake in flight for an agent that can
+  // still take it. A child that is only parked in a durable wait may be
+  // waiting on the parent's own assignee, so it is not counted.
+  async function liveOpenChildIssues(issue: typeof issues.$inferSelect) {
+    const runnableAgent = (agentId: typeof heartbeatRuns.agentId | typeof agentWakeupRequests.agentId) =>
+      exists(
+        db
+          .select({ id: agents.id })
+          .from(agents)
+          .where(and(eq(agents.id, agentId), notInArray(agents.status, ["paused", "terminated", "pending_approval"]))),
+      );
+    return db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, issue.companyId),
+          eq(issues.parentId, issue.id),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+          or(
+            exists(
+              db
+                .select({ id: heartbeatRuns.id })
+                .from(heartbeatRuns)
+                .where(
+                  and(
+                    eq(heartbeatRuns.companyId, issues.companyId),
+                    inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+                    sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issues.id}::text`,
+                    runnableAgent(heartbeatRuns.agentId),
+                  ),
+                ),
+            ),
+            exists(
+              db
+                .select({ id: agentWakeupRequests.id })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.companyId, issues.companyId),
+                    inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+                    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issues.id}::text`,
+                    runnableAgent(agentWakeupRequests.agentId),
+                  ),
+                ),
+            ),
+          ),
+        ),
+      );
   }
 
   async function resolveContinuationWaitingOnReview(
@@ -3710,7 +3759,11 @@ export function recoveryService(
       getLatestIssueRun(issue.companyId, issue.id),
       hasPersistedDurableWaitPath(issue, run),
       parseObject(context.paperclipWorkspace).mode === "shared_workspace" ? healthyOpenChildIssues(issue, true) : Promise.resolve([]),
-      healthyOpenChildIssues(issue, false, true),
+      // Only when deciding whether to reserve a repair. Suppressing an already
+      // reserved repair at dispatch would leave a cancelled legacy run that
+      // recovery holds for board reconciliation, which would then swallow the
+      // child-completion wake, so a reserved repair runs once instead.
+      dispatchRunId === undefined ? liveOpenChildIssues(issue) : Promise.resolve([]),
     ]);
     const ownsRepair = active?.kind === "deliberate_wait_without_target" && active.ownerType === "agent";
     return decideLegacyContinuation({
