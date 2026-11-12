@@ -22,6 +22,7 @@ import {
   isNotNull,
   isNull,
   not,
+  exists,
   notExists,
   notInArray,
   or,
@@ -102,6 +103,7 @@ import {
 } from "../chat-control-recovery-stop.js";
 import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
+  dependencyReadinessWakeReason,
   issueService,
   executeIssuePostCommitActions,
   type IssuePostCommitAction,
@@ -2910,6 +2912,58 @@ export function recoveryService(
     return openChildren;
   }
 
+  // Open direct children with a run or wake in flight for an agent that can
+  // still take it. A child that is only parked in a durable wait may be
+  // waiting on the parent's own assignee, so it is not counted.
+  async function liveOpenChildIssues(issue: typeof issues.$inferSelect) {
+    const runnableAgent = (agentId: typeof heartbeatRuns.agentId | typeof agentWakeupRequests.agentId) =>
+      exists(
+        db
+          .select({ id: agents.id })
+          .from(agents)
+          .where(and(eq(agents.id, agentId), notInArray(agents.status, ["paused", "terminated", "pending_approval"]))),
+      );
+    return db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, issue.companyId),
+          eq(issues.parentId, issue.id),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+          or(
+            exists(
+              db
+                .select({ id: heartbeatRuns.id })
+                .from(heartbeatRuns)
+                .where(
+                  and(
+                    eq(heartbeatRuns.companyId, issues.companyId),
+                    inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+                    sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issues.id}::text`,
+                    runnableAgent(heartbeatRuns.agentId),
+                  ),
+                ),
+            ),
+            exists(
+              db
+                .select({ id: agentWakeupRequests.id })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.companyId, issues.companyId),
+                    inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+                    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issues.id}::text`,
+                    runnableAgent(agentWakeupRequests.agentId),
+                  ),
+                ),
+            ),
+          ),
+        ),
+      );
+  }
+
   async function resolveContinuationWaitingOnReview(
     issue: typeof issues.$inferSelect,
   ) {
@@ -3466,21 +3520,11 @@ export function recoveryService(
         healthyChildren.length > 0 ||
         hasNewSourcePath
       ) {
-        if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(
-            issue.companyId,
-            issue.id,
-          );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
-        }
+        // A healthy direct child is itself the parent's wait: the parent's
+        // assignee gets the issue_children_completed wake once every child is
+        // terminal. Recording the child as a blocker as well would strand the
+        // parent if the child is cancelled, because cancelled blockers never
+        // resolve, so the parent is left as its owner set it.
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
           sourceIssueId: action.sourceIssueId,
@@ -3705,7 +3749,7 @@ export function recoveryService(
     if ((readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId)) !== issue.id) {
       return { kind: "skip" as const, reason: "invalid_issue_binding" };
     }
-    const [agent, pause, budget, stop, active, routine, goal, latest, durableWait, workspaceChildren] = await Promise.all([
+    const [agent, pause, budget, stop, active, routine, goal, latest, durableWait, workspaceChildren, waitingOnChildren] = await Promise.all([
       getAgent(run.agentId),
       isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
       isInvocationBudgetBlocked(issue, run.agentId),
@@ -3716,6 +3760,11 @@ export function recoveryService(
       getLatestIssueRun(issue.companyId, issue.id),
       hasPersistedDurableWaitPath(issue, run),
       parseObject(context.paperclipWorkspace).mode === "shared_workspace" ? healthyOpenChildIssues(issue, true) : Promise.resolve([]),
+      // Only when deciding whether to reserve a repair. Suppressing an already
+      // reserved repair at dispatch would leave a cancelled legacy run that
+      // recovery holds for board reconciliation, which would then swallow the
+      // child-completion wake, so a reserved repair runs once instead.
+      dispatchRunId === undefined ? liveOpenChildIssues(issue) : Promise.resolve([]),
     ]);
     const ownsRepair = active?.kind === "deliberate_wait_without_target" && active.ownerType === "agent";
     return decideLegacyContinuation({
@@ -3723,7 +3772,11 @@ export function recoveryService(
       gates: {
         stopped: stop.kind !== "clear" || isOperatorCancelledRun(run, run.agentId),
         paused: pause, budgetBlocked: budget,
-        pendingWait: state.hasDurableWaitingPath || durableWait || parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt),
+        // An open child with a live run or wake is a native wait target: the
+        // child-completion wake, not a disposition repair, is the parent's
+        // next step. A child that is only parked in a durable wait may be
+        // waiting on this parent's assignee, so it does not count.
+        pendingWait: state.hasDurableWaitingPath || durableWait || parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt) || waitingOnChildren.length > 0,
         activeExecution: state.hasActiveExecutionPath || latest?.id !== (dispatchRunId ?? run.id),
         ownedLifecycle: run.issueCommentStatus === "retry_queued" || run.issueCommentStatus === "retry_exhausted" ||
           Boolean(readNonEmptyString(context.goalControlRequestId)) || context.resumeSessionGoalHeartbeat === true ||
@@ -3740,6 +3793,10 @@ export function recoveryService(
     const context = parseObject(run?.contextSnapshot);
     if (!run || !parseObject(context.legacyDispositionEpisode).id) return null;
     if (!["queued", "running", "scheduled_retry"].includes(run.status)) return "repair_not_active";
+    // A child-completion wake coalesced into this repair is the parent's own
+    // wake, already admitted by the dependency gates. The repair's disposition
+    // checks (for example a parent that is now blocked) must not discard it.
+    if (dependencyReadinessWakeReason(context) === "issue_children_completed") return null;
     const episode = legacyDispositionEpisode(run);
     // Infrastructure retries retain the successful disposition source even
     // though their immediate retryOfRunId points at a failed repair attempt.
