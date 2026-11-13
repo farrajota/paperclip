@@ -8192,10 +8192,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   );
 
   // A handoff stops the run that asked for it. opencode_local is a plain
-  // process adapter: it parses the step_finish usage the killed process already
+  // process adapter: it parses the JSONL events the killed process already
   // printed, but its result reaches the executor only after Stop has settled.
+  function stepFinish(input: number, output: number, cacheRead: number, cost: number) {
+    return {
+      type: "step_finish",
+      part: { tokens: { input, output, reasoning: 0, cache: { read: cacheRead } }, cost },
+    };
+  }
+
   async function startProcessRunReportingUsageAfterStop(
-    stepFinishEvents: Array<{ input: number; output: number; cacheRead: number; cost: number }>,
+    openCodeEvents: Array<Record<string, unknown>>,
   ) {
     const actualProcess = await vi.importActual<
       typeof import("../adapters/process/execute.js")
@@ -8227,6 +8234,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         model: "openrouter/test-model",
         usage: parsed.usage,
         costUsd: parsed.costUsd,
+        summary: parsed.summary,
+        ...(parsed.sessionId
+          ? {
+              sessionId: parsed.sessionId,
+              sessionParams: { sessionId: parsed.sessionId },
+              sessionDisplayId: parsed.sessionId,
+            }
+          : {}),
       };
     }) as typeof mockAdapterExecute);
     const fixture = await seedRunFixture({
@@ -8235,23 +8250,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "idle",
       runStatus: "queued",
     });
-    const printSteps = stepFinishEvents
-      .map((step) =>
-        `console.log(${JSON.stringify(JSON.stringify({
-          type: "step_finish",
-          part: {
-            tokens: { input: step.input, output: step.output, reasoning: 0, cache: { read: step.cacheRead } },
-            cost: step.cost,
-          },
-        }))});`,
-      )
+    const printEvents = openCodeEvents
+      .map((event) => `console.log(${JSON.stringify(JSON.stringify(event))});`)
       .join(" ");
     await db
       .update(agents)
       .set({
         adapterConfig: {
           command: process.execPath,
-          args: ["-e", `${printSteps} console.log('stop ready'); setInterval(() => {}, 1000)`],
+          args: ["-e", `${printEvents} console.log('stop ready'); setInterval(() => {}, 1000)`],
           graceSec: 1,
         },
       })
@@ -8279,8 +8286,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("charges the partial usage a process reported before a handoff Stop settled", async () => {
     const { runId, agentId, issueId, heartbeat, releaseResult } =
       await startProcessRunReportingUsageAfterStop([
-        { input: 1_000, output: 60, cacheRead: 200, cost: 0.03 },
-        { input: 500, output: 40, cacheRead: 100, cost: 0.02 },
+        stepFinish(1_000, 60, 200, 0.03),
+        stepFinish(500, 40, 100, 0.02),
       ]);
 
     const stopped = await stopRunForReassignment(heartbeat, runId, issueId);
@@ -8312,9 +8319,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("charges a stopped run once across repeated Stops and later recovery passes", async () => {
     const { runId, agentId, issueId, heartbeat, releaseResult } =
-      await startProcessRunReportingUsageAfterStop([
-        { input: 800, output: 50, cacheRead: 0, cost: 0.04 },
-      ]);
+      await startProcessRunReportingUsageAfterStop([stepFinish(800, 50, 0, 0.04)]);
 
     await stopRunForReassignment(heartbeat, runId, issueId);
     releaseResult();
@@ -8331,6 +8336,95 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runtime).toMatchObject({ totalInputTokens: 800, totalOutputTokens: 50, totalCostCents: 4 });
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     expect(agent?.spentMonthlyCents).toBe(4);
+  });
+
+  it("keeps a handoff-stopped run's partial reply and lifecycle owned by Stop", async () => {
+    const { runId, agentId, companyId, issueId, heartbeat, releaseResult } =
+      await startProcessRunReportingUsageAfterStop([
+        { type: "text", part: { text: "Partial review conclusion before the handoff." } },
+        stepFinish(100, 10, 0, 0.01),
+      ]);
+    const reviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerId, companyId, name: "Reviewer", role: "engineer", status: "idle",
+      adapterType: "process", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+
+    await stopRunForReassignment(heartbeat, runId, issueId);
+    await db.update(issues).set({ assigneeAgentId: reviewerId }).where(eq(issues.id, issueId));
+    releaseResult();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+    expect(
+      events
+        .filter((event) => event.eventType === "lifecycle" && event.message?.startsWith("run cancelled"))
+        .map((event) => event.message),
+    ).toEqual(["run cancelled before issue reassignment"]);
+    expect(events.filter((event) => event.eventType === "run.presentation.resolved")).toEqual([]);
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toMatchObject({ agentId, costCents: 1 });
+  });
+
+  it("records a stopped run's session on the run without moving the agent's session pointers", async () => {
+    const { runId, agentId, companyId, issueId, heartbeat, releaseResult } =
+      await startProcessRunReportingUsageAfterStop([
+        { type: "step_start", sessionID: "ses_stopped" },
+        stepFinish(200, 20, 0, 0.02),
+      ]);
+    const successorId = randomUUID();
+
+    await stopRunForReassignment(heartbeat, runId, issueId);
+    // Stop promotes queued work; a successor can claim and finish before the
+    // stopped executor's adapter result arrives.
+    await db.insert(heartbeatRuns).values({
+      id: successorId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system",
+      status: "succeeded", contextSnapshot: { issueId }, sessionIdAfter: "ses_successor",
+      startedAt: new Date(), finishedAt: new Date(),
+    });
+    await db.insert(agentRuntimeState).values({
+      agentId, companyId, adapterType: "process", sessionId: "ses_successor",
+      lastRunId: successorId, lastRunStatus: "succeeded",
+    }).onConflictDoUpdate({
+      target: agentRuntimeState.agentId,
+      set: { sessionId: "ses_successor", lastRunId: successorId, lastRunStatus: "succeeded", lastError: null },
+    });
+    await db.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId));
+    await db.insert(agentTaskSessions).values({
+      companyId, agentId, adapterType: "process", taskKey: issueId,
+      sessionParamsJson: { sessionId: "ses_successor" }, sessionDisplayId: "ses_successor", lastRunId: successorId,
+    });
+    releaseResult();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect((await heartbeat.getRun(runId))?.sessionIdAfter).toBe("ses_stopped");
+    const [runtime] = await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId));
+    expect(runtime).toMatchObject({
+      sessionId: "ses_successor", lastRunId: successorId, lastRunStatus: "succeeded",
+      totalInputTokens: 200, totalOutputTokens: 20, totalCostCents: 2,
+    });
+    const taskSessions = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId));
+    expect(taskSessions).toEqual([
+      expect.objectContaining({ taskKey: issueId, sessionDisplayId: "ses_successor", lastRunId: successorId }),
+    ]);
+  });
+
+  it("charges the usage of a process stopped by an agent-wide cancel", async () => {
+    const { runId, agentId, heartbeat, releaseResult } =
+      await startProcessRunReportingUsageAfterStop([stepFinish(300, 30, 0, 0.03)]);
+
+    await heartbeat.cancelActiveForAgent(agentId, "Cancelled due to budget pause");
+    releaseResult();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", errorCode: "agent_paused" });
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toMatchObject({ inputTokens: 300, outputTokens: 30, costCents: 3 });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agent?.spentMonthlyCents).toBe(3);
   });
 
   it("records no cost for a run stopped before its first model step finished", async () => {
