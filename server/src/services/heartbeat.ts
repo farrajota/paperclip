@@ -1310,9 +1310,12 @@ const processRunCancellationSettlements = new Map<
     error?: unknown;
   }
 >();
-// Keep failed Stop evidence until the exact executor exits, independently of
+// Keep settled Stop evidence until the exact executor exits, independently of
 // the active owner barrier. A later Stop may retry a still-owned live child.
-const failedProcessRunCancellations = new Map<
+// A successful Stop usually settles before the killed adapter's result reaches
+// the executor; without this receipt the executor skips its late write and the
+// usage the provider already billed is never recorded.
+const settledProcessRunCancellations = new Map<
   string,
   { settled: Promise<void>; failed: boolean; error?: unknown }
 >();
@@ -25503,7 +25506,7 @@ export function heartbeatService(
         }
         const processCancellation =
           processRunCancellationSettlements.get(run.id) ??
-          failedProcessRunCancellations.get(run.id);
+          settledProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
@@ -26909,10 +26912,10 @@ export function heartbeatService(
       } finally {
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
-        // A failed owned Stop remains visible until this exact executor settles,
-        // including a graceful exit result arriving after the cancellation error.
+        // A settled owned Stop remains visible until this exact executor settles,
+        // including a result arriving after the Stop succeeded or failed.
         // It is never retained beyond the active execution's cleanup.
-        failedProcessRunCancellations.delete(run.id);
+        settledProcessRunCancellations.delete(run.id);
         executionControl.finish();
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
@@ -30083,16 +30086,16 @@ export function heartbeatService(
           if (processCancellationSettlement) {
             processCancellationSettlement.failed = true;
             processCancellationSettlement.error = error;
-            if (activeRunExecutions.has(run.id)) {
-              failedProcessRunCancellations.set(
-                run.id,
-                processCancellationSettlement,
-              );
-            }
           }
           throw error;
         } finally {
           if (processCancellationSettlement) {
+            if (activeRunExecutions.has(run.id)) {
+              settledProcessRunCancellations.set(
+                run.id,
+                processCancellationSettlement,
+              );
+            }
             if (
               processRunCancellationSettlements.get(run.id) ===
               processCancellationSettlement
