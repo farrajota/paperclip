@@ -1310,9 +1310,13 @@ const processRunCancellationSettlements = new Map<
     error?: unknown;
   }
 >();
-// Keep failed Stop evidence until the exact executor exits, independently of
+// Keep settled Stop evidence until the exact executor exits, independently of
 // the active owner barrier. A later Stop may retry a still-owned live child.
-const failedProcessRunCancellations = new Map<
+// A successful Stop usually settles before the killed adapter's result reaches
+// the executor; without this receipt the executor skips its late write and the
+// usage the provider already billed is never recorded. The agent-wide cancel
+// leaves the same receipt for the processes it stops.
+const settledProcessRunCancellations = new Map<
   string,
   { settled: Promise<void>; failed: boolean; error?: unknown }
 >();
@@ -20030,6 +20034,7 @@ export function heartbeatService(
     result: AdapterExecutionResult,
     session: { legacySessionId: string | null },
     normalizedUsage?: UsageTotals | null,
+    options: { chargeOnly?: boolean } = {},
   ) {
     await ensureRuntimeState(agent);
     const usage = normalizedUsage ?? normalizeUsageTotals(result.usage);
@@ -20061,11 +20066,17 @@ export function heartbeatService(
     await db
       .update(agentRuntimeState)
       .set({
-        adapterType: agent.adapterType,
-        sessionId: session.legacySessionId,
-        lastRunId: run.id,
-        lastRunStatus: run.status,
-        lastError: run.error ?? null,
+        // A charge-only write comes from a run whose Stop already settled. The
+        // agent's session and last-run pointers may belong to a successor now.
+        ...(options.chargeOnly
+          ? {}
+          : {
+              adapterType: agent.adapterType,
+              sessionId: session.legacySessionId,
+              lastRunId: run.id,
+              lastRunStatus: run.status,
+              lastError: run.error ?? null,
+            }),
         totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
         totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
         totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
@@ -25503,7 +25514,7 @@ export function heartbeatService(
         }
         const processCancellation =
           processRunCancellationSettlements.get(run.id) ??
-          failedProcessRunCancellations.get(run.id);
+          settledProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
@@ -25725,11 +25736,55 @@ export function heartbeatService(
           // adapter's semantic result, usage, logs, or presentation decision.
           // Only complete the late metadata write when the reconciler chose the
           // same terminal status; a conflicting terminal outcome remains owned
-          // by the path that won the compare-and-set. Owned legacy cancellation
-          // likewise keeps the provider session, logs, and usage after Stop wins.
+          // by the path that won the compare-and-set.
           if (
-            (adapterResult.nativeFinalization ||
-              (processCancellation && !processCancellation.failed && status === "cancelled")) &&
+            !adapterResult.nativeFinalization &&
+            processCancellation &&
+            !processCancellation.failed &&
+            status === "cancelled" &&
+            persistedRunWrite.run?.status === "cancelled"
+          ) {
+            // An owned process Stop already released the issue, settled the
+            // wakeup, recorded the lifecycle event and promoted queued work.
+            // Record only what the provider did: usage, the run's own session
+            // and logs, then charge it. Presentation, comments and the agent's
+            // session pointers stay with Stop and any successor it promoted.
+            // The usage_json guard keeps the charge to exactly once.
+            const stoppedRun = await db
+              .update(heartbeatRuns)
+              .set({
+                usageJson,
+                sessionIdAfter: finalRunPatch.sessionIdAfter,
+                stdoutExcerpt,
+                stderrExcerpt,
+                logBytes: logSummary?.bytes,
+                logSha256: logSummary?.sha256,
+                logCompressed: logSummary?.compressed ?? false,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, run.id),
+                  eq(heartbeatRuns.status, "cancelled"),
+                  isNull(heartbeatRuns.usageJson),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (stoppedRun) {
+              await updateRuntimeState(
+                agent,
+                stoppedRun,
+                adapterResult,
+                { legacySessionId: null },
+                normalizedUsage,
+                { chargeOnly: true },
+              );
+            }
+            return;
+          }
+          if (
+            adapterResult.nativeFinalization &&
             persistedRunWrite.run?.status === status
           ) {
             persistedRun = await db
@@ -26909,10 +26964,10 @@ export function heartbeatService(
       } finally {
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
-        // A failed owned Stop remains visible until this exact executor settles,
-        // including a graceful exit result arriving after the cancellation error.
+        // A settled owned Stop remains visible until this exact executor settles,
+        // including a result arriving after the Stop succeeded or failed.
         // It is never retained beyond the active execution's cleanup.
-        failedProcessRunCancellations.delete(run.id);
+        settledProcessRunCancellations.delete(run.id);
         executionControl.finish();
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
@@ -30083,16 +30138,16 @@ export function heartbeatService(
           if (processCancellationSettlement) {
             processCancellationSettlement.failed = true;
             processCancellationSettlement.error = error;
-            if (activeRunExecutions.has(run.id)) {
-              failedProcessRunCancellations.set(
-                run.id,
-                processCancellationSettlement,
-              );
-            }
           }
           throw error;
         } finally {
           if (processCancellationSettlement) {
+            if (activeRunExecutions.has(run.id)) {
+              settledProcessRunCancellations.set(
+                run.id,
+                processCancellationSettlement,
+              );
+            }
             if (
               processRunCancellationSettlements.get(run.id) ===
               processCancellationSettlement
@@ -30155,6 +30210,7 @@ export function heartbeatService(
         run.runtimeMode !== "native"
           ? captureAdapterStopOwnership(run.id)
           : undefined;
+      let releaseStopReceipt: (() => void) | undefined;
       try {
         if (stopOwnership?.control) {
           await cancelRunInternal(run.id, reason, { errorCode });
@@ -30169,6 +30225,21 @@ export function heartbeatService(
             runId: run.id,
             reason,
             runtimeMode: run.runtimeMode,
+          });
+        }
+        // This path writes the cancelled status before it stops the process,
+        // so the executor finds the run terminal. Leave the receipt an owned
+        // Stop leaves, so the executor still charges what the provider billed.
+        if (
+          run.runtimeMode !== "native" &&
+          runningProcesses.has(run.id) &&
+          activeRunExecutions.has(run.id)
+        ) {
+          settledProcessRunCancellations.set(run.id, {
+            settled: new Promise<void>((resolve) => {
+              releaseStopReceipt = resolve;
+            }),
+            failed: false,
           });
         }
         const persistedCancellationResult =
@@ -30204,8 +30275,11 @@ export function heartbeatService(
           });
         }
         runningProcesses.delete(run.id);
+        // The executor waits on this receipt; never make it wait on promotion.
+        releaseStopReceipt?.();
         await releaseIssueExecutionAndPromote(run);
       } finally {
+        releaseStopReceipt?.();
         stopOwnership?.release();
       }
     }
