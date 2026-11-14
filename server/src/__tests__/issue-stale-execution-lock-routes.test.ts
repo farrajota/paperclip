@@ -2,14 +2,19 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
+  documentRevisions,
+  documents,
   heartbeatRuns,
   issueComments,
+  issueDocuments,
+  issueRecoveryActions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -19,6 +24,27 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
+
+// Lets a test run work between the route's unlocked issue read and its
+// checkout-ownership guard, where a concurrent scheduler tick can commit.
+const betweenIssueReadAndOwnershipGuard = vi.hoisted(() => ({ run: null as null | (() => Promise<void>) }));
+vi.mock("../services/task-watchdog-scope.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/task-watchdog-scope.js")>(
+    "../services/task-watchdog-scope.js",
+  );
+  return {
+    ...actual,
+    resolveTaskWatchdogMutationScope: async (
+      ...args: Parameters<typeof actual.resolveTaskWatchdogMutationScope>
+    ) => {
+      const run = betweenIssueReadAndOwnershipGuard.run;
+      betweenIssueReadAndOwnershipGuard.run = null;
+      if (run) await run();
+      return actual.resolveTaskWatchdogMutationScope(...args);
+    },
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -41,6 +67,12 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   }, 20_000);
 
   afterEach(async () => {
+    betweenIssueReadAndOwnershipGuard.run = null;
+    await db.delete(issueDocuments);
+    await db.delete(documentRevisions);
+    await db.delete(documents);
+    await db.delete(issueRecoveryActions);
+    await db.delete(agentWakeupRequests);
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
@@ -373,6 +405,64 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body?.error).toBe("Issue run ownership conflict");
+  });
+
+  it("keeps a paused owner's document PUT when stranded recovery runs inside its ownership guard", async () => {
+    const { companyId } = await seedCompanyAgentAndRuns();
+    const pausedAgentId = randomUUID();
+    const liveRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values({
+      id: pausedAgentId,
+      companyId,
+      name: "PausedCoder",
+      role: "engineer",
+      status: "paused",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId,
+      companyId,
+      agentId: pausedAgentId,
+      status: "running",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId, taskId: issueId },
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Paused owner still publishing",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: pausedAgentId,
+      checkoutRunId: liveRunId,
+      executionRunId: liveRunId,
+      executionLockedAt: new Date(),
+      responsibleUserId: "responsible-user",
+    });
+    betweenIssueReadAndOwnershipGuard.run = async () => {
+      await heartbeatService(db).reconcileStrandedAssignedIssues();
+    };
+
+    const app = createApp(agentActor(companyId, pausedAgentId, liveRunId));
+    const put = await request(app)
+      .put(`/api/issues/${issueId}/documents/run-output`)
+      .send({ title: "Run output", format: "markdown", body: "# Output\n" });
+    const readback = await request(app).get(`/api/issues/${issueId}/documents/run-output`);
+
+    expect(betweenIssueReadAndOwnershipGuard.run).toBeNull();
+    expect(put.status, JSON.stringify(put.body)).toBe(201);
+    expect(readback.status).toBe(200);
+    const row = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ status: "in_progress", checkoutRunId: liveRunId });
   });
 
   it("preserves live checkout ownership on checkout conflicts without retry side effects", async () => {
