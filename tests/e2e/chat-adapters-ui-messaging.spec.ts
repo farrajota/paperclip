@@ -1437,6 +1437,15 @@ test.describe("Exact failed chat run retry", () => {
           surface === "agent run"
             ? `/${seed.prefix}/agents/${seed.agentId}/runs/${failedRunId}`
             : `/${seed.prefix}/inbox/all`;
+        // The UUID route canonicalizes to the agent's URL key, which re-reads
+        // the agent under the new route reference.
+        const canonicalAgentRead =
+          surface === "agent run" && outcome === "denied"
+            ? page.waitForResponse(
+                (response) =>
+                  new URL(response.url()).pathname === "/api/agents/maya",
+              )
+            : null;
         await page.goto(startPath);
         const retry = page
           .getByRole("button", { name: "Retry", exact: true })
@@ -1455,6 +1464,12 @@ test.describe("Exact failed chat run retry", () => {
         });
         if (outcome === "denied") {
           await expect(page.getByText(denial, { exact: true })).toBeVisible();
+          if (canonicalAgentRead) {
+            // The denial must survive the canonical agent read; it is the
+            // operator's only explanation for why the retry did not start.
+            await canonicalAgentRead;
+            await expect(page.getByText(denial, { exact: true })).toBeVisible();
+          }
           if (surface !== "agent run") {
             await expect(
               page.getByText("Run retry failed", { exact: true }),
