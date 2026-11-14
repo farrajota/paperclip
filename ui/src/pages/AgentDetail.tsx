@@ -813,6 +813,14 @@ export function AgentDetail() {
     queryKey: [...queryKeys.agents.detail(routeAgentRef), lookupCompanyId ?? null],
     queryFn: () => agentsApi.get(routeAgentRef, lookupCompanyId),
     enabled: canFetchAgent,
+    // Canonicalizing the route (UUID to URL key) or resolving the company
+    // changes this key for the same agent. Keep rendering that agent while the
+    // new key loads, so the page does not fall back to a skeleton and discard
+    // the open run's local state, such as a retry denial.
+    placeholderData: (previous) =>
+      previous && (previous.id === routeAgentRef || agentRouteRef(previous) === routeAgentRef)
+        ? previous
+        : undefined,
   });
   const resolvedCompanyId = agent?.companyId ?? selectedCompanyId;
   const canonicalAgentRef = agent ? agentRouteRef(agent) : routeAgentRef;
