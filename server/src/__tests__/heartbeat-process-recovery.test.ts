@@ -7255,6 +7255,45 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("does not escalate a paused assignee's issue while its own running run still holds the lock", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({ agentStatus: "paused", runStatus: "running" });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+    });
+    await expect(issueService(db).assertCheckoutOwner(issueId, agentId, runId)).resolves.toMatchObject({
+      status: "in_progress",
+      checkoutRunId: runId,
+    });
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+  });
+
+  it("escalates a paused assignee's issue once its locking run is no longer running", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({ agentStatus: "paused", runStatus: "running" });
+    const heartbeat = heartbeatService(db);
+    expect((await heartbeat.reconcileStrandedAssignedIssues()).escalated).toBe(0);
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", errorCode: "agent_paused", error: "agent paused", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+  });
+
   it("keeps a legacy agent-owned recovery action readable without scheduling another takeover wake", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

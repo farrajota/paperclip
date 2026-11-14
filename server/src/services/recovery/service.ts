@@ -4545,6 +4545,18 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
+      // A non-invokable owner can still have a run that holds this issue's
+      // lock, e.g. between a pause and the end of that run's cancellation.
+      // Escalating now would clear the lock under the live run and fail its
+      // final writes with 409; the next tick escalates once the run is terminal.
+      const ownerRunHoldsLock =
+        latestRun?.status === "running" &&
+        latestRun.agentId === agentId &&
+        (issue.checkoutRunId === latestRun.id || issue.executionRunId === latestRun.id);
+      if (issue.status !== "in_review" && !agentInvokable && ownerRunHoldsLock) {
+        result.skipped += 1;
+        continue;
+      }
       if (issue.status !== "in_review" && !agentInvokable) {
         const classification = classifyContinuationFailure(latestRun);
         if (
