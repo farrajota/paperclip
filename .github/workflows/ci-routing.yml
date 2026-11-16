@@ -105,11 +105,7 @@ jobs:
             ' <<< "$comparison" >/dev/null 2>&1
           }
 
-          # Fork release line: every merge into zay/main is a release gate, so
-          # a stacked middle PR still runs the full suite.
-          if [[ "$PR_BASE_REF" == 'zay/main' ]]; then
-            reason='zay/main release gate'
-          elif jq -e 'type == "object"' <<< "$STACK_JSON" >/dev/null 2>&1; then
+          if jq -e 'type == "object"' <<< "$STACK_JSON" >/dev/null 2>&1; then
             stack_position="$(jq -r '.position // empty' <<< "$STACK_JSON")"
             stack_size="$(jq -r '.size // empty' <<< "$STACK_JSON")"
             stack_base_ref="$(jq -r '.base.ref // empty' <<< "$STACK_JSON")"
@@ -131,6 +127,15 @@ jobs:
               full_ci='false'
               reason='middle pull request in stack'
             fi
+          fi
+
+          # Fork release line: every merge into zay/main is a release gate, so
+          # a stacked middle PR still runs the full suite. This runs after the
+          # stack parsing so diff_covers_stack keeps its upstream meaning and
+          # malformed stack metadata still blocks the release-notes skip.
+          if [[ "$PR_BASE_REF" == 'zay/main' && "$full_ci" == 'false' ]]; then
+            full_ci='true'
+            reason='zay/main release gate'
           fi
 
           if [[ "$full_ci" == 'true' && "$diff_covers_stack" == 'true' ]] &&
