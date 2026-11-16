@@ -571,6 +571,15 @@ const failedProcessRunCancellations = new Map<
   string,
   { settled: Promise<void>; failed: boolean; error?: unknown }
 >();
+// Keep a successful owned Stop receipt until the exact executor exits, too.
+// A successful Stop usually settles before the killed adapter's result reaches
+// the executor; without this receipt the executor skips its late write, so the
+// run never records its provider session (session-delta usage resolution reads
+// it) or its log summary.
+const settledProcessRunCancellations = new Map<
+  string,
+  { settled: Promise<void>; failed: boolean; error?: unknown }
+>();
 // Background heartbeat executions are dispatched fire-and-forget (see
 // startNextQueuedRunForAgent), so the promise that resolves once a run's DB
 // writes are fully flushed is otherwise unobservable. Track those promises here
@@ -1431,6 +1440,7 @@ export function heartbeatService(
     mergeRunStopMetadataForAgent,
     setRunStatusFromLive,
     failedProcessRunCancellations,
+    settledProcessRunCancellations,
     setWakeupStatus,
     appendRunEvent,
     finalizeAgentStatus,
@@ -1772,6 +1782,7 @@ export function heartbeatService(
     traceStore,
     processRunCancellationSettlements,
     failedProcessRunCancellations,
+    settledProcessRunCancellations,
   });
 
   async function executeRun(
@@ -3907,10 +3918,11 @@ export function heartbeatService(
       } finally {
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
-        // A failed owned Stop remains visible until this exact executor settles,
-        // including a graceful exit result arriving after the cancellation error.
+        // A settled owned Stop remains visible until this exact executor settles,
+        // including a result arriving after the Stop succeeded or failed.
         // It is never retained beyond the active execution's cleanup.
         failedProcessRunCancellations.delete(run.id);
+        settledProcessRunCancellations.delete(run.id);
         executionControl.finish();
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);

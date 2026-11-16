@@ -78,6 +78,7 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   traceStore: Pick<ReturnType<typeof providerTraceStore>, "finalize">;
   processRunCancellationSettlements: Pick<HeartbeatRunControlDependencies["processRunCancellationSettlements"], "get">;
   failedProcessRunCancellations: HeartbeatRunCompletionDependencies["processRunCancellationSettlements"];
+  settledProcessRunCancellations: HeartbeatRunCompletionDependencies["processRunCancellationSettlements"];
 }
 
 interface RunCompletionOutput {
@@ -381,6 +382,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     traceStore,
     processRunCancellationSettlements,
     failedProcessRunCancellations,
+    settledProcessRunCancellations,
   } = dependencies;
 
   async function completeRun(input: CompleteHeartbeatRunInput) {
@@ -391,6 +393,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const { handle, outputProgressState, flushOutputProgress } = output;
     const processCancellation =
       processRunCancellationSettlements.get(run.id) ??
+      settledProcessRunCancellations.get(run.id) ??
       failedProcessRunCancellations.get(run.id);
     await processCancellation?.settled;
     let outcome: RunSessionOutcome;
@@ -649,6 +652,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     ));
     let persistedRun: typeof heartbeatRuns.$inferSelect | null =
       persistedRunWrite.run;
+    let ownedProcessStop = false;
     if (!persistedRunWrite.updated) {
       persistedRun = null;
       // Native reconciliation can commit and project the terminal status in
@@ -659,9 +663,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       // same terminal status; a conflicting terminal outcome remains owned
       // by the path that won the compare-and-set. Owned legacy cancellation
       // likewise keeps the provider session, logs, and usage after Stop wins.
+      ownedProcessStop = Boolean(
+        !adapterResult.nativeFinalization &&
+          processCancellation &&
+          !processCancellation.failed &&
+          status === "cancelled",
+      );
       if (
-        (adapterResult.nativeFinalization ||
-          (processCancellation && !processCancellation.failed && status === "cancelled")) &&
+        (adapterResult.nativeFinalization || ownedProcessStop) &&
         persistedRunWrite.run?.status === status
       ) {
         persistedRun = await db
@@ -706,6 +715,23 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       await measureRunPhase("completion.cost", () => accountRunCost(db, persistedRun!.id, budgetHooks)).catch((err) => {
         logger.error({ err, runId: run.id }, "Run accounting queued for recovery");
       });
+      if (ownedProcessStop) {
+        // An owned process Stop already released the issue, settled the
+        // wakeup, recorded the lifecycle event and promoted queued work. Keep
+        // only what the provider did (usage, the run's own session and logs,
+        // and its charge above). Presentation, comments and the agent's
+        // session pointers stay with Stop and any successor it promoted.
+        if (await pendingCaseHandoffForRun(db, persistedRun.id, persistedRun.companyId)) {
+          // A case handoff deliberately keeps the outgoing agent's own session,
+          // as the completed-run path below does, so its next phase resumes it.
+          await persistSessionState(persistedRun);
+          await releaseIssueExecutionAndPromote(persistedRun, { suppressImmediateRecovery: true });
+        }
+        await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
+          wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+        });
+        return;
+      }
       persistedRun =
         (await measureRunPhase("completion.liveness", () => classifyAndPersistRunLiveness(
           persistedRun!,
