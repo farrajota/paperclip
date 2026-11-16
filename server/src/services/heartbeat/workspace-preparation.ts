@@ -38,6 +38,7 @@ import { logger } from "../../middleware/logger.js";
 import { createGitRemoteAuthProvider } from "../git-credentials.js";
 import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd } from "../native-runtime/native-workspace-sync.js";
 import { parseObject } from "../../adapters/utils.js";
+import { runContextSnapshotWrite } from "./run-preparation.js";
 import { materializeNativeChatTaskRoot } from "../native-runtime/native-chat-workspace.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { withIsolatedRepositorySourceLock } from "../isolated-remote-workspace-source.js";
@@ -1079,7 +1080,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: runContextSnapshotWrite(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));

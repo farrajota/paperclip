@@ -3313,7 +3313,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const, admitted: true };
             }
-            if (durableRequest || wakeCommentId ||
+            // An execution-policy handoff stops the executor's own run and then
+            // wakes the next stage participant while that run is still releasing
+            // its lease. Nothing re-sends a skipped stage wake, so keep it durable;
+            // that run's executor cleanup re-admits it
+            // (run-control readmitExecutionStageHandoffsForRun). Any other owner
+            // keeps the terminal wait receipt below.
+            const awaitsInterruptedRunCleanup =
+              enrichedContextSnapshot.source === "issue.execution_stage" &&
+              executionBlocker.cause === "execution_owner_active" &&
+              executionBlocker.recoveryActionId === null &&
+              executionBlocker.runId !== null &&
+              executionBlocker.runId === readNonEmptyString(enrichedContextSnapshot.interruptedRunId);
+            if (durableRequest || wakeCommentId || awaitsInterruptedRunCleanup ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
                 readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
               await tx.insert(agentWakeupRequests).values({
