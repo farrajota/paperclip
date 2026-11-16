@@ -1111,10 +1111,12 @@ describeEmbeddedPostgres("secretService", () => {
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
+    const cleanupEntered = deferred<void>();
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
+      cleanupEntered.resolve();
       await cleanupGate;
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await awaitEntryOrOperationFailure(cleanupEntered.promise, cleanupCall, "cleanupCall");
 
     let updateResolved = false;
     const updateCall = svc.update(secret.id, { status: "archived" }).then((result) => {
@@ -1148,10 +1150,12 @@ describeEmbeddedPostgres("secretService", () => {
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
+    const cleanupEntered = deferred<void>();
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
+      cleanupEntered.resolve();
       await cleanupGate;
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await awaitEntryOrOperationFailure(cleanupEntered.promise, cleanupCall, "cleanupCall");
 
     let removeResolved = false;
     const removeCall = svc.remove(secret.id).then((result) => {
@@ -1201,15 +1205,17 @@ describeEmbeddedPostgres("secretService", () => {
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
+    const cleanupEntered = deferred<void>();
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
       events.push("cleanup-enter");
+      cleanupEntered.resolve();
       await cleanupGate;
       await rm(accountHomeDir, { recursive: true, force: true });
       events.push("cleanup-exit");
     });
-    // Give the cleanup a chance to acquire the lock before the adapter
-    // config normalization starts racing for the same lock.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Start the adapter config normalization only once the cleanup
+    // confirmably holds the lock.
+    await awaitEntryOrOperationFailure(cleanupEntered.promise, cleanupCall, "cleanupCall");
     const normalizeCall = svc.normalizeAdapterConfigForPersistence(
       companyId,
       { apiKey: accountHomeDir },
