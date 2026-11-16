@@ -26,6 +26,7 @@ describe("stopped task recovery notice", () => {
     await act(async () => root.render(<QueryClientProvider client={client}>
       <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried} blocker={{
         recoveryActionId: "recovery", runId: "failed-run", agentId: "agent", cause: "legacy_execution_requires_reconciliation",
+        canRetry: true,
         nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
       }} />
     </QueryClientProvider>));
@@ -60,6 +61,19 @@ describe("stopped task recovery notice", () => {
       await act(async () => container.querySelector<HTMLButtonElement>("button")!.click());
       expect(agentsApi.retryFailedRun).toHaveBeenCalledWith("agent", "cancelled-run", "company");
     }
+  });
+  it("offers no Retry for a failed legacy hold the server reports as not retryable", async () => {
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <ExecutionBlockerNotice companyId="company" issueId="task" onRetried={onRetried} blocker={{
+        recoveryActionId: "recovery", runId: "failed-run", agentId: "agent", cause: "legacy_execution_requires_reconciliation",
+        canRetry: false, canContinue: false,
+        nextAction: "Record the observed outcome through execution reconciliation to release this task.",
+      }} />
+    </QueryClientProvider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    expect(container.textContent).toContain("execution reconciliation");
+    expect(Array.from(container.querySelectorAll("button"))).toEqual([]);
+    expect(container.querySelector("a")?.getAttribute("href")).toBe("/agents/agent/runs/failed-run");
   });
   it("keeps removed-chat guidance without suggesting a message to an unavailable destination", async () => {
     await act(async () => root.render(<QueryClientProvider client={client}>
