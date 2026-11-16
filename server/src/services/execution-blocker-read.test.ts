@@ -18,7 +18,9 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
   async function fixture(patch: Partial<typeof heartbeatRuns.$inferInsert> = {}, extraEvidence: Record<string, unknown> = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Blocker fixture", issuePrefix: companyId.slice(0, 8) });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Blocker agent", adapterType: "process", status: "active" });
+    // Fork: the agent matches the run's recorded adapter. Admission refuses a
+    // process agent on this hold, so the blocker no longer offers it Retry.
+    await db.insert(agents).values({ id: agentId, companyId, name: "Blocker agent", adapterType: "paperclip_runner", status: "active" });
     await db.insert(issues).values({ id: issueId, companyId, title: "Blocker task", status: "blocked", assigneeAgentId: agentId });
     const payload = randomBytes(128 * 1024).toString("base64");
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "failed", runtimeMode: "legacy",

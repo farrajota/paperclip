@@ -27,6 +27,7 @@ import { CONVERSATION_CONTINUATION_POLICY } from "./conversation-continuation.js
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
+import { taskInterruptionPresentation } from "./task-interruption-presentation.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { recordNativeFinalizationFailure } from "./native-runtime/native-run-finalizer.js";
 const support = await getEmbeddedPostgresTestSupport();
@@ -1005,6 +1006,70 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, waiting.id)))[0])
       .toMatchObject({ status: "coalesced", runId: successors[0].id });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  async function seedFailedLegacyHold(adapterType: string) {
+    const f = await seed();
+    await db.update(agents).set({ adapterType }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "failed", nativeIssueId: null,
+      runnerProfileJson: { adapterDispatch: { adapterType } } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    return f;
+  }
+
+  it.each(["hetzner_claude", "process"])("offers no retry for a held %s run because neither retry nor comment can be admitted", async adapterType => {
+    const f = await seedFailedLegacyHold(adapterType);
+    const notice = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(notice).toMatchObject({ cause: "legacy_execution_requires_reconciliation", canRetry: false, canContinue: false });
+    expect(notice?.nextAction).not.toContain("Try again");
+    expect(notice?.nextAction).not.toContain("send a new message");
+    expect(notice?.nextAction).toContain("reconcil");
+  });
+
+  it("offers no retry for a held process run after the agent was switched to a conversation adapter", async () => {
+    const f = await seedFailedLegacyHold("process");
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
+    const notice = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(notice).toMatchObject({ cause: "legacy_execution_requires_reconciliation", canRetry: false, canContinue: false });
+    expect(notice?.nextAction).not.toContain("Try again");
+    expect(notice?.nextAction).toContain("reconcil");
+  });
+
+  it("keeps the retry offer for a held run on a conversation adapter", async () => {
+    const f = await seedFailedLegacyHold("claude_local");
+    const notice = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(notice).toMatchObject({ canRetry: true });
+    expect(notice?.nextAction).toContain("Try again or send a new message to continue");
+  });
+
+  async function heldTaskPresentation(f: Fixture) {
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    return taskInterruptionPresentation(db, task);
+  }
+
+  it.each(["hetzner_claude", "process"])("offers no task-page Retry for a held %s run that admission would reject", async adapterType => {
+    const f = await seedFailedLegacyHold(adapterType);
+    expect(await heldTaskPresentation(f)).toMatchObject({ state: "failed", responsibility: "system", canRetry: false });
+  });
+
+  it("offers no task-page Retry for a held process run after the agent was switched to a conversation adapter", async () => {
+    const f = await seedFailedLegacyHold("process");
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
+    expect(await heldTaskPresentation(f)).toMatchObject({ state: "failed", canRetry: false });
+  });
+
+  it("keeps the task-page Retry for a held run on a conversation adapter", async () => {
+    const f = await seedFailedLegacyHold("claude_local");
+    expect(await heldTaskPresentation(f)).toMatchObject({ state: "failed", responsibility: "system", canRetry: true });
+  });
+
+  it("keeps the task-page Retry for a failed process run without an execution hold", async () => {
+    const f = await seedFailedLegacyHold("process");
+    await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    expect(await heldTaskPresentation(f)).toMatchObject({ state: "failed", canRetry: true });
   });
 
   it.each(["launch", "provider", "cleanup"])("retains a pre-dispatch review wait with contradictory %s evidence", async kind => {

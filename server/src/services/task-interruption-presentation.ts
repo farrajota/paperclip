@@ -1,4 +1,5 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { z } from "zod";
 import { agents, agentWakeupRequests, approvals, companies, heartbeatRuns, issueApprovals, issueRecoveryActions,
   issues, issueTreeHoldMembers, issueTreeHolds, projects, type Db } from "@paperclipai/db";
 import type { TaskInterruptionPresentation } from "@paperclipai/shared";
@@ -7,6 +8,7 @@ import { readSystemRecovery } from "./system-recovery-state.js";
 import { PROJECT_ACCESS_DENIED } from "./project-access-denial.js";
 import { authorizationService } from "./authorization.js";
 import { taskWorkspaceProjectRequirements } from "./task-workspace-access.js";
+import { executionBlockerPredicate, supportsExplicitContinuation } from "./execution-blocker.js";
 
 type ProjectionIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId" | "projectId">;
 type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
@@ -24,6 +26,9 @@ type ProjectionState = {
   company?: Pick<typeof companies.$inferSelect, "status" | "pauseReason">;
   paused: boolean;
   approval: boolean;
+  /** False when an execution hold routes Retry through explicit continuation
+   * admission and that admission always refuses this run's adapter. */
+  retryAdmissible?: boolean;
 };
 
 /** Recognize old persisted failures without displaying arbitrary run error text. */
@@ -65,14 +70,15 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
       userAction: "project_access", projectAccess };
   }
   const retryAt = system?.nextAttemptAt ?? run.scheduledRetryAt?.getTime();
+  const canRetry = input.retryAdmissible !== false;
   if (retryAt && retryAt > now) return { ...base, state: "retry_scheduled",
-    nextRetryAt: new Date(retryAt).toISOString(), canRetry: true };
+    nextRetryAt: new Date(retryAt).toISOString(), canRetry };
   const activeObservation = action?.evidence.systemRecoveryActiveAt;
   if (system?.state === "running" && typeof activeObservation === "number" &&
       activeObservation > now - 45_000) return { ...base, state: "working" };
   if (wait && wait.requestedAt.getTime() > now - 10_000 && system?.state !== "exhausted")
     return { ...base, state: "working" };
-  return { ...base, state: "failed", canRetry: true, ...(projectAccess ? { projectAccess } : {}) };
+  return { ...base, state: "failed", canRetry, ...(projectAccess ? { projectAccess } : {}) };
 }
 
 /** Batch list reads rather than doing seven queries per row. Keep run logs and
@@ -121,6 +127,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     inArray(sql`${issueRecoveryActions.evidence}->>'runId'`, runIds),
     sql`${issueRecoveryActions.evidence} ? 'systemRecovery'`,
   )).orderBy(issueRecoveryActions.sourceIssueId, desc(issueRecoveryActions.createdAt)) : [];
+  const retryRefused = await heldRetryRefusedIssueIds(db, companyId, ids);
   const byIssue = <T extends { issueId: string }>(rows: T[]) => new Map(rows.map(row => [row.issueId, row]));
   const runMap = byIssue(runs), waitMap = byIssue(waits);
   // Recheck current authority, including standard trust, root-issue grants and
@@ -160,9 +167,40 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       workspaceSelectionAvailable: required?.available ?? false,
       agent: agentMap.get(issue.assigneeAgentId ?? ""), project: projectMap.get(issue.projectId ?? ""),
       company: companyRows[0], paused: pauses.has(issue.id), approval: approvalsSet.has(issue.id),
+      retryAdmissible: !retryRefused.has(issue.id),
     }));
   }
   return result;
+}
+
+/** With an execution hold, Retry is admitted only by explicit continuation,
+ * which re-checks every hold's run; one refused adapter refuses the Retry.
+ * Only the adapter type is read from the run profile, never its prompts. */
+async function heldRetryRefusedIssueIds(db: Db, companyId: string, issueIds: string[]): Promise<Set<string>> {
+  const holds = await db.select({ issueId: issueRecoveryActions.sourceIssueId, cause: issueRecoveryActions.cause,
+    evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.sourceIssueId, issueIds),
+    executionBlockerPredicate(),
+  ));
+  const heldRuns = holds.flatMap(hold => {
+    const runId = z.string().guid().safeParse(hold.evidence.runId ?? hold.evidence.sourceRunId);
+    return runId.success ? [{ ...hold, runId: runId.data }] : [];
+  });
+  const refused = new Set<string>();
+  if (!heldRuns.length) return refused;
+  const runs = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+    runtimeMode: heartbeatRuns.runtimeMode,
+    runnerProfileJson: sql<Record<string, unknown> | null>`jsonb_build_object('adapterDispatch',
+      jsonb_build_object('adapterType', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->'adapterType'))`,
+  }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+    inArray(heartbeatRuns.id, [...new Set(heldRuns.map(hold => hold.runId))])));
+  const runMap = new Map(runs.map(run => [run.id, run]));
+  for (const hold of heldRuns) {
+    const run = runMap.get(hold.runId);
+    if (run && !refused.has(hold.issueId) && !await supportsExplicitContinuation(db, companyId, hold.cause, run))
+      refused.add(hold.issueId);
+  }
+  return refused;
 }
 
 export async function taskInterruptionPresentation(db: Db, issue: ProjectionIssue) {
