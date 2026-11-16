@@ -65,6 +65,7 @@ function callbacks(db: Db) {
     traceStore: { finalize: vi.fn<Dependencies["traceStore"]["finalize"]>() },
     processRunCancellationSettlements: new Map<string, { settled: Promise<void>; failed: boolean }>(),
     failedProcessRunCancellations: new Map<string, { settled: Promise<void>; failed: boolean }>(),
+    settledProcessRunCancellations: new Map<string, { settled: Promise<void>; failed: boolean }>(),
   } satisfies Dependencies;
 }
 
@@ -187,6 +188,27 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       expect((await read(f.run.id)).sessionIdAfter).toBe("provider-session");
       expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "cancelled", expect.any(String), expect.any(Object));
     } else expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
+  it("records and charges a run whose owned Stop settled first without replaying its completion", async () => {
+    const f = await fixture();
+    const finishedAt = new Date("2026-11-13T23:00:00Z");
+    await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "issue_reassigned", error: "Cancelled before issue reassignment", finishedAt })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    f.deps.settledProcessRunCancellations.set(f.run.id, { settled: Promise.resolve(), failed: false });
+    f.controller.abort();
+    await f.completion.completeRun(f.input);
+    expect(await read(f.run.id)).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned", finishedAt,
+      sessionIdAfter: "provider-session", logBytes: 123, logSha256: "log-hash", costAccountingPending: false, costAccountedAt: expect.any(Date),
+      usageJson: { inputTokens: 20, cachedInputTokens: 5, outputTokens: 8 } });
+    expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, f.run.id))).toHaveLength(1);
+    // Stop owns the wakeup, lifecycle, presentation and the agent's session pointers.
+    expect(f.deps.setWakeupStatus).not.toHaveBeenCalled();
+    expect(f.deps.updateRuntimeState).not.toHaveBeenCalled();
+    expect(f.deps.upsertTaskSession).not.toHaveBeenCalled();
+    expect(f.deps.findLatestCompletedFinalAgentMessage).not.toHaveBeenCalled();
+    expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "cancelled", expect.any(String), expect.any(Object));
   });
 
   it("attributes an adapter stop caused by a lost controller lease", async () => {

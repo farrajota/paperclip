@@ -183,6 +183,8 @@ export interface HeartbeatRunControlDependencies extends Pick<ReturnType<typeof 
   activeRunExecutions: Set<string>;
   processRunCancellationSettlements: Map<string, ProcessRunCancellationSettlement>;
   failedProcessRunCancellations: Map<string, ProcessRunCancellationSettlement>;
+  // The executor reads this successful owned Stop receipt after Stop settled.
+  settledProcessRunCancellations: Map<string, ProcessRunCancellationSettlement>;
 }
 
 export function leaseReleaseStatusForRunStatus(
@@ -336,6 +338,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     mergeRunStopMetadataForAgent,
     setRunStatusFromLive,
     failedProcessRunCancellations,
+    settledProcessRunCancellations,
     setWakeupStatus,
     appendRunEvent,
     finalizeAgentStatus,
@@ -1533,6 +1536,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           throw error;
         } finally {
           if (processCancellationSettlement) {
+            // The killed adapter's result usually reaches the executor after
+            // this Stop settled. Leave the executor a successful receipt so it
+            // still records the run's provider session, logs and usage.
+            if (!processCancellationSettlement.failed && activeRunExecutions.has(run.id)) {
+              settledProcessRunCancellations.set(run.id, processCancellationSettlement);
+            }
             if (
               processRunCancellationSettlements.get(run.id) ===
               processCancellationSettlement

@@ -590,6 +590,26 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     expect(terminateLocalService).toHaveBeenCalledTimes(2);
     // The executor still owns removal of this evidence after it observes Stop.
     expect(deps.failedProcessRunCancellations.get(run.id)?.error).toBe(failure);
+    // The later successful Stop leaves its own receipt for the same executor.
+    expect(deps.settledProcessRunCancellations.get(run.id)).toMatchObject({ failed: false });
+  });
+
+  it("leaves a successful process Stop receipt for its active executor only", async () => {
+    const { company, agent } = await fixture();
+    const owned = await liveRun(company.id, agent.id);
+    const deps = callbacks(db);
+    deps.activeRunExecutions.add(owned.id);
+    expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(owned.id)).toMatchObject({ status: "cancelled" });
+    expect(deps.processRunCancellationSettlements.size).toBe(0);
+    const receipt = deps.settledProcessRunCancellations.get(owned.id);
+    expect(receipt).toMatchObject({ failed: false });
+    await expect(receipt?.settled).resolves.toBeUndefined();
+    expect(deps.failedProcessRunCancellations.has(owned.id)).toBe(false);
+
+    // No executor in this process will read a receipt for an unowned run.
+    const unowned = await liveRun(company.id, agent.id);
+    expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(unowned.id)).toMatchObject({ status: "cancelled" });
+    expect(deps.settledProcessRunCancellations.has(unowned.id)).toBe(false);
   });
 
   async function ownedAdapterRun() {

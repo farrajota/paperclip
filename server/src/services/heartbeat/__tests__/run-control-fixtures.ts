@@ -63,6 +63,7 @@ export function callbacks(db: Db): TestCallbacks {
     activeRunExecutions: new Set<string>(),
     processRunCancellationSettlements: new Map<string, { settled: Promise<void>; failed: boolean; error?: unknown }>(),
     failedProcessRunCancellations: new Map<string, { settled: Promise<void>; failed: boolean; error?: unknown }>(),
+    settledProcessRunCancellations: new Map<string, { settled: Promise<void>; failed: boolean; error?: unknown }>(),
   } satisfies HeartbeatRunControlDependencies;
 }
 export const runControlPostgresSupport = await getEmbeddedPostgresTestSupport();
