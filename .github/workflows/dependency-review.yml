@@ -1,0 +1,24 @@
+name: Dependency review
+
+# Fork-local dependency review. Upstream runs this check inside "commitperclip
+# PR Review" (commitperclip-review.yml), a pull_request_target workflow whose
+# other steps need COMMITPERCLIP_KEY, a private key only upstream holds.
+# GitHub reads pull_request_target workflows from the default branch (master,
+# the upstream mirror), so the fork cannot change that file for its own PRs.
+# The fork therefore disables that workflow in the repository's Actions
+# settings and runs the dependency review here on pull_request instead.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0

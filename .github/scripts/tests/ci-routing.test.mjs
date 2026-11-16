@@ -107,6 +107,12 @@ test("dependency and metadata review failures remain blocking", () => {
   assert.match(review, /exit 1/);
 });
 
+test("scope runs full CI for a stacked middle PR whose base is zay/main", () => {
+  const middle = { position: 2, size: 3, base: { ref: "master" } };
+  assert.equal(runScope({ stack: middle, baseRef: "zay/main" }).full_ci, "true");
+  assert.equal(runScope({ stack: middle, baseRef: "stack/lower" }).full_ci, "false");
+});
+
 test("scope skips only safe release-note diffs and profiling restores full CI", () => {
   const releaseNotes = { files: [{ filename: "releases/v2026.10.27.0.md" }] };
   const codeChange = { files: [{ filename: "server/src/index.ts" }] };

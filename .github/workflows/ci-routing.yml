@@ -129,6 +129,15 @@ jobs:
             fi
           fi
 
+          # Fork release line: every merge into zay/main is a release gate, so
+          # a stacked middle PR still runs the full suite. This runs after the
+          # stack parsing so diff_covers_stack keeps its upstream meaning and
+          # malformed stack metadata still blocks the release-notes skip.
+          if [[ "$PR_BASE_REF" == 'zay/main' && "$full_ci" == 'false' ]]; then
+            full_ci='true'
+            reason='zay/main release gate'
+          fi
+
           if [[ "$full_ci" == 'true' && "$diff_covers_stack" == 'true' ]] &&
              release_notes_only; then
             full_ci='false'

@@ -167,6 +167,27 @@ test("pr.yml routes to the fork-local PR workflow", () => {
   assert.ok(readForkPrWorkflow().length > 0);
 });
 
+test("pr.yml fork-gate job requires the called workflow to succeed even when it fails or is skipped", () => {
+  const caller = readFileSync(prCallerWorkflow, "utf8");
+  const forkGate = readWorkflowJobs(caller).get("fork-gate");
+  assert.ok(forkGate, "pr.yml must define a fork-gate job");
+  assert.match(forkGate, /^ {4}needs: \[ci\]$/m);
+  assert.match(forkGate, /CI_RESULT: \$\{\{ needs\.ci\.result \}\}/);
+  assert.match(forkGate, /run: test "\$CI_RESULT" = "success"/);
+});
+
+test("pr.yml fork-gate skips unrelated label events but still runs when ci fails", () => {
+  // A label event other than profile-ci skips `ci`, so an unguarded
+  // fork-gate would post a failing required check on the same head SHA.
+  const caller = readFileSync(prCallerWorkflow, "utf8");
+  const forkGate = readWorkflowJobs(caller).get("fork-gate");
+  assert.ok(forkGate, "pr.yml must define a fork-gate job");
+  assert.match(
+    forkGate,
+    /^ {4}if: \$\{\{ always\(\) && \(github\.event\.action != 'labeled' \|\| github\.event\.label\.name == 'profile-ci'\) \}\}$/m,
+  );
+});
+
 test("the fork-local PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
   // Branch protection requires a check literally named `e2e`. The shards run
   // as `e2e shard (n/8)`, so the aggregate keeps the required-check contract
@@ -304,6 +325,12 @@ test("the stacked PR scope selector runs full CI only where intended", () => {
     runStackScope({ position: "invalid", size: 11, base: { ref: "master" } }, "stack-5").full_ci,
     "true",
   );
+});
+
+test("the stacked PR scope selector treats every PR into zay/main as a release gate", () => {
+  const middle = { position: 6, size: 11, base: { ref: "master" } };
+  assert.equal(runStackScope(middle, "zay/main").full_ci, "true");
+  assert.equal(runStackScope(middle, "stack-5").full_ci, "false");
 });
 
 test("the fork-local PR workflow passes the shard's spec filter to Playwright without a literal --", () => {
