@@ -46,6 +46,9 @@ function callbacks(db: Db) {
     getWorktreeExecutionCutoff: vi.fn<HeartbeatSchedulingDependencies["getWorktreeExecutionCutoff"]>(async () => null),
     parseHeartbeatPolicy: vi.fn<HeartbeatSchedulingDependencies["parseHeartbeatPolicy"]>(() => timerPolicy),
     claimDueTimerHeartbeat: vi.fn<HeartbeatSchedulingDependencies["claimDueTimerHeartbeat"]>(async () => ({ wasFirstHeartbeat: true })),
+    dispatchPendingNativeStatusWakeups: vi.fn<HeartbeatSchedulingDependencies["dispatchPendingNativeStatusWakeups"]>(
+      async () => ({ scanned: 0, dispatched: 0, recovered: 0, deferred: 0 }),
+    ),
   } satisfies HeartbeatSchedulingDependencies;
 }
 

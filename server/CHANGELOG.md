@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Patch Changes
+- Accept one-time schedule timestamps whose UTC offset is not a whole hour (for example `+05:30` or `+05:45`); offset hours and minutes were read from the wrong capture groups, so those timestamps were rejected as invalid and out-of-range offset hours were never range-checked.
+- Added native one-time issue schedules with explicit UTC-offset/IANA-time-zone input, durable due wake intents, assignee/issue invalidation, native admission, cancellation, and persisted wake/run status in the issue detail UI.
+- Refresh mounted one-time schedule cards through native run/activity invalidation, including due/admission receipts without a run; expose controls in default desktop/mobile task-chat Properties and Classic Activity, retaining normalized UTC text and HTML datetime for Date and string timestamps.
+- Keep scheduling fields full-width and vertically stacked inside desktop and mobile Properties panes so required date/time and UTC-offset inputs neither overlap nor extend beyond the reader.
+- One-time schedule routes apply the issue read boundary before the manage gate, so a private task's schedule answers 404 like the task itself, and the timer worker also wakes at the next pending schedule's due time.
 - Time out the Runner's terminal-result and old-authority outbox acknowledgement waits only after 2 seconds without acknowledgement progress, instead of after 2 seconds in total, so a controller that durably commits a long retained outbox on slow storage can finish settling. A stalled or repeated cursor still fails after 2 seconds, and a configured `--max-runtime-ms` caps the wait; warm activation and attachment result waits keep their fixed bound. See `packages/paperclip-runner/docs/durable-recovery.md`.
 - Select each failed or timed-out run's latest matching exhaustion receipt through a run-correlated lateral query, preserving tenant and lifecycle filters, compact payload fields and feed ordering; no measured speedup or CI qualification is claimed.
 - Scale the native workspace finalizer test's 1-second "second recovery returns busy" race window by the opt-in `PAPERCLIP_TEST_TIMEOUT_FACTOR`; on the gVisor runner the second call's database lock work crossed it and the race reported `still-running` (wrapper pipeline 3056814426, job 17951291186). The busy-return and single-call assertions are unchanged.

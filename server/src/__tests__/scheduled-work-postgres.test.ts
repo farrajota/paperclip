@@ -1,4 +1,4 @@
-import { agents, companies, createDb, issues, routines, routineTriggers } from "@paperclipai/db";
+import { agentWakeupRequests, agents, companies, createDb, issueOneTimeSchedules, issues, routines, routineTriggers } from "@paperclipai/db";
 import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -67,5 +67,53 @@ describe.skipIf(!support.supported)("scheduled deadline database queries", () =>
     await db.execute(sql`truncate table companies restart identity cascade`);
     for (const task of tasks.values()) await task.run(new AbortController().signal);
     for (const task of tasks.values()) expect(task.nextRunAt!()).toBeNull();
+  });
+
+  it("wakes the timer worker at the next pending one-time schedule", async () => {
+    const now = Date.now();
+    const at = (minutes: number) => new Date(now + minutes * 60_000);
+    const [company, pausedCompany] = await db.insert(companies).values([
+      { name: "Active one-time schedules", issuePrefix: "OTS" },
+      { name: "Paused one-time schedules", issuePrefix: "OTP", status: "paused" },
+    ]).returning();
+    const [agent, pausedAgent] = await db.insert(agents).values([
+      { companyId: company!.id, name: "Scheduled agent" },
+      { companyId: pausedCompany!.id, name: "Paused company agent" },
+    ]).returning();
+    const target = { companyId: company!.id, title: "Scheduled", status: "todo", assigneeAgentId: agent!.id };
+    const [monitored, pending, cancelled, claimed, overdue, pausedIssue] = await db.insert(issues).values([
+      { ...target, status: "in_progress", monitorNextCheckAt: at(15) },
+      target, target, target, target,
+      { ...target, companyId: pausedCompany!.id, assigneeAgentId: pausedAgent!.id },
+    ]).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId: company!.id, agentId: agent!.id, source: "automation", status: "queued",
+    }).returning();
+    const schedule = { companyId: company!.id, assigneeAgentId: agent!.id, timeZone: "UTC" };
+    await db.insert(issueOneTimeSchedules).values([
+      { ...schedule, issueId: pending!.id, dueAt: at(5) },
+      { ...schedule, issueId: cancelled!.id, dueAt: at(1), cancelledAt: new Date(now), cancellationReason: "Cancelled by user" },
+      { ...schedule, issueId: claimed!.id, dueAt: at(2), wakeupRequestId: wake!.id },
+      // Overdue work is drained by the tick itself; a past deadline would spin
+      // the worker while scheduling is suppressed.
+      { ...schedule, issueId: overdue!.id, dueAt: at(-1) },
+      { ...schedule, companyId: pausedCompany!.id, assigneeAgentId: pausedAgent!.id, issueId: pausedIssue!.id, dueAt: at(3) },
+    ]);
+    expect(monitored).toBeDefined();
+    type Task = Parameters<ReturnType<typeof createDeliveryWorkCoordinator>["register"]>[1];
+    const tasks = new Map<DeliveryQueue, Task>();
+    registerScheduledWork({ register: (queue, task) => {
+      tasks.set(queue, task);
+      return { ready: Promise.resolve(), wake: () => {} };
+    } }, db, { retryMs: 60_000, tickTimers: async () => {}, tickRoutines: async () => {} });
+    const timers = tasks.get(DELIVERY_QUEUES.issueMonitors)!;
+    await timers.run(new AbortController().signal);
+    expect(timers.nextRunAt!()).toBe(at(5).getTime());
+
+    await db.update(issueOneTimeSchedules).set({ cancelledAt: new Date(now), cancellationReason: "Cancelled by user" })
+      .where(sql`${issueOneTimeSchedules.issueId} = ${pending!.id}`);
+    await timers.run(new AbortController().signal);
+    expect(timers.nextRunAt!()).toBe(at(15).getTime());
+    await db.execute(sql`truncate table companies restart identity cascade`);
   });
 });

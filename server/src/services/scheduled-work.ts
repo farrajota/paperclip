@@ -56,9 +56,17 @@ export function registerScheduledWork(
       WHERE c.status = 'active' AND i.status IN ('in_progress', 'in_review')
         AND i.assignee_agent_id IS NOT NULL AND i.assignee_user_id IS NULL
         AND i.monitor_next_check_at > ${now.toISOString()}::timestamptz`;
+    // tickTimers claims due one-time schedules. Like monitors, only future
+    // instants are deadlines: overdue rows are drained by the tick itself, and
+    // a past deadline would spin this worker while scheduling is suppressed.
+    const oneTimeSchedules = sql`SELECT min(s.due_at) AS next_at
+      FROM issue_one_time_schedules s JOIN companies c ON c.id = s.company_id
+      WHERE c.status = 'active' AND s.cancelled_at IS NULL AND s.wakeup_request_id IS NULL
+        AND s.due_at > ${now.toISOString()}::timestamptz`;
+    const timerDeadlines = sql`${monitors} UNION ALL ${oneTimeSchedules}`;
     return options.governanceOperations
-      ? sql`SELECT min(next_at) AS next_at FROM (${monitors} UNION ALL ${options.governanceOperations.deadlineQuery(now)}) AS monitor_deadlines`
-      : monitors;
+      ? sql`SELECT min(next_at) AS next_at FROM (${timerDeadlines} UNION ALL ${options.governanceOperations.deadlineQuery(now)}) AS monitor_deadlines`
+      : sql`SELECT min(next_at) AS next_at FROM (${timerDeadlines}) AS monitor_deadlines`;
   });
   return { routines, timers };
 }
