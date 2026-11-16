@@ -674,11 +674,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
+        // Every finished step already streamed its token usage. Report it so the
+        // server charges the calls the killed run made; the stream covers only
+        // this invocation, so it is per-run.
+        const streamed = attempt.parsed.usage;
+        const hasStreamedUsage =
+          streamed.inputTokens + streamed.cachedInputTokens + streamed.outputTokens > 0;
+        const timedOutModelId = model || null;
         return {
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          ...(hasStreamedUsage
+            ? {
+                usage: {
+                  inputTokens: streamed.inputTokens,
+                  outputTokens: streamed.outputTokens,
+                  cachedInputTokens: streamed.cachedInputTokens,
+                },
+                usageBasis: "per_run" as const,
+                provider: parseModelProvider(timedOutModelId),
+                biller: resolveOpenCodeBiller(runtimeEnv, parseModelProvider(timedOutModelId)),
+                model: timedOutModelId,
+                billingType: "unknown" as const,
+                costUsd: attempt.parsed.costUsd,
+              }
+            : {}),
           clearSession: clearSessionOnMissingSession,
         };
       }

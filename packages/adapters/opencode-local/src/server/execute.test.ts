@@ -107,6 +107,55 @@ describe("OpenCode local skill injection", () => {
     expect(prompts[1]).toContain("Connection tools:");
   });
 
+  it("returns the usage OpenCode streamed before a timeout killed the run", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-timeout");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const stepFinish = (input: number, output: number, reasoning: number, cacheRead: number, cost: number) =>
+      JSON.stringify({
+        type: "step_finish",
+        sessionID: "timeout-session",
+        part: { tokens: { input, output, reasoning, cache: { read: cacheRead } }, cost },
+      });
+    runProcessMock.mockReset().mockResolvedValueOnce(probeResult({
+      exitCode: null,
+      signal: "SIGTERM",
+      timedOut: true,
+      stdout: [stepFinish(100, 20, 5, 400, 0.01), stepFinish(150, 30, 0, 600, 0.02)].join("\n"),
+    }));
+    const result = await execute({
+      runId: "run-timeout-usage",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", timeoutSec: 5, env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: createPromptContextFixture(),
+      onLog: async () => {},
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.usage).toEqual({ inputTokens: 250, cachedInputTokens: 1000, outputTokens: 55 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.costUsd).toBeCloseTo(0.03);
+    expect(result.provider).toBe("openai");
+    expect(result.model).toBe("openai/gpt-5");
+  });
+
+  it("reports no usage for an OpenCode run that timed out before any step finished", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-timeout-empty");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset().mockResolvedValueOnce(probeResult({
+      exitCode: null, signal: "SIGTERM", timedOut: true, stdout: "",
+    }));
+    const result = await execute({
+      runId: "run-timeout-no-usage",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", timeoutSec: 5, env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: createPromptContextFixture(),
+      onLog: async () => {},
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.usage).toBeUndefined();
+  });
+
   it("injects runtime skills into the configured child HOME", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-configured-home-"));
     const processHome = path.join(root, "process-home");

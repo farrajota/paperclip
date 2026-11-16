@@ -770,11 +770,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
+        // Every finished turn already streamed its usage and cost. Report it so
+        // the server charges the calls the killed run made; the stream covers
+        // only this invocation, so it is per-run.
+        const streamed = attempt.parsed.usage;
+        const hasStreamedUsage =
+          streamed.inputTokens + streamed.cachedInputTokens + streamed.outputTokens > 0;
         return {
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          ...(hasStreamedUsage
+            ? {
+                usage: {
+                  inputTokens: streamed.inputTokens,
+                  outputTokens: streamed.outputTokens,
+                  cachedInputTokens: streamed.cachedInputTokens,
+                },
+                usageBasis: "per_run" as const,
+                provider: provider,
+                biller: resolvePiBiller(runtimeEnv, provider),
+                model: model,
+                billingType: "unknown" as const,
+                costUsd: streamed.costUsd,
+              }
+            : {}),
           clearSession: clearSessionOnMissingSession,
         };
       }
