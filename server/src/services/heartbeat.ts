@@ -127,6 +127,7 @@ import {
   deriveTaskKey,
   type WakeupOptions,
   mergeCoalescedContextSnapshot,
+  runContextSnapshotWrite,
   PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY,
   PAPERCLIP_HARNESS_CHECKOUT_KEY,
   attestReviewedExternalChatRun,
@@ -2993,7 +2994,7 @@ export function heartbeatService(
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: context,
+          contextSnapshot: runContextSnapshotWrite(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -3117,7 +3118,7 @@ export function heartbeatService(
             startedAt,
             sessionIdBefore:
               runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-            contextSnapshot: context,
+            contextSnapshot: runContextSnapshotWrite(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id))

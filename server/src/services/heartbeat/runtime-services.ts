@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { parseObject } from "../../adapters/utils.js";
+import { runContextSnapshotWrite } from "./run-preparation.js";
 import { assertLowTrustRuntimeServicesAllowed } from "../low-trust-runtime-containment.js";
 import {
   buildWorkspaceReadyComment, buildWorkspaceReadyMetadata, buildWorkspaceReadyPresentation,
@@ -126,7 +127,7 @@ export async function startHeartbeatRuntimeServices(db: Db, input: RuntimeServic
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: runContextSnapshotWrite(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
@@ -189,7 +190,7 @@ export async function recordHeartbeatAdapterRuntimeServices(db: Db, input: Runti
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: runContextSnapshotWrite(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
