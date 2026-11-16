@@ -3948,6 +3948,7 @@ export function heartbeatService(
           : releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true })).catch(err => {
           logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
         });
+        await runControl.readmitExecutionStageHandoffsForRun(latestRun);
       }
       if (
         !nativeSessionResumeScheduled &&

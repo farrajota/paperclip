@@ -730,6 +730,72 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     }, queueId);
   }
 
+  // The deferred receipt is the durable intent of a stage handoff that waited
+  // on the run it stopped. The release drain never promotes after an
+  // acknowledged Stop, so re-enter ordinary admission instead: every current
+  // gate (assignee, stage, holds, budget, ownership) applies again. The claim
+  // keeps a concurrent drain from promoting the same intent twice.
+  async function readmitExecutionStageHandoff(wake: typeof agentWakeupRequests.$inferSelect) {
+    const [claimed] = await db.update(agentWakeupRequests).set({ status: "claimed", claimedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution")))
+      .returning();
+    if (!claimed) return;
+    const payload = { ...parseObject(claimed.payload) };
+    const savedContext = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+    delete payload[DEFERRED_WAKE_CONTEXT_KEY];
+    delete payload.executionWait;
+    let wakeRun: Awaited<ReturnType<typeof enqueueWakeup>>;
+    try {
+      wakeRun = await enqueueWakeup(claimed.agentId, {
+        source: claimed.source as WakeupOptions["source"],
+        triggerDetail: (claimed.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
+        reason: claimed.reason,
+        payload,
+        contextSnapshot: savedContext,
+        requestedByActorType: (claimed.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+        requestedByActorId: claimed.requestedByActorId,
+        idempotencyKey: claimed.idempotencyKey,
+      });
+    } catch (error) {
+      await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", claimedAt: null, updatedAt: new Date() })
+        .where(and(eq(agentWakeupRequests.id, claimed.id), eq(agentWakeupRequests.status, "claimed")));
+      throw error;
+    }
+    // Admission wrote its own receipt (queued, deferred, or skipped); this
+    // intent is settled either way and must not be delivered again.
+    await db.update(agentWakeupRequests).set({
+      status: "coalesced", runId: wakeRun?.id ?? null, finishedAt: new Date(), updatedAt: new Date(),
+    }).where(and(eq(agentWakeupRequests.id, claimed.id), eq(agentWakeupRequests.status, "claimed")));
+  }
+
+  // Called by the stopped run's executor after its lease release. An
+  // execution-stage handoff that stopped this run defers its wake while this
+  // run still holds its lease. Admission reads the lease and records that wait
+  // under the issue row lock; read under the same lock so a wait recorded just
+  // before the release is never missed.
+  async function readmitExecutionStageHandoffsForRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "contextSnapshot">,
+  ) {
+    const issueId = readNonEmptyString(run.contextSnapshot?.issueId);
+    if (!issueId || !isUuidLike(issueId)) return;
+    const handoffs = await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} and company_id = ${run.companyId} for update`);
+      return tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, run.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        sql`${agentWakeupRequests.payload}->>'interruptedRunId' = ${run.id}`,
+        sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,source}' = 'issue.execution_stage'`,
+      ));
+    });
+    for (const handoff of handoffs) {
+      await readmitExecutionStageHandoff(handoff).catch(err => {
+        logger.error({ err, runId: run.id, wakeupRequestId: handoff.id }, "failed to readmit execution-stage handoff after cleanup");
+      });
+    }
+  }
+
   async function resumeTaskRetry(companyId: string, requestId: string) {
     if ((await getSchedulingSuppression()).suppressed) return;
     const [wake] = await db.select().from(agentWakeupRequests).where(and(
@@ -1683,6 +1749,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     resumeQueuedCommentInterrupt,
     resumeSavedLegacyComments,
     resumeTaskRetry,
+    readmitExecutionStageHandoffsForRun,
     cancelActiveForAgentInternal,
     cancelInvocationsForAgentsInternal,
   };
