@@ -777,4 +777,61 @@ describe("pi remote execution", () => {
     expect(userPrompt).not.toContain("CUSTOM POLICY run-instructions-policy");
     expect(userPrompt).not.toContain("Execution contract:");
   });
+
+  it("returns the usage Pi streamed in finished turns before a timeout killed the run", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-pi-timeout-usage-"));
+    cleanupDirs.push(rootDir);
+    const turnEnd = (input: number, output: number, cacheRead: number, cost: number) =>
+      JSON.stringify({
+        type: "turn_end",
+        message: { role: "assistant", content: "working", usage: { input, output, cacheRead, cost: { total: cost } } },
+        toolResults: [],
+      });
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: null,
+      signal: "SIGTERM",
+      timedOut: true,
+      stdout: [turnEnd(100, 20, 400, 0.01), turnEnd(150, 30, 600, 0.02)].join("\n"),
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    } as never);
+
+    const result = await execute({
+      runId: "run-timeout-usage",
+      agent: { id: "agent-1", companyId: "company-1", name: "Pi Builder", adapterType: "pi_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "pi", model: "openai/gpt-5.4-mini", cwd: rootDir, timeoutSec: 5 },
+      context: { paperclipWorkspace: { cwd: rootDir, source: "project_primary" } },
+      onLog: async () => {},
+    } as never);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.usage).toEqual({ inputTokens: 250, cachedInputTokens: 1000, outputTokens: 50 });
+    expect(result.usageBasis).toBe("per_run");
+    expect(result.costUsd).toBeCloseTo(0.03);
+    expect(result.provider).toBe("openai");
+    expect(result.model).toBe("openai/gpt-5.4-mini");
+  });
+
+  it("reports no usage for a Pi run that timed out before any turn finished", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-pi-timeout-empty-"));
+    cleanupDirs.push(rootDir);
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: null, signal: "SIGTERM", timedOut: true, stdout: "", stderr: "", pid: 123,
+      startedAt: new Date().toISOString(),
+    } as never);
+
+    const result = await execute({
+      runId: "run-timeout-no-usage",
+      agent: { id: "agent-1", companyId: "company-1", name: "Pi Builder", adapterType: "pi_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "pi", model: "openai/gpt-5.4-mini", cwd: rootDir, timeoutSec: 5 },
+      context: { paperclipWorkspace: { cwd: rootDir, source: "project_primary" } },
+      onLog: async () => {},
+    } as never);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.usage).toBeUndefined();
+  });
 });
