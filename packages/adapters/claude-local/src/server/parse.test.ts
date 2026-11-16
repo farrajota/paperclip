@@ -557,6 +557,56 @@ describe("parseClaudeStreamJson usage extraction", () => {
     expect(parsed.costUsd).toBeCloseTo(1.25);
   });
 
+  // Claude Code repeats an assistant message once per content block, each copy
+  // carrying a usage snapshot of the same API call. A run killed before its
+  // result event still made those calls, so the snapshots are summed once per
+  // message id.
+  const assistantEvent = (id: string, usage: Record<string, number>, parentToolUseId: string | null = null) =>
+    JSON.stringify({
+      type: "assistant",
+      session_id: "sess-1",
+      parent_tool_use_id: parentToolUseId,
+      message: { id, model: "claude-sonnet-5", content: [{ type: "text", text: "working" }], usage },
+    });
+
+  it("sums the assistant usage streamed before a run ended without a result event", () => {
+    const parsed = parseClaudeStreamJson(
+      [
+        assistantEvent("msg_a", {
+          input_tokens: 5,
+          cache_creation_input_tokens: 1_000,
+          cache_read_input_tokens: 2_000,
+          output_tokens: 3,
+        }),
+        assistantEvent("msg_a", {
+          input_tokens: 5,
+          cache_creation_input_tokens: 1_000,
+          cache_read_input_tokens: 2_000,
+          output_tokens: 40,
+        }),
+        assistantEvent(
+          "msg_sub",
+          { input_tokens: 7, cache_creation_input_tokens: 0, cache_read_input_tokens: 300, output_tokens: 20 },
+          "toolu_task",
+        ),
+      ].join("\n"),
+    );
+    expect(parsed.resultJson).toBeNull();
+    expect(parsed.usage).toBeNull();
+    expect(parsed.streamedUsage).toEqual({
+      inputTokens: 1_012,
+      cachedInputTokens: 2_300,
+      outputTokens: 60,
+    });
+  });
+
+  it("reports no streamed usage when no assistant message carried usage", () => {
+    const parsed = parseClaudeStreamJson(
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-1", model: "claude-sonnet-5" }),
+    );
+    expect(parsed.streamedUsage).toBeNull();
+  });
+
   it("falls back to the result usage block when modelUsage is absent", () => {
     const parsed = parseClaudeStreamJson(`${resultEvent({})}\n`);
     expect(parsed.usage).toEqual({
