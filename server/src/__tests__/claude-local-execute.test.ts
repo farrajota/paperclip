@@ -45,6 +45,21 @@ process.exit(${exit});
   await fs.chmod(commandPath, 0o755);
 }
 
+// Prints the given stream-json events, then never exits, so the adapter's
+// timeout kills it before Claude writes its result event.
+async function writeTimingOutClaudeCommand(
+  commandPath: string,
+  events: Array<Record<string, unknown>>,
+): Promise<void> {
+  const lines = events.map((event) => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("\n");
+  const script = `#!/usr/bin/env node
+${lines}
+setInterval(() => {}, 1000);
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
 async function writeFakeClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -1587,6 +1602,80 @@ describe("claude execute", () => {
       expect(result.errorMessage).toBeNull();
       expect(result.errorCode).toBeNull();
       expect(result.summary).toBe("Implemented the requested change.");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns the usage Claude streamed before a timeout killed the run", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-timeout-usage-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    const sessionId = "abababab-abab-4bab-8bab-abababababab";
+    await writeTimingOutClaudeCommand(commandPath, [
+      { type: "system", subtype: "init", session_id: sessionId, model: "claude-sonnet-5" },
+      {
+        type: "assistant",
+        session_id: sessionId,
+        message: {
+          id: "msg_timeout_1",
+          content: [{ type: "text", text: "Looking at the issue." }],
+          usage: { input_tokens: 4, cache_creation_input_tokens: 900, cache_read_input_tokens: 1_500, output_tokens: 30 },
+        },
+      },
+      {
+        type: "assistant",
+        session_id: sessionId,
+        message: {
+          id: "msg_timeout_1",
+          content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "sleep 600" } }],
+          usage: { input_tokens: 4, cache_creation_input_tokens: 900, cache_read_input_tokens: 1_500, output_tokens: 30 },
+        },
+      },
+    ]);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-timeout-usage",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          timeoutSec: 1,
+          graceSec: 1,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.timedOut).toBe(true);
+      expect(result.errorCode).toBe("timeout");
+      expect(result.usage).toEqual({ inputTokens: 904, cachedInputTokens: 1_500, outputTokens: 30 });
+      expect(result.usageBasis).toBe("per_run");
+      expect(result.costUsd).toBeNull();
+      expect(result.provider).toBe("anthropic");
+      expect(result.model).toBe("claude-sonnet-5");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

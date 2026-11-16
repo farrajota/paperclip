@@ -88,6 +88,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
 import { parseOpenCodeJsonl } from "@paperclipai/adapter-opencode-local/server";
+import { execute as executeClaudeLocal } from "@paperclipai/adapter-claude-local/server";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolvePaperclipInstanceRoot,
@@ -8464,6 +8465,173 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(costs[0]).toMatchObject({ inputTokens: 300, outputTokens: 30, costCents: 3 });
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     expect(agent?.spentMonthlyCents).toBe(3);
+  });
+
+  // A claude_local CLI run that hits its timeout is killed before Claude writes
+  // the result event that carries the run's totals. The assistant messages it
+  // already streamed each carry the usage of a model call that was made.
+  async function startClaudeCliRunThatTimesOut(options: { ignoreSigterm?: boolean } = {}) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-timeout-usage-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    const sessionId = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+    const events = [
+      { type: "system", subtype: "init", session_id: sessionId, model: "claude-sonnet-5" },
+      {
+        type: "assistant",
+        session_id: sessionId,
+        message: {
+          id: "msg_timeout_1",
+          content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "sleep 600" } }],
+          usage: { input_tokens: 10, cache_creation_input_tokens: 1_190, cache_read_input_tokens: 400, output_tokens: 75 },
+        },
+      },
+    ];
+    const sigtermHandler = options.ignoreSigterm
+      ? `process.on("SIGTERM", () => console.log("timeout sigterm ignored"));`
+      : "";
+    await fs.writeFile(
+      commandPath,
+      `#!/usr/bin/env node\n${sigtermHandler}\n${events.map((event) => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("\n")}\nsetInterval(() => {}, 1000);\n`,
+      "utf8",
+    );
+    await fs.chmod(commandPath, 0o755);
+    let reportSigterm!: () => void;
+    const sigtermSeen = new Promise<void>((resolve) => {
+      reportSigterm = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce((async (input: unknown) => {
+      const context = input as Parameters<typeof executeClaudeLocal>[0];
+      return executeClaudeLocal({
+        ...context,
+        onLog: async (stream, text) => {
+          await context.onLog(stream, text);
+          if (text.includes("timeout sigterm ignored")) reportSigterm();
+        },
+      });
+    }) as typeof mockAdapterExecute);
+    const fixture = await seedRunFixture({
+      runtimeMode: "legacy",
+      adapterType: "claude_local",
+      agentStatus: "idle",
+      runStatus: "queued",
+    });
+    await db
+      .update(agents)
+      .set({
+        adapterConfig: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          timeoutSec: 1,
+          graceSec: options.ignoreSigterm ? 5 : 1,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+      })
+      .where(eq(agents.id, fixture.agentId));
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    const heartbeat = heartbeatService(db);
+    const settle = async () => {
+      try {
+        await heartbeat.drainActiveRunExecutions();
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    };
+    try {
+      await heartbeat.resumeQueuedRuns();
+    } catch (err) {
+      await settle();
+      throw err;
+    }
+    return { ...fixture, heartbeat, sigtermSeen, settle };
+  }
+
+  async function runClaudeCliUntilTimeout() {
+    const started = await startClaudeCliRunThatTimesOut();
+    await started.settle();
+    return started;
+  }
+
+  it("charges the usage a claude_local CLI run streamed before it timed out", async () => {
+    const { runId, agentId, issueId } = await runClaudeCliUntilTimeout();
+
+    const settled = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(settled).toMatchObject({ status: "timed_out", errorCode: "timeout" });
+    expect(settled?.usageJson).toMatchObject({
+      inputTokens: 1_200,
+      cachedInputTokens: 400,
+      outputTokens: 75,
+      usageSource: "per_run",
+      provider: "anthropic",
+      model: "claude-sonnet-5",
+      costStatus: "unpriced",
+    });
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toMatchObject({
+      agentId,
+      issueId,
+      provider: "anthropic",
+      model: "claude-sonnet-5",
+      inputTokens: 1_200,
+      cachedInputTokens: 400,
+      outputTokens: 75,
+      costCents: 0,
+      costStatus: "unpriced",
+    });
+    const [runtime] = await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId));
+    expect(runtime).toMatchObject({
+      totalInputTokens: 1_200,
+      totalCachedInputTokens: 400,
+      totalOutputTokens: 75,
+    });
+  });
+
+  it("charges a timed-out claude_local run once across a later Stop and recovery passes", async () => {
+    const { runId, agentId, heartbeat } = await runClaudeCliUntilTimeout();
+
+    expect((await heartbeat.cancelRun(runId, "Stop after timeout"))?.status).toBe("timed_out");
+    const restarted = heartbeatService(db);
+    await restarted.resumeQueuedRuns();
+    await restarted.drainActiveRunExecutions();
+
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toMatchObject({ inputTokens: 1_200, cachedInputTokens: 400, outputTokens: 75 });
+    const [runtime] = await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId));
+    expect(runtime).toMatchObject({
+      totalInputTokens: 1_200,
+      totalCachedInputTokens: 400,
+      totalOutputTokens: 75,
+    });
+  });
+
+  it("charges a timed-out claude_local run once when a Stop lands during its kill grace", async () => {
+    const { runId, agentId, issueId, heartbeat, sigtermSeen, settle } =
+      await startClaudeCliRunThatTimesOut({ ignoreSigterm: true });
+    try {
+      await sigtermSeen;
+      const stopped = await stopRunForReassignment(heartbeat, runId, issueId);
+      expect(stopped?.status).toBe("cancelled");
+    } finally {
+      await settle();
+    }
+
+    expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toMatchObject({ inputTokens: 1_200, cachedInputTokens: 400, outputTokens: 75 });
+    const [runtime] = await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId));
+    expect(runtime).toMatchObject({
+      totalInputTokens: 1_200,
+      totalCachedInputTokens: 400,
+      totalOutputTokens: 75,
+    });
   });
 
   it("records no cost for a run stopped before its first model step finished", async () => {
