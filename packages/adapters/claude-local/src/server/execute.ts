@@ -1008,6 +1008,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : undefined;
 
     if (proc.timedOut) {
+      // The killed run already made model calls. Report their usage so the
+      // server charges them; the stream covers only this invocation, so it is
+      // per-run. Without a result event Claude reports no cost.
+      const timedOutUsage = parsedStream.usage ?? parsedStream.streamedUsage;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -1015,6 +1019,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
+        ...(timedOutUsage ? { usage: timedOutUsage, usageBasis: "per_run" as const } : {}),
+        provider: "anthropic",
+        biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+        model: parsedStream.model || model,
+        billingType,
+        costUsd: parsedStream.costUsd,
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
     }

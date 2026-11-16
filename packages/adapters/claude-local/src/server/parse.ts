@@ -54,11 +54,55 @@ export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null
   return { inputTokens, outputTokens, cachedInputTokens };
 }
 
+// Claude Code repeats an assistant message once per content block, and every
+// copy carries a usage snapshot of the same API call. Keep the largest value
+// per message id so each call counts once. Cache-creation tokens are billed
+// prompt tokens, so they count as input, as in claudeModelUsageTotals.
+function recordAssistantUsage(
+  byMessage: Map<string, UsageSummary>,
+  key: string,
+  usageValue: unknown,
+) {
+  const usage = parseObject(usageValue);
+  if (Object.keys(usage).length === 0) return;
+  const snapshot: UsageSummary = {
+    inputTokens: asNumber(usage.input_tokens, 0) + asNumber(usage.cache_creation_input_tokens, 0),
+    cachedInputTokens: asNumber(usage.cache_read_input_tokens, 0),
+    outputTokens: asNumber(usage.output_tokens, 0),
+  };
+  const previous = byMessage.get(key);
+  byMessage.set(
+    key,
+    previous
+      ? {
+          inputTokens: Math.max(previous.inputTokens, snapshot.inputTokens),
+          cachedInputTokens: Math.max(previous.cachedInputTokens ?? 0, snapshot.cachedInputTokens ?? 0),
+          outputTokens: Math.max(previous.outputTokens, snapshot.outputTokens),
+        }
+      : snapshot,
+  );
+}
+
+function sumAssistantUsage(byMessage: Map<string, UsageSummary>): UsageSummary | null {
+  if (byMessage.size === 0) return null;
+  let inputTokens = 0;
+  let cachedInputTokens = 0;
+  let outputTokens = 0;
+  for (const usage of byMessage.values()) {
+    inputTokens += usage.inputTokens;
+    cachedInputTokens += usage.cachedInputTokens ?? 0;
+    outputTokens += usage.outputTokens;
+  }
+  return { inputTokens, cachedInputTokens, outputTokens };
+}
+
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
+  const assistantUsageByMessage = new Map<string, UsageSummary>();
+  let assistantEventIndex = 0;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -76,6 +120,12 @@ export function parseClaudeStreamJson(stdout: string) {
     if (type === "assistant") {
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
       const message = parseObject(event.message);
+      assistantEventIndex += 1;
+      recordAssistantUsage(
+        assistantUsageByMessage,
+        asString(message.id, "") || `event:${assistantEventIndex}`,
+        message.usage,
+      );
       const content = Array.isArray(message.content) ? message.content : [];
       for (const entry of content) {
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
@@ -94,6 +144,10 @@ export function parseClaudeStreamJson(stdout: string) {
     }
   }
 
+  // The result event carries the authoritative totals. A run killed before it,
+  // for example by a timeout, keeps only what the assistant messages streamed.
+  const streamedUsage = sumAssistantUsage(assistantUsageByMessage);
+
   if (!finalResult) {
     return {
       sessionId,
@@ -101,6 +155,7 @@ export function parseClaudeStreamJson(stdout: string) {
       costUsd: null as number | null,
       usage: null as UsageSummary | null,
       usageBasis: null as "per_run" | null,
+      streamedUsage,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
     };
@@ -125,6 +180,7 @@ export function parseClaudeStreamJson(stdout: string) {
     // modelUsage covers exactly this CLI invocation, so mark it per-run to
     // keep the server from applying its session-cumulative delta heuristic.
     usageBasis: "per_run" as const,
+    streamedUsage,
     summary,
     resultJson: finalResult,
   };
