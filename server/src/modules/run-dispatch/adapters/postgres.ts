@@ -36,7 +36,7 @@ import { collectDispositionRepairSourceState } from "../../../services/recovery/
 import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
-import { issueService } from "../../../services/issues.js";
+import { dependencyReadinessWakeReason, issueService } from "../../../services/issues.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
@@ -493,8 +493,13 @@ export function createPostgresRunDispatchAdapter(
       : null;
     if (isBlocked()) return { agentFound: true, facts };
 
-    const dependencyReadiness = await issuesSvcForRead.listDependencyReadiness(input.companyId, [issueId]);
-    const readiness = dependencyReadiness.get(issueId);
+    // A child-completion wake coalesced into this retry must not be
+    // suppressed by the parent's own cancelled direct children.
+    const readiness = await issuesSvcForRead.getDependencyReadinessForWake(
+      input.companyId,
+      issueId,
+      dependencyReadinessWakeReason(input.contextSnapshot),
+    );
     facts.dependenciesBlocked =
       readiness && !readiness.isDependencyReady
         ? {
@@ -1304,7 +1309,7 @@ export function createPostgresRunDispatchAdapter(
     const wakeReadiness = await issuesSvc.getDependencyReadinessForWake(
       run.companyId,
       issueId,
-      readNonEmptyString(contextSnapshot.wakeReason),
+      dependencyReadinessWakeReason(contextSnapshot),
       tx,
     );
     if (facts.issueStatus === "blocked") {

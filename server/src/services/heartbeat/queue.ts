@@ -164,7 +164,7 @@ import type { createHeartbeatRunState } from "./run-state.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
 import type { HeartbeatRecoveryDependencies, createHeartbeatRecovery } from "./recovery.js";
-import type { issueService } from "../issues.js";
+import { dependencyReadinessWakeReason, type issueService } from "../issues.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
 import type { budgetService } from "../budgets.js";
 import type { instanceSettingsService } from "../instance-settings.js";
@@ -1117,11 +1117,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
 
       // Same wake-aware readiness as the enqueue gate, so a queued
-      // child-completion wake is not cancelled for a cancelled direct child.
+      // child-completion wake is not cancelled for a cancelled direct child,
+      // even after a later wake was coalesced into this run.
       const readiness = await issuesSvc.getDependencyReadinessForWake(
         run.companyId,
         issueId,
-        readNonEmptyString(context.wakeReason),
+        dependencyReadinessWakeReason(context),
       );
       const unresolvedBlockerCount = readiness.unresolvedBlockerCount;
       if (
