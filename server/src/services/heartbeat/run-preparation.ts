@@ -870,6 +870,11 @@ export interface WakeupOptions {
     /** Internal diagnostic only; the callback cannot grant admission. */
     onExecutionDeferred?: (blockerCause: string) => void;
   };
+  issueOneTimeScheduleGuard?: {
+    scheduleId: string;
+    wakeupRequestId: string;
+    assigneeAgentId: string;
+  };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
 }

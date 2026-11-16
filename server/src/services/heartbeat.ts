@@ -1579,6 +1579,7 @@ export function heartbeatService(
     groupAgentOrgRowsByCompany,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
+    dispatchPendingNativeStatusWakeups,
   });
 
   const {

@@ -33,6 +33,18 @@ This keeps agents aligned — they can always answer "why am I doing this?"
 
 Assign an issue to an agent by setting the `assigneeAgentId`. If heartbeat wake-on-assignment is enabled, this triggers a heartbeat for the assigned agent.
 
+## Scheduling a Future Run
+
+In the default task-chat reader, open **Properties** and use **One-time run** to schedule an existing visible issue for a future time. The same controls remain in the Classic Task Interface's **Activity** tab. Enter the wall-clock date/time, its explicit UTC offset, and its IANA time zone (for example, `2026-10-26T09:00:00-04:00` with `America/New_York`). Paperclip stores the normalized UTC instant and the entered zone. Creating a schedule does not assign or wake an agent immediately.
+
+Schedules are available for `backlog`, `todo`, and `in_progress` issues assigned to an agent. The assigned agent is snapshotted when the schedule is created; changing the assignee, hiding the issue, or moving it to an ineligible/terminal status cancels the pending schedule. A board user can manage schedules; an agent must be the assigned agent and have runtime-management permission.
+
+At the due time, the schedule becomes a durable native wake request. The normal Paperclip scheduler remains responsible for permission, agent pause, budget, checkout, workspace, and concurrency decisions, so a due schedule may wait or fail under those gates rather than bypassing them. The card reports the persisted wake/run status. You can cancel before the native wake intent is committed; once queued, it cannot be cancelled here.
+
+While the schedule card is mounted, native run and issue-activity events refresh its persisted wake/run projection, including admission failures or waits that create no run. The browser does not advance status from its clock or run another scheduler. Default desktop and mobile readers use the existing Properties surface to create, read, and cancel schedules; opening it again reads the same native-backed schedule.
+
+The three scheduling inputs remain vertically stacked within the available Properties pane width, including on desktop; the date/time and UTC offset are separate required fields.
+
 ## Status Lifecycle
 
 ```
