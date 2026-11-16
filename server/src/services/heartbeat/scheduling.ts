@@ -54,6 +54,7 @@ import {
 import { logger } from "../../middleware/logger.js";
 import { failRunnerGoalAction } from "../runner-goals.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
+import { issueOneTimeScheduleService } from "../issue-one-time-schedules.js";
 import type { Db } from "@paperclipai/db";
 import type { issueService } from "../issues.js";
 import type { createHeartbeatQueue } from "./queue.js";
@@ -66,7 +67,7 @@ type RunPreparation = ReturnType<typeof createHeartbeatRunPreparation>;
 
 export interface HeartbeatSchedulingDependencies
   extends Pick<HeartbeatRetryDependencies, "getRun" | "getAgent" | "getWorktreeExecutionCutoff">,
-    Pick<HeartbeatQueue, "enqueueWakeup" | "parseHeartbeatPolicy" | "claimDueTimerHeartbeat">,
+    Pick<HeartbeatQueue, "enqueueWakeup" | "parseHeartbeatPolicy" | "claimDueTimerHeartbeat" | "dispatchPendingNativeStatusWakeups">,
     Pick<RunPreparation, "toAgentOrgRow" | "groupAgentOrgRowsByCompany"> {
   issuesSvc: Pick<ReturnType<typeof issueService>, "listReviewAttention" | "create">;
   scheduleBoundedRetryForRun: ReturnType<typeof createHeartbeatRetries>["scheduleBoundedRetryForRun"];
@@ -136,7 +137,9 @@ export function createHeartbeatScheduling(
     groupAgentOrgRowsByCompany,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
+    dispatchPendingNativeStatusWakeups,
   } = dependencies;
+  const oneTimeSchedules = issueOneTimeScheduleService(db);
 
   const issueMonitorDispatchColumns = {
     id: issues.id,
@@ -1279,12 +1282,17 @@ export function createHeartbeatScheduling(
         else skipped += 1;
       }
 
+      // A due schedule only commits a native wake intent; dispatching it in
+      // the same tick sends it through normal admission without waiting for
+      // another producer to drain the native status outbox.
+      const oneTimeScheduleTick = await oneTimeSchedules.tickDue(now);
+      const nativeStatusWakeups = await dispatchPendingNativeStatusWakeups();
       const issueMonitors = await tickDueIssueMonitors(now);
 
       return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
+        checked: checked + oneTimeScheduleTick.checked + issueMonitors.checked,
+        enqueued: enqueued + nativeStatusWakeups.dispatched + issueMonitors.triggered,
+        skipped: skipped + oneTimeScheduleTick.invalidated + issueMonitors.skipped,
       };
     }
 

@@ -89,6 +89,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueOneTimeSchedules,
   issueRecoveryActions,
   issueRelations,
   issues,
@@ -133,6 +134,11 @@ import {
 } from "../issue-rewake-throttle.js";
 import { logActivity } from "../activity-log.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../issue-dependency-wakeups.js";
+import {
+  ISSUE_ONE_TIME_SCHEDULE_WAKE_REASON,
+  logIssueOneTimeScheduleUpdate,
+} from "../issue-one-time-schedules.js";
+import { isIssueOneTimeScheduleEligibleStatus } from "../issue-one-time-schedule.js";
 import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
   isVerifiedIssueTreeControlInteractionWake,
@@ -3115,6 +3121,101 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               sourceRunId: readNonEmptyString(enrichedContextSnapshot.previousRunId)!,
             })) return { kind: "deferred" as const };
           }
+          const scheduleGuard = opts.issueOneTimeScheduleGuard;
+          if (scheduleGuard) {
+            // Recheck the scheduled target under row locks: the due tick only
+            // committed an intent, and the issue or schedule may have changed
+            // before this admission.
+            const [targetIssue] = await tx
+              .select({
+                status: issues.status,
+                hiddenAt: issues.hiddenAt,
+                assigneeAgentId: issues.assigneeAgentId,
+                assigneeUserId: issues.assigneeUserId,
+              })
+              .from(issues)
+              .where(and(eq(issues.id, issue.id), eq(issues.companyId, agent.companyId)))
+              .for("update");
+            const [schedule] = await tx
+              .select({
+                assigneeAgentId: issueOneTimeSchedules.assigneeAgentId,
+                cancelledAt: issueOneTimeSchedules.cancelledAt,
+                wakeupRequestId: issueOneTimeSchedules.wakeupRequestId,
+              })
+              .from(issueOneTimeSchedules)
+              .where(
+                and(
+                  eq(issueOneTimeSchedules.id, scheduleGuard.scheduleId),
+                  eq(issueOneTimeSchedules.companyId, agent.companyId),
+                  eq(issueOneTimeSchedules.issueId, issue.id),
+                ),
+              )
+              .for("update");
+            const issueStillEligible = Boolean(
+              targetIssue &&
+                targetIssue.hiddenAt === null &&
+                targetIssue.assigneeAgentId === scheduleGuard.assigneeAgentId &&
+                targetIssue.assigneeUserId === null &&
+                isIssueOneTimeScheduleEligibleStatus(targetIssue.status),
+            );
+            const scheduleStillPending = Boolean(
+              schedule &&
+                schedule.cancelledAt === null &&
+                schedule.assigneeAgentId === scheduleGuard.assigneeAgentId &&
+                schedule.wakeupRequestId === scheduleGuard.wakeupRequestId,
+            );
+            if (!issueStillEligible || !scheduleStillPending) {
+              const now = new Date();
+              if (
+                schedule &&
+                schedule.cancelledAt === null &&
+                schedule.wakeupRequestId === scheduleGuard.wakeupRequestId
+              ) {
+                await tx
+                  .update(issueOneTimeSchedules)
+                  .set({
+                    cancelledAt: now,
+                    cancellationReason: !targetIssue
+                      ? "Issue no longer exists"
+                      : targetIssue.assigneeAgentId !== scheduleGuard.assigneeAgentId ||
+                          targetIssue.assigneeUserId !== null
+                        ? "Issue assignee changed before the scheduled run"
+                        : "Issue was hidden or became ineligible before the scheduled run",
+                    updatedAt: now,
+                  })
+                  .where(
+                    and(
+                      eq(issueOneTimeSchedules.id, scheduleGuard.scheduleId),
+                      isNull(issueOneTimeSchedules.cancelledAt),
+                      eq(issueOneTimeSchedules.wakeupRequestId, scheduleGuard.wakeupRequestId),
+                    ),
+                  );
+              }
+              await tx.insert(agentWakeupRequests).values({
+                ...durableReceiptFields,
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: "issue_one_time_schedule_ineligible",
+                payload: {
+                  ...(payload ?? {}),
+                  heartbeatSkip: {
+                    reason: "The issue or schedule changed before the due wake was admitted.",
+                    issueId: issue.id,
+                  },
+                },
+                status: "skipped",
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                error: "The scheduled issue changed before native wake admission.",
+                finishedAt: now,
+              });
+              return { kind: "skipped" as const };
+            }
+          }
+
           const issueStateGuard = opts.issueStateGuard;
           const activeMonitorRun = issueStateGuard?.monitorNextCheckAt === undefined ? null
             : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
@@ -4644,6 +4745,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
    * wake was inserted but before the intent was linked to it. Dispatch failure
    * only requeues the intent; it never changes the provider run outcome.
    */
+  async function logOneTimeScheduleWakeUpdate(wake: typeof agentWakeupRequests.$inferSelect) {
+    if (wake.reason !== ISSUE_ONE_TIME_SCHEDULE_WAKE_REASON) return;
+    const payload = parseObject(wake.payload);
+    const scheduleId = readNonEmptyString(payload.issueOneTimeScheduleId);
+    const issueId = readNonEmptyString(payload.issueId) ?? readNonEmptyString(payload.taskId);
+    if (!scheduleId || !issueId) return;
+    await logIssueOneTimeScheduleUpdate(db, { id: scheduleId, companyId: wake.companyId, issueId });
+  }
+
   async function dispatchPendingNativeStatusWakeups(
     input: {
       companyId?: string;
@@ -4718,6 +4828,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               isNull(agentWakeupRequests.runId),
             ),
           );
+        await logOneTimeScheduleWakeUpdate(candidate);
         recovered += 1;
         continue;
       }
@@ -4752,6 +4863,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (claimed.length === 0) continue;
 
       const payload = parseObject(candidate.payload);
+      const scheduleGuard = candidate.reason === ISSUE_ONE_TIME_SCHEDULE_WAKE_REASON
+        ? {
+            scheduleId: readNonEmptyString(payload.issueOneTimeScheduleId) ?? "",
+            wakeupRequestId: candidate.id,
+            assigneeAgentId: candidate.agentId,
+          }
+        : null;
       const wakeContext = parseObject(payload._paperclipWakeContext);
       const issueId =
         readNonEmptyString(payload.issueId) ??
@@ -4775,6 +4893,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             updatedAt: new Date(),
           })
           .where(eq(agentWakeupRequests.id, candidate.id));
+        await logOneTimeScheduleWakeUpdate(candidate);
         recovered += 1;
         continue;
       }
@@ -4826,6 +4945,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               updatedAt: new Date(),
             })
             .where(eq(agentWakeupRequests.id, candidate.id));
+          await logOneTimeScheduleWakeUpdate(candidate);
           recovered += 1;
           continue;
         }
@@ -4843,6 +4963,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           requestedByActorType: "system",
           requestedByActorId: dispatchActorId,
           ...(completedOnboardingGuard ? { issueStateGuard: completedOnboardingGuard } : {}),
+          ...(scheduleGuard ? { issueOneTimeScheduleGuard: scheduleGuard } : {}),
           contextSnapshot: {
             ...wakeContext,
             ...(issueId ? { issueId, taskId: issueId } : {}),
@@ -4927,6 +5048,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         );
         deferred += 1;
       }
+      // Admission may produce only a skipped/deferred receipt, with no run
+      // event to refresh the visible schedule. Publish after the wake write.
+      await logOneTimeScheduleWakeUpdate(candidate);
     }
 
     return { scanned: candidates.length, dispatched, recovered, deferred };

@@ -34,6 +34,7 @@ export async function assertCanManageIssueMonitor(
   companyId: string,
   assigneeAgentId: string | null,
   monitorChanged: boolean,
+  controlName = "issue monitors",
 ) {
   if (!monitorChanged) return;
   if (req.actor.type === "board") return;
@@ -55,7 +56,7 @@ export async function assertCanManageIssueMonitor(
   )
     return;
   throw forbidden(
-    "Only the assignee agent or a board user can manage issue monitors",
+    `Only the assignee agent or a board user can manage ${controlName}`,
   );
 }
 
