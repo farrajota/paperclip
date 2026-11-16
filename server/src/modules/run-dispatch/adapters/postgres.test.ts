@@ -1269,6 +1269,28 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(dispatch).toHaveBeenCalledTimes(mode === "interaction" ? 1 : 0);
   });
 
+  it.each(["direct child", "non-child"] as const)("admits a blocked parent's child-completion wake past a cancelled blocker only when it is a %s", async blockerKind => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID(), blockerId = randomUUID();
+    await seedIssue({ companyId, issueId, assigneeAgentId: agentId, status: "blocked" });
+    await seedIssue({ companyId, issueId: blockerId, status: "cancelled" });
+    if (blockerKind === "direct child") await db.update(issues).set({ parentId: issueId }).where(eq(issues.id, blockerId));
+    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+    const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: {
+      issueId, wakeReason: "issue_children_completed", completedChildIssueId: blockerId, childIssueIds: [blockerId],
+    } });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const dispatch = vi.fn(async () => "triage the cancelled child");
+    expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+      reservationId: reservation.id, expectedStatus: "running", enforceContinuationOwnership: false,
+      businessWorkAdmission: true, now: new Date(), dispatch })).toMatchObject(blockerKind === "direct child"
+      ? { dispatched: true }
+      : { dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_blocked" } });
+    expect(dispatch).toHaveBeenCalledTimes(blockerKind === "direct child" ? 1 : 0);
+  });
+
   it.each(["reservation", "dispatch"] as const)("orders recovery %s behind a coordinator before taking finalization's issue and run locks", async boundary => {
     const f = await seedRecoveryAdmission();
     let signalLocked!: () => void, allowFinalization!: () => void;

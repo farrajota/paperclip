@@ -38,6 +38,17 @@ export function createHeartbeatQueueTestDependencies(db: Db): QueueTestDependenc
     issuesSvc: {
       getDependencyReadiness: vi.fn<HeartbeatQueueDependencies["issuesSvc"]["getDependencyReadiness"]>(),
       listDependencyReadiness: vi.fn(async () => new Map()),
+      getDependencyReadinessForWake: vi.fn<HeartbeatQueueDependencies["issuesSvc"]["getDependencyReadinessForWake"]>(
+        async (_companyId, issueId) => ({
+          issueId,
+          blockerIssueIds: [],
+          unresolvedBlockerIssueIds: [],
+          unresolvedBlockerCount: 0,
+          pendingFinalizeBlockerIssueIds: [],
+          allBlockersDone: true,
+          isDependencyReady: true,
+        }),
+      ),
     },
     treeControlSvc: { getActivePauseHoldGate: vi.fn(async () => null) },
     budgets: { getInvocationBlock: vi.fn(async () => null) },
