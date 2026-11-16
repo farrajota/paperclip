@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Patch Changes
+- Accept one-time schedule timestamps whose UTC offset is not a whole hour (for example `+05:30` or `+05:45`); offset hours and minutes were read from the wrong capture groups, so those timestamps were rejected as invalid and out-of-range offset hours were never range-checked.
 - Added native one-time issue schedules with explicit UTC-offset/IANA-time-zone input, durable due wake intents, assignee/issue invalidation, native admission, cancellation, and persisted wake/run status in the issue detail UI.
 - Refresh mounted one-time schedule cards through native run/activity invalidation, including due/admission receipts without a run; expose controls in default desktop/mobile task-chat Properties and Classic Activity, retaining normalized UTC text and HTML datetime for Date and string timestamps.
 - Keep scheduling fields full-width and vertically stacked inside desktop and mobile Properties panes so required date/time and UTC-offset inputs neither overlap nor extend beyond the reader.

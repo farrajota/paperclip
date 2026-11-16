@@ -46,7 +46,8 @@ export function normalizeIssueScheduleTime(
   if (!match) {
     throw new Error("A future timestamp with an explicit UTC offset is required");
   }
-  const [, yearText, monthText, dayText, hourText, minuteText, secondText, , , , offsetHourText, offsetMinuteText] = match;
+  // Groups: 1-6 date/time, 7 the whole zone suffix, 8 its sign, 9-10 offset hours/minutes.
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, , , offsetHourText, offsetMinuteText] = match;
   const year = Number(yearText);
   const month = Number(monthText);
   const day = Number(dayText);
