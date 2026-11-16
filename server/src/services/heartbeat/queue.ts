@@ -164,7 +164,7 @@ import type { createHeartbeatRunState } from "./run-state.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
 import type { HeartbeatRecoveryDependencies, createHeartbeatRecovery } from "./recovery.js";
-import type { issueService } from "../issues.js";
+import { dependencyReadinessWakeReason, type issueService } from "../issues.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
 import type { budgetService } from "../budgets.js";
 import type { instanceSettingsService } from "../instance-settings.js";
@@ -187,7 +187,10 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   Pick<HeartbeatRecoveryDependencies, "setRunStatus"> {
   sweepPendingCleanupLeases: ReturnType<typeof createHeartbeatRecovery>["sweepPendingCleanupLeases"];
   options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck">;
-  issuesSvc: Pick<ReturnType<typeof issueService>, "getDependencyReadiness" | "listDependencyReadiness">;
+  issuesSvc: Pick<
+    ReturnType<typeof issueService>,
+    "getDependencyReadiness" | "listDependencyReadiness" | "getDependencyReadinessForWake"
+  >;
   treeControlSvc: Pick<ReturnType<typeof issueTreeControlService>, "getActivePauseHoldGate">;
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
   instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "getExperimental">;
@@ -1113,12 +1116,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return null;
       }
 
-      const dependencyReadiness = await issuesSvc.listDependencyReadiness(
+      // Same wake-aware readiness as the enqueue gate, so a queued
+      // child-completion wake is not cancelled for a cancelled direct child,
+      // even after a later wake was coalesced into this run.
+      const readiness = await issuesSvc.getDependencyReadinessForWake(
         run.companyId,
-        [issueId],
+        issueId,
+        dependencyReadinessWakeReason(context),
       );
-      const readiness = dependencyReadiness.get(issueId);
-      const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
+      const unresolvedBlockerCount = readiness.unresolvedBlockerCount;
       if (
         unresolvedBlockerCount > 0 &&
         !allowsIssueInteractionWake(
@@ -1129,7 +1135,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         await cancelQueuedRunForBlockedDependencies(
           run,
           issueId,
-          readiness?.unresolvedBlockerIssueIds ?? [],
+          readiness.unresolvedBlockerIssueIds,
         );
         logger.info(
           { runId: run.id, issueId, unresolvedBlockerCount },
@@ -3647,9 +3653,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
-          const dependencyReadiness = await issuesSvc
-            .listDependencyReadiness(issue.companyId, [issue.id], tx)
-            .then((rows) => rows.get(issue.id) ?? null);
+          // The wake reason matters: a parent's child-completion wake is not
+          // suppressed by its own cancelled direct children (see
+          // getDependencyReadinessForWake).
+          const dependencyReadiness = await issuesSvc.getDependencyReadinessForWake(
+            issue.companyId,
+            issue.id,
+            readNonEmptyString(enrichedContextSnapshot.wakeReason),
+            tx,
+          );
 
           // Blocked descendants should stay idle until the final blocker resolves.
           // Human comment/mention wakes are the exception: they may run in a

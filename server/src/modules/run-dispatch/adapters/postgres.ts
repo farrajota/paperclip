@@ -36,7 +36,7 @@ import { collectDispositionRepairSourceState } from "../../../services/recovery/
 import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
-import { issueService } from "../../../services/issues.js";
+import { dependencyReadinessWakeReason, issueService } from "../../../services/issues.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
@@ -493,8 +493,13 @@ export function createPostgresRunDispatchAdapter(
       : null;
     if (isBlocked()) return { agentFound: true, facts };
 
-    const dependencyReadiness = await issuesSvcForRead.listDependencyReadiness(input.companyId, [issueId]);
-    const readiness = dependencyReadiness.get(issueId);
+    // A child-completion wake coalesced into this retry must not be
+    // suppressed by the parent's own cancelled direct children.
+    const readiness = await issuesSvcForRead.getDependencyReadinessForWake(
+      input.companyId,
+      issueId,
+      dependencyReadinessWakeReason(input.contextSnapshot),
+    );
     facts.dependenciesBlocked =
       readiness && !readiness.isDependencyReady
         ? {
@@ -1296,8 +1301,23 @@ export function createPostgresRunDispatchAdapter(
         currentStatus: facts.issueStatus,
       });
     }
+    // A parent's child-completion wake is judged past its own cancelled direct
+    // children (see getDependencyReadinessForWake). The parent stays blocked on
+    // them, and this run is how its manager learns of the cancellation and
+    // triages or escalates. Only that case is admitted while blocked: the wake
+    // must be ready under the wake-aware rule and not under the general rule.
+    const wakeReadiness = await issuesSvc.getDependencyReadinessForWake(
+      run.companyId,
+      issueId,
+      dependencyReadinessWakeReason(contextSnapshot),
+      tx,
+    );
     if (facts.issueStatus === "blocked") {
-      return reject("issue_blocked", "Cancelled because the task is blocked before provider dispatch", { issueId });
+      const generalReadiness = await issuesSvc.getDependencyReadiness(issueId, tx);
+      const admittedPastCancelledChildren = wakeReadiness.isDependencyReady && !generalReadiness.isDependencyReady;
+      if (!admittedPastCancelledChildren) {
+        return reject("issue_blocked", "Cancelled because the task is blocked before provider dispatch", { issueId });
+      }
     }
     if (facts.reviewParticipant.isInReview && facts.reviewParticipant.hasParticipant
       && !currentReviewOwner && !facts.isInteractionWake) {
@@ -1330,12 +1350,11 @@ export function createPostgresRunDispatchAdapter(
       }
     }
 
-    const readiness = await issuesSvc.getDependencyReadiness(issueId, tx);
-    if (!readiness.isDependencyReady) {
+    if (!wakeReadiness.isDependencyReady) {
       return reject("issue_dependencies_blocked", "Cancelled because one or more task dependencies are not complete", {
         issueId,
-        unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
-        unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+        unresolvedBlockerIssueIds: wakeReadiness.unresolvedBlockerIssueIds,
+        unresolvedBlockerCount: wakeReadiness.unresolvedBlockerCount,
       });
     }
 

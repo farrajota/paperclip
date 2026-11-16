@@ -37,7 +37,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { heartbeatService, mergeCoalescedContextSnapshot } from "../services/heartbeat.ts";
+import { legacyDispositionFingerprint } from "../services/recovery/legacy-continuation.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -86,6 +87,13 @@ async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
       "updated_at" timestamptz NOT NULL DEFAULT now()
     );
   `));
+}
+
+// Scoped to one run: a follow-up run of the same agent may reach the adapter
+// before a test reads the count.
+function adapterCallsForRun(runId: string) {
+  return (mockAdapterExecute.mock.calls as unknown as Array<[{ runId?: string } | undefined]>)
+    .filter(([input]) => input?.runId === runId).length;
 }
 
 async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
@@ -1514,5 +1522,582 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         interaction: true,
       },
     });
+  });
+
+  async function seedManagerParentWithCancelledChildBlocker() {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "Manager",
+      role: "manager",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Managed parent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: managerId,
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: childId,
+        companyId,
+        parentId,
+        title: "Specialist child",
+        status: "cancelled",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    // The manager made its own child a blocker of the parent as well.
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: childId,
+      relatedIssueId: parentId,
+      type: "blocks",
+    });
+    return { companyId, managerId, parentId, childId };
+  }
+
+  // Every run that carries this child's completion wake for the parent,
+  // including one it was coalesced into.
+  function childCompletionRunIds(parentId: string, childId: string) {
+    return db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${parentId}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'completedChildIssueId' = ${childId}`,
+        ),
+      )
+      .then((rows) => rows.map((row) => row.id));
+  }
+
+  function childrenCompletedContext(parentId: string, childId: string) {
+    return {
+      issueId: parentId,
+      taskId: parentId,
+      wakeReason: "issue_children_completed",
+      source: "issue.children_completed",
+      completedChildIssueId: childId,
+      childIssueIds: [childId],
+    };
+  }
+
+  it("delivers issue_children_completed to the manager when a cancelled direct child also blocks the parent", async () => {
+    const { managerId, parentId, childId } = await seedManagerParentWithCancelledChildBlocker();
+
+    const wake = await heartbeat.wakeup(managerId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: parentId, completedChildIssueId: childId, childIssueIds: [childId] },
+      contextSnapshot: childrenCompletedContext(parentId, childId),
+    });
+    expect(wake).not.toBeNull();
+
+    const dispatched = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, wake!.id))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    }, 10_000);
+    expect(dispatched).toBe(true);
+    expect(mockAdapterExecute).toHaveBeenCalled();
+
+    const wakeRequests = await db
+      .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, managerId),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${parentId}`,
+        ),
+      );
+    expect(wakeRequests.map((row) => row.reason)).toEqual(["issue_children_completed"]);
+    expect(wakeRequests[0]?.status).not.toBe("skipped");
+
+    // The cancelled blocker is still unresolved for the parent itself: the
+    // wake must not check the parent out or move it out of `blocked`.
+    const parent = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, parentId))
+      .then((rows) => rows[0] ?? null);
+    expect(parent).toMatchObject({ status: "blocked", checkoutRunId: null });
+  });
+
+  it("keeps a cancelled non-child blocker gating the parent's issue_children_completed wake", async () => {
+    const { companyId, managerId, parentId, childId } = await seedManagerParentWithCancelledChildBlocker();
+    const outsiderId = randomUUID();
+    await db.insert(issues).values({
+      id: outsiderId,
+      companyId,
+      title: "Unrelated prerequisite",
+      status: "cancelled",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: outsiderId,
+      relatedIssueId: parentId,
+      type: "blocks",
+    });
+
+    const wake = await heartbeat.wakeup(managerId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: parentId, completedChildIssueId: childId, childIssueIds: [childId] },
+      contextSnapshot: childrenCompletedContext(parentId, childId),
+    });
+    expect(wake).toBeNull();
+
+    const wakeRequest = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        status: agentWakeupRequests.status,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, managerId),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${parentId}`,
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(wakeRequest).toMatchObject({
+      reason: "issue_dependencies_blocked",
+      status: "skipped",
+      payload: expect.objectContaining({ unresolvedBlockerIssueIds: [outsiderId] }),
+    });
+    const parentRuns = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${parentId}`)
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(parentRuns).toBe(0);
+  });
+
+  it("keeps a cancelled direct child blocker gating the parent's other wakes", async () => {
+    const { managerId, parentId, childId } = await seedManagerParentWithCancelledChildBlocker();
+
+    const wake = await heartbeat.wakeup(managerId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: parentId, resolvedBlockerIssueId: childId },
+      contextSnapshot: {
+        issueId: parentId,
+        wakeReason: "issue_blockers_resolved",
+        resolvedBlockerIssueId: childId,
+      },
+    });
+    expect(wake).toBeNull();
+
+    const wakeRequest = await db
+      .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, managerId),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${parentId}`,
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(wakeRequest).toMatchObject({ reason: "issue_dependencies_blocked", status: "skipped" });
+  });
+
+  it("claims a queued issue_children_completed run when its only blocker is a cancelled direct child", async () => {
+    const { companyId, managerId, parentId, childId } = await seedManagerParentWithCancelledChildBlocker();
+    const wakeupRequestId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId: managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: parentId, completedChildIssueId: childId, childIssueIds: [childId] },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: childrenCompletedContext(parentId, childId),
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    await heartbeat.resumeQueuedRuns();
+
+    const settled = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded" || run?.status === "cancelled";
+    }, 10_000);
+    expect(settled).toBe(true);
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).toMatchObject({ status: "succeeded" });
+    expect(run?.errorCode).not.toBe("issue_dependencies_blocked");
+  });
+
+  it("runs the manager once when the child-completion wake is coalesced into a scheduled disposition repair", async () => {
+    const { companyId, managerId, parentId, childId } = await seedManagerParentWithCancelledChildBlocker();
+    // The successful manager run that recovery is repairing, and the repair it
+    // scheduled before the operator cancelled the child (demo 4B, 2026-11-12).
+    const sourceRunId = randomUUID();
+    const episode = { id: randomUUID(), attempt: 1, maxAttempts: 2 };
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "succeeded",
+      runtimeMode: "legacy",
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: parentId, legacyDispositionEpisode: episode },
+    });
+    const repairRunId = randomUUID();
+    const repairWakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: repairWakeupRequestId,
+      companyId,
+      agentId: managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_disposition_repair",
+      payload: { issueId: parentId },
+      status: "queued",
+      requestedByActorType: "system",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: repairRunId,
+      wakeupRequestId: repairWakeupRequestId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      runtimeMode: "legacy",
+      retryOfRunId: sourceRunId,
+      scheduledRetryAt: new Date(Date.now() - 1_000),
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "issue_disposition_repair",
+      contextSnapshot: {
+        ...childrenCompletedContext(parentId, childId),
+        retryReason: "issue_disposition_repair",
+        retryOfRunId: sourceRunId,
+        dispositionRepairSourceRunId: sourceRunId,
+        dispositionRepairAttempt: 2,
+        dispositionRepairFingerprint: legacyDispositionFingerprint(companyId, parentId, managerId, episode.id),
+        legacyDispositionEpisode: { ...episode, attempt: 2 },
+      },
+    });
+
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: repairRunId })
+      .where(eq(agentWakeupRequests.id, repairWakeupRequestId));
+
+    const promoted = await heartbeat.promoteDueScheduledRetries(new Date());
+    expect(promoted.runIds).toContain(repairRunId);
+    await heartbeat.resumeQueuedRuns();
+
+    const settled = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, repairRunId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded" || run?.status === "cancelled";
+    }, 10_000);
+    expect(settled).toBe(true);
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, repairRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).toMatchObject({ status: "succeeded" });
+    expect(adapterCallsForRun(repairRunId)).toBe(1);
+    expect(await childCompletionRunIds(parentId, childId)).toEqual([repairRunId]);
+  });
+
+  it("claims a queued child-completion run after a later wake was coalesced into it", async () => {
+    const { companyId, managerId, parentId, childId } = await seedManagerParentWithCancelledChildBlocker();
+    const wakeupRequestId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId: managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: parentId, completedChildIssueId: childId, childIssueIds: [childId] },
+      status: "queued",
+    });
+    // Coalescing keeps only the latest wakeReason; the child-completion
+    // fields of the earlier wake stay in the context.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: mergeCoalescedContextSnapshot(childrenCompletedContext(parentId, childId), {
+        issueId: parentId,
+        taskId: parentId,
+        wakeReason: "issue_status_changed",
+        source: "issue.status_changed",
+      }),
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    await heartbeat.resumeQueuedRuns();
+
+    const settled = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded" || run?.status === "cancelled";
+    }, 10_000);
+    expect(settled).toBe(true);
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).toMatchObject({ status: "succeeded" });
+  });
+
+  it("runs a reserved repair once when its parent's child became live, then delivers the child-completion wake", async () => {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const specialistId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "Manager",
+        role: "manager",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: specialistId,
+        companyId,
+        name: "Specialist",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Managed parent",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: managerId,
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: childId,
+        companyId,
+        parentId,
+        title: "Specialist child",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: specialistId,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    // The repair was reserved while the child was parked; the child has
+    // since become live again through a queued wake of its own.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: specialistId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: childId },
+      status: "queued",
+      requestedByActorType: "system",
+    });
+    const sourceRunId = randomUUID();
+    const episode = { id: randomUUID(), attempt: 1, maxAttempts: 2 };
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "succeeded",
+      runtimeMode: "legacy",
+      finishedAt: new Date(),
+      contextSnapshot: { issueId: parentId, legacyDispositionEpisode: episode },
+    });
+    const repairRunId = randomUUID();
+    const repairWakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: repairWakeupRequestId,
+      companyId,
+      agentId: managerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_disposition_repair",
+      payload: { issueId: parentId },
+      status: "queued",
+      requestedByActorType: "system",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: repairRunId,
+      wakeupRequestId: repairWakeupRequestId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      runtimeMode: "legacy",
+      retryOfRunId: sourceRunId,
+      scheduledRetryAt: new Date(Date.now() - 1_000),
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "issue_disposition_repair",
+      contextSnapshot: {
+        issueId: parentId,
+        taskId: parentId,
+        wakeReason: "issue_disposition_repair",
+        retryReason: "issue_disposition_repair",
+        retryOfRunId: sourceRunId,
+        dispositionRepairSourceRunId: sourceRunId,
+        dispositionRepairAttempt: 2,
+        dispositionRepairFingerprint: legacyDispositionFingerprint(companyId, parentId, managerId, episode.id),
+        legacyDispositionEpisode: { ...episode, attempt: 2 },
+      },
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: repairRunId })
+      .where(eq(agentWakeupRequests.id, repairWakeupRequestId));
+
+    await heartbeat.promoteDueScheduledRetries(new Date());
+    await heartbeat.resumeQueuedRuns();
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, repairRunId))
+        .then((rows) => rows[0] ?? null);
+      return ["succeeded", "cancelled", "failed"].includes(run?.status ?? "");
+    }, 10_000);
+    await heartbeat.waitForRunExecutionDrain(repairRunId);
+    const repair = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, repairRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(repair).toMatchObject({ status: "succeeded" });
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const activeActions = await db
+      .select({ kind: issueRecoveryActions.kind, cause: issueRecoveryActions.cause })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.sourceIssueId, parentId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      );
+    expect(activeActions).toEqual([]);
+
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "cancelled" })
+      .where(sql`${agentWakeupRequests.payload} ->> 'issueId' = ${childId}`);
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, childId));
+    const wake = await heartbeat.wakeup(managerId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: parentId, completedChildIssueId: childId, childIssueIds: [childId] },
+      contextSnapshot: childrenCompletedContext(parentId, childId),
+    });
+    expect(wake).not.toBeNull();
+    const delivered = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, wake!.id))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    }, 10_000);
+    expect(delivered).toBe(true);
+    expect(adapterCallsForRun(wake!.id)).toBe(1);
+    expect(await childCompletionRunIds(parentId, childId)).toEqual([wake!.id]);
   });
 });
