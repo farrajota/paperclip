@@ -1,9 +1,9 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
-import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
+import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker, historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
 import { z } from "zod";
-import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -105,6 +105,20 @@ export function executionBlockerPredicate() {
   );
 }
 
+/** Mirrors the adapter gates of admitExplicitNativeContinuation that refuse
+ * unconditionally. Conditional paperclip_runner admission stays with admission. */
+export async function supportsExplicitContinuation(db: Db, companyId: string, cause: string, run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "runtimeMode" | "runnerProfileJson">): Promise<boolean> {
+  const [agent] = await db.select({ adapterType: agents.adapterType }).from(agents).where(and(
+    eq(agents.companyId, companyId), eq(agents.id, run.agentId),
+  )).limit(1);
+  if (!agent) return false;
+  if (!isConversationAdapter(agent.adapterType)) return agent.adapterType === "paperclip_runner";
+  if (cause !== "legacy_execution_requires_reconciliation" || run.runtimeMode !== "legacy") return true;
+  // A settings change never converts a known process/webhook execution into a conversation.
+  const historical = await historicalAdapterType(db, run);
+  return !historical || isConversationAdapter(historical);
+}
+
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,
@@ -186,10 +200,13 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       and (consumed.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text
         or consumed.context_snapshot->'wakeCommentIds' @> jsonb_build_array(${issueComments.id}::text)))`,
   )) : [];
+  // For any adapter admission refuses, neither a retry nor a comment can ever
+  // be admitted, so offering them is a dead end.
+  const continuationSupported = run ? await supportsExplicitContinuation(db, companyId, action.cause, run) : false;
   const cancellation = run ? readRunCancellation(run.resultJson) : null;
-  const eligibleContinuation = Boolean(!restoreHold && run && conversation?.assigneeAgentId === run.agentId &&
+  const eligibleContinuation = Boolean(!restoreHold && run && continuationSupported && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && canContinueCancelledRun(run));
-  const canRetry = Boolean(!restoreHold && run && conversation?.assigneeAgentId === run.agentId &&
+  const canRetry = Boolean(!restoreHold && run && continuationSupported && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && await canRetryStoppedRun(db, run));
   const runError = run && canRetry && isPreDispatchReviewWait(run)
     ? "Waiting for review; this continuation never started."
@@ -207,6 +224,9 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId),
   )).limit(1) : [];
   let nextAction = action.nextAction;
+  if (run && !continuationSupported && action.cause === "legacy_execution_requires_reconciliation") {
+    nextAction += " This run's adapter cannot be continued by retry or comment. Inspect the run, then record its observed outcome through execution reconciliation to release this task.";
+  }
   if (canRetry && !eligibleContinuation) nextAction += " Try again or send a new message to continue once the previous execution has stopped.";
   if (chatBinding && !restoreHold) {
     if (chatBinding.state === "endpoint_removed" || !chatBinding.endpointStatus || chatBinding.endpointStatus === "archived") {
@@ -217,7 +237,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     } else {
       nextAction = "Send a new chat message to continue this conversation.";
     }
-  } else if (!restoreHold && run?.status === "cancelled" && !eligibleContinuation && !canRetry && action.cause === "legacy_execution_requires_reconciliation") {
+  } else if (!restoreHold && continuationSupported && run?.status === "cancelled" && !eligibleContinuation && !canRetry && action.cause === "legacy_execution_requires_reconciliation") {
     nextAction += " Inspect the run before sending a new message to request continuation.";
   }
 
