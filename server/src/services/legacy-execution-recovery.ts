@@ -86,7 +86,11 @@ export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */
-export async function terminalizeLegacyExecution(input: {
+export async function terminalizeLegacyExecution(input: TerminalizeLegacyExecutionInput) {
+  return (await terminalizeLegacyExecutionWithOutcome(input)).run;
+}
+
+type TerminalizeLegacyExecutionInput = {
   db: Db;
   run: Run;
   status: string;
@@ -97,7 +101,13 @@ export async function terminalizeLegacyExecution(input: {
   /** Adapter settlement records a copy-back failure before host finalization. */
   recordRestoreFailureOnly?: boolean;
   workspaceRestoreSource?: LegacyWorkspaceRestoreSource;
-}) {
+};
+
+/** `escalated` is true only when this call released the task's lock or recorded
+ * a board decision; it is false when an earlier decision already covers the run. */
+export async function terminalizeLegacyExecutionWithOutcome(
+  input: TerminalizeLegacyExecutionInput,
+): Promise<{ run: Run | null; escalated: boolean }> {
   const { db, run, status } = input;
   let patch = input.patch;
   const issueId =
@@ -124,7 +134,7 @@ export async function terminalizeLegacyExecution(input: {
       eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
     )).for("update");
     if (!current || (current.runtimeMode !== "legacy" && !(input.recordRestoreFailureOnly && current.runtimeMode === "native")) ||
-        (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
+        (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return { run: null, escalated: false };
     if (patch?.resultJson !== undefined) patch = { ...patch,
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
         input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson),
@@ -148,7 +158,7 @@ export async function terminalizeLegacyExecution(input: {
         ),
       )
       .returning();
-    if (!updated) return null;
+    if (!updated) return { run: null, escalated: false };
     const retainedLeaseIds = await preserveLegacyWorkspaceRestoreSources(tx as unknown as Db,
       input.recordRestoreFailureOnly ? { ...updated, status: "failed" } : updated, input.workspaceRestoreSource);
     if (retainedLeaseIds.length) {
@@ -166,7 +176,9 @@ export async function terminalizeLegacyExecution(input: {
     const needsRecovery = input.recordRestoreFailureOnly
       ? retainedLeaseIds.length > 0 || hasRequiredWorkspaceRecovery(updated.resultJson)
       : !input.reconcileIfNeeded || await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, updated);
-    if (!needsRecovery) return updated;
+    if (!needsRecovery) return { run: updated, escalated: false };
+    const releasedLock = !input.recordRestoreFailureOnly &&
+      (task?.executionRunId === run.id || task?.checkoutRunId === run.id);
     if (!input.recordRestoreFailureOnly && task?.executionRunId === run.id)
       await tx
         .update(issues)
@@ -192,7 +204,7 @@ export async function terminalizeLegacyExecution(input: {
         eq(issueRecoveryActions.fingerprint, fingerprint),
       )).orderBy(desc(issueRecoveryActions.createdAt)).limit(1).for("update");
       const decision = existing?.evidence.executionReconciliation as Record<string, unknown> | undefined;
-      if (hasRequiredWorkspaceRecovery(existing?.evidence) && decision?.runId === run.id) return updated;
+      if (hasRequiredWorkspaceRecovery(existing?.evidence) && decision?.runId === run.id) return { run: updated, escalated: releasedLock };
       const now = new Date();
       const evidence = {
         ...existing?.evidence,
@@ -215,7 +227,7 @@ export async function terminalizeLegacyExecution(input: {
         sourceIssueId: task.id, kind: "active_run_watchdog",
         cause: run.runtimeMode === "native" ? "native_continuation_requires_reconciliation" : LEGACY_RECOVERY_CAUSE,
         fingerprint, attemptCount: 1 });
-      return updated;
+      return { run: updated, escalated: true };
     }
     const review = task?.status === "in_review" ? parseIssueExecutionState(task.executionState) : null;
     const isCurrentReviewer = review?.status === "pending" &&
@@ -263,7 +275,7 @@ export async function terminalizeLegacyExecution(input: {
             ),
           ),
         )).limit(1);
-      if (reconciled) return updated;
+      if (reconciled) return { run: updated, escalated: releasedLock };
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
         sourceIssueId: task.id,
@@ -290,8 +302,9 @@ export async function terminalizeLegacyExecution(input: {
         wakePolicy: null,
         supersedeOnIdentityChange: true,
       });
+      return { run: updated, escalated: true };
     }
-    return updated;
+    return { run: updated, escalated: releasedLock };
   });
 }
 
