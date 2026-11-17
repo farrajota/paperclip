@@ -1572,8 +1572,11 @@ export function createDbSetupTokenCleanupStore(db: Db): SetupTokenCleanupStore {
 
     async remove(identity): Promise<void> {
       // The delete matches the company, the owner, and the adapter, so it never
-      // removes a row by the session id alone.
-      await writeLoginCleanup(db, DELIVERY_QUEUES.setupTokenCleanup, tx => tx.delete(adapterAuthSessions).where(scopeMatch(identity)));
+      // removes a row by the session id alone. Removing a record never creates
+      // cleanup work, so it does not wake the cleanup worker. The reaper removes
+      // inside its own sweep; a wake from that delete would count as a write
+      // during the sweep and hold the worker busy for another retry interval.
+      await db.delete(adapterAuthSessions).where(scopeMatch(identity));
     },
 
     async listReapable(now): Promise<SetupTokenCleanupRecord[]> {

@@ -223,4 +223,34 @@ describe.skipIf(!support.supported)("durable login cleanup", () => {
     await quiet(c);
     expect(releaseById).toHaveBeenCalledTimes(1); expect(await cleanup.listReapable(Date.now())).toEqual([]);
   });
+  it("settles a consumed claim whose producer wake reads before the consume and finishes after the quiet window", async () => {
+    const cleanup = createDbSetupTokenCleanupStore(observed), releaseById = vi.fn(async () => {});
+    let gate: Promise<void> | null = null, entered: (() => void) | null = null;
+    const store = { ...cleanup, async listReapable(now: number) {
+      const rows = await cleanup.listReapable(now);
+      const wait = gate; gate = null; entered?.(); entered = null;
+      if (wait) await wait;
+      return rows;
+    } };
+    const c = coordinator(db, undefined, error => errors.push(error));
+    const reaper = createSetupTokenReaper({ store, leases: { releaseById } });
+    await registerLoginCleanupWork(c, [{ queue: DELIVERY_QUEUES.setupTokenCleanup, run: reaper.sweep, next: loginCleanupSchedule(observed).setupToken }], () => true).ready;
+    await quiet(c);
+    const identity = { sessionId: randomUUID(), companyId, ownerUserId: "setup", adapterType: "claude_local" };
+    const deadline = Date.now() + 120_000;
+    await cleanup.record({ ...identity, environmentId, leaseId: randomUUID(), state: "starting", deadline, boundAt: null });
+    await settle(); expect(c.nextWakeAt()).toBe(deadline);
+    // The transition's wake reads the claim before it is consumed. Under a slow
+    // database that sweep is still in flight when the fake clock jumps through
+    // the whole quiet window, so the consumed claim is reaped only afterwards.
+    let release!: () => void;
+    gate = new Promise<void>(resolve => { release = resolve; });
+    const read = new Promise<void>(resolve => { entered = resolve; });
+    expect(await transitionSetupTokenSessionToStored(observed, identity)).toBe(true);
+    await vi.advanceTimersByTimeAsync(0); await read;
+    expect(await cleanup.consumeStoredClaim(identity)).not.toBeNull();
+    setTimeout(release, 60_000);
+    await quiet(c);
+    expect(releaseById).toHaveBeenCalledTimes(1); expect(await cleanup.listReapable(Date.now())).toEqual([]);
+  });
 });
