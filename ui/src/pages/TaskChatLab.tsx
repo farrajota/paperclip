@@ -273,7 +273,7 @@ export function TaskChatLab() {
               </div>
             ) : (
               <div className="mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col">
-                <TaskChatThreadView items={items} renderMessageActions={labMessageActions} />
+                <TaskChatThreadView items={items} renderMessageActions={labMessageActions} navigationHistoryPartial={false} />
               </div>
             )}
           </div>

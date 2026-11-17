@@ -16,6 +16,15 @@ const PAPERCLIP_DECISION_SIGNING_SECRET =
 const PAPERCLIP_TOOL_ACTION_SIGNING_SECRET =
   process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET ?? "playwright-e2e-tool-action-signing-secret";
 const PLAYWRIGHT_CHANNEL = process.env.PAPERCLIP_PLAYWRIGHT_CHANNEL;
+// Outside outputDir, which Playwright empties at the start of each run. CI
+// uploads this directory next to the Playwright report.
+const POSTGRES_LOG_FILE = path.resolve(import.meta.dirname, "postgres-log/postgres.log");
+// Worker processes reload this config while the server is running; only the
+// main process may clear a previous run's log, and workers inherit this marker.
+if (!process.env.PAPERCLIP_E2E_POSTGRES_LOG_CLEARED) {
+  fs.rmSync(path.dirname(POSTGRES_LOG_FILE), { recursive: true, force: true });
+  process.env.PAPERCLIP_E2E_POSTGRES_LOG_CLEARED = "true";
+}
 
 process.env.PAPERCLIP_HOME = PAPERCLIP_HOME;
 process.env.PAPERCLIP_CONFIG = PAPERCLIP_CONFIG;
@@ -79,7 +88,9 @@ export default defineConfig({
       ...process.env,
       NODE_ENV: "test",
       PAPERCLIP_UI_DEV_MIDDLEWARE: "false",
-      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${path.resolve(import.meta.dirname, "fixtures/agent-chat-github.mjs")} --import=${path.resolve(import.meta.dirname, "fixtures/ai-connection-provider.mjs")}`,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${path.resolve(import.meta.dirname, "fixtures/agent-chat-github.mjs")} --import=${path.resolve(import.meta.dirname, "fixtures/ai-connection-provider.mjs")} --import=${path.resolve(import.meta.dirname, "fixtures/postgres-lock-diagnostics.mjs")}`,
+      // Enables lock-wait logging on the embedded Postgres; see the fixture.
+      PAPERCLIP_E2E_POSTGRES_LOG_FILE: POSTGRES_LOG_FILE,
       PORT: String(PORT),
       PAPERCLIP_OPEN_ON_LISTEN: "false",
       PAPERCLIP_API_URL: BASE_URL,

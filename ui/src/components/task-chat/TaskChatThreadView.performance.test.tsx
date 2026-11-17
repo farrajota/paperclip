@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { memo } from "react";
+import { act, memo } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -27,11 +27,32 @@ beforeEach(() => {
 afterEach(() => {
   flushSync(() => root.unmount());
   host.remove();
+  vi.unstubAllGlobals();
 });
 
 const history: TaskChatMessageItem[] = Array.from({ length: 200 }, (_, index) => ({
   id: `message-${index}`, kind: "message", author: "agent", text: `Response ${index}`,
 }));
+
+function rect(top: number, bottom: number): DOMRect {
+  return { top, bottom, left: 0, right: 300, width: 300, height: bottom - top, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+}
+
+function modelNativeTargetGeometry(scroller: HTMLElement, anchor: HTMLElement, summary: HTMLElement) {
+  const summaryDocumentTop = 900;
+  Object.defineProperty(scroller, "clientHeight", { value: 200, configurable: true });
+  scroller.getBoundingClientRect = () => rect(100, 300);
+  anchor.getBoundingClientRect = () => rect(100 - scroller.scrollTop, 1100 - scroller.scrollTop);
+  summary.getBoundingClientRect = () => rect(
+    100 + summaryDocumentTop - scroller.scrollTop,
+    140 + summaryDocumentTop - scroller.scrollTop,
+  );
+  const anchorScroll = vi.fn(() => { scroller.scrollTop = 400; });
+  const summaryScroll = vi.fn(() => { scroller.scrollTop = 800; });
+  Object.defineProperty(anchor, "scrollIntoView", { value: anchorScroll, configurable: true });
+  Object.defineProperty(summary, "scrollIntoView", { value: summaryScroll, configurable: true });
+  return { anchorScroll, summaryScroll };
+}
 
 it("does no historical render work for a live-tail-only update", () => {
   const actions = vi.fn(() => null);
@@ -74,4 +95,85 @@ it("uses the current gallery callback after the provider changes", () => {
   flushSync(() => host.querySelector<HTMLButtonElement>("button")!.click());
   expect(firstGallery).toHaveBeenCalledExactlyOnceWith("image.png");
   expect(nextGallery).toHaveBeenCalledExactlyOnceWith("image.png");
+});
+it("activates a standalone folded turn through its native disclosure and confirms the selected summary landing", async () => {
+  const turn: TaskChatItem = {
+    id: "folded-turn",
+    kind: "turn",
+    items: [{ id: "tool-1", kind: "tool", name: "Read", status: "completed", target: "src/issue.ts" }],
+    settled: true,
+    summary: { durationLabel: "8s", toolCount: 1, added: 0, removed: 0 },
+  };
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    callback(0);
+    return 1;
+  });
+  flushSync(() => root.render(
+    <TaskChatThreadView items={[turn]} navigationHistoryPartial={false} />,
+  ));
+  const scroller = host.querySelector<HTMLElement>('[data-testid="task-chat-scroller"]')!;
+  const anchor = host.querySelector<HTMLElement>('[data-thread-anchor="folded-turn"]')!;
+  const summary = anchor.querySelector<HTMLElement>('[data-testid="task-chat-turn-summary"]')!;
+  const { anchorScroll, summaryScroll } = modelNativeTargetGeometry(scroller, anchor, summary);
+  await act(async () => {
+    host.querySelector<HTMLButtonElement>('[aria-label="Turn summary: Worked"]')!.click();
+  });
+  const viewport = scroller.getBoundingClientRect();
+  const landed = summary.getBoundingClientRect();
+  expect(summaryScroll).toHaveBeenCalledWith({ block: "center", behavior: "auto" });
+  expect(anchorScroll).not.toHaveBeenCalled();
+  expect(landed.bottom).toBeGreaterThan(viewport.top);
+  expect(landed.top).toBeLessThan(viewport.bottom);
+  expect(anchor.querySelector('.tc-turn-fold[data-folded="false"]')).not.toBeNull();
+  expect(host.textContent).toContain("Opened Worked.");
+});
+
+it("confirms an attached turn summary itself when its containing message is taller than the viewport", async () => {
+  const attached: TaskChatMessageItem = {
+    id: "attached-message",
+    renderKey: "stable-attached-message",
+    kind: "message",
+    author: "agent",
+    text: "A long response whose footer summary is below the visible message body.",
+    attachedTurn: {
+      id: "attached-turn",
+      kind: "turn",
+      items: [{ id: "tool-2", kind: "tool", name: "Read", status: "completed", target: "src/issue.ts" }],
+      settled: true,
+      summary: { durationLabel: "38s", toolCount: 1, added: 0, removed: 0 },
+    },
+  };
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    callback(0);
+    return 1;
+  });
+  flushSync(() => root.render(
+    <TaskChatThreadView items={[attached]} navigationHistoryPartial={false} />,
+  ));
+  const scroller = host.querySelector<HTMLElement>('[data-testid="task-chat-scroller"]')!;
+  const anchor = host.querySelector<HTMLElement>('[data-thread-anchor="stable-attached-message"]')!;
+  const summary = anchor.querySelector<HTMLElement>('[data-testid="task-chat-turn-summary"]')!;
+  const { anchorScroll, summaryScroll } = modelNativeTargetGeometry(scroller, anchor, summary);
+  await act(async () => {
+    host.querySelector<HTMLButtonElement>('[aria-label="Turn summary: Worked"]')!.click();
+  });
+  const viewport = scroller.getBoundingClientRect();
+  const landed = summary.getBoundingClientRect();
+  expect(summaryScroll).toHaveBeenCalledWith({ block: "center", behavior: "auto" });
+  expect(anchorScroll).not.toHaveBeenCalled();
+  expect(landed.bottom).toBeGreaterThan(viewport.top);
+  expect(landed.top).toBeLessThan(viewport.bottom);
+  expect(anchor.querySelector('.tc-turn-fold[data-folded="false"]')).not.toBeNull();
+  expect(host.textContent).toContain("Opened Worked.");
+});
+
+it("updates a long-thread outline without rebuilding transcript markdown", () => {
+  flushSync(() => root.render(
+    <TaskChatThreadView items={history} scroll={false} navigationHistoryPartial />,
+  ));
+  renders.mockClear();
+  const button = host.querySelector<HTMLButtonElement>('[aria-label="Message: Agent"]')!;
+  act(() => button.dispatchEvent(new MouseEvent("mouseover", { bubbles: true })));
+  expect(renders).not.toHaveBeenCalled();
+  expect(host.querySelector('[data-thread-anchor="message-0"]')?.classList.contains("outline")).toBe(true);
 });
