@@ -444,6 +444,23 @@ export function runDetailRefetchIntervalMs(status: HeartbeatRun["status"]): 5000
   return false;
 }
 
+/**
+ * Canonicalizing the route (UUID to URL key) or resolving the company changes
+ * the agent query key for the same agent. Keeping that agent on screen while
+ * the new key loads stops the page from falling back to a skeleton, which
+ * would unmount the open run and discard its local state, such as a retry
+ * denial. A different agent still gets the skeleton. URL keys are unique only
+ * within a company, so an agent of another company is never kept, even when it
+ * shares the URL key.
+ */
+export function sameAgentRoutePlaceholder<
+  T extends { id: string; companyId: string; urlKey?: string | null; name?: string | null },
+>(previous: T | undefined, routeAgentRef: string, lookupCompanyId: string | undefined): T | undefined {
+  if (!previous) return undefined;
+  if (lookupCompanyId && previous.companyId !== lookupCompanyId) return undefined;
+  return previous.id === routeAgentRef || agentRouteRef(previous) === routeAgentRef ? previous : undefined;
+}
+
 export function RunInvocationCard({
   payload,
   censorUsernameInLogs,
@@ -825,6 +842,7 @@ export function AgentDetail() {
     queryKey: [...queryKeys.agents.detail(routeAgentRef), lookupCompanyId ?? null],
     queryFn: () => agentsApi.get(routeAgentRef, lookupCompanyId),
     enabled: canFetchAgent,
+    placeholderData: (previous) => sameAgentRoutePlaceholder(previous, routeAgentRef, lookupCompanyId),
   });
   const lifecycle = useAgentLifecycleStatus(agent);
   const resolvedCompanyId = agent?.companyId ?? selectedCompanyId;

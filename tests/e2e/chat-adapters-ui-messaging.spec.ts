@@ -1580,4 +1580,168 @@ test.describe("Failed chat task and exact run retry", () => {
       });
     }
   }
+
+  test("agent run: a retry denial from the UUID route survives the canonical agent read", async ({
+    page,
+  }) => {
+    // The UUID route canonicalizes to the agent's URL key, which changes the
+    // agent query key. The canonical read is held until the denial is shown,
+    // so Retry is always clicked while that read is still pending.
+    const now = Date.now();
+    const run = {
+      id: failedRunId,
+      companyId: seed.companyId,
+      agentId: seed.agentId,
+      status: "failed",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: new Date(now - 60_000).toISOString(),
+      finishedAt: new Date(now - 30_000).toISOString(),
+      createdAt: new Date(now - 60_000).toISOString(),
+      updatedAt: new Date(now - 30_000).toISOString(),
+      error: "The fixture provider turn failed.",
+      errorCode: "adapter_failed",
+      exitCode: 1,
+      signal: null,
+      responsibleUserId: null,
+      runtimeMode: "native",
+      driverKind: "codex_app_server",
+      nativeIssueId: issue.id,
+      usageJson: null,
+      resultJson: null,
+      sessionIdBefore: null,
+      sessionIdAfter: null,
+      logStore: null,
+      logRef: null,
+      logBytes: 0,
+      retryOfRunId: null,
+      scheduledRetryAt: null,
+      scheduledRetryAttempt: 0,
+      scheduledRetryReason: null,
+      contextSnapshot: {
+        source: "chat:slack",
+        issueId: issue.id,
+        wakeCommentId: "44444444-dddd-4ddd-8ddd-444444444444",
+        wakeCommentIds: ["44444444-dddd-4ddd-8ddd-444444444444"],
+      },
+    };
+    const isCanonicalAgentRead = (method: string, url: URL) =>
+      method === "GET" &&
+      url.pathname === "/api/agents/maya" &&
+      url.searchParams.get("companyId") === seed.companyId;
+    let markCanonicalReadRequested!: () => void;
+    const canonicalReadRequested = new Promise<void>((resolve) => {
+      markCanonicalReadRequested = resolve;
+    });
+    let releaseCanonicalRead!: () => void;
+    const canonicalReadReleased = new Promise<void>((resolve) => {
+      releaseCanonicalRead = resolve;
+    });
+    const pageClosed = new Promise<"closed">((resolve) => {
+      page.once("close", () => resolve("closed"));
+    });
+    const wakeups: Array<Record<string, unknown>> = [];
+    await page.route("**/api/**", async (route) => {
+      const url = new URL(route.request().url());
+      const pathname = url.pathname;
+      if (isCanonicalAgentRead(route.request().method(), url)) {
+        markCanonicalReadRequested();
+        // A test that fails while the read is held closes the page; the held
+        // request then has nothing left to continue.
+        if ((await Promise.race([canonicalReadReleased, pageClosed])) === "closed") return;
+        await route.continue();
+        return;
+      }
+      if (pathname === "/api/instance/settings/experimental") {
+        await fulfill(route, {
+          enableChatConnectors: true,
+          enableStreamlinedUi: true,
+        });
+        return;
+      }
+      if (pathname === `/api/companies/${seed.companyId}/heartbeat-runs`) {
+        await fulfill(route, [run]);
+        return;
+      }
+      if (pathname === `/api/heartbeat-runs/${failedRunId}`) {
+        await fulfill(route, run);
+        return;
+      }
+      if (
+        pathname === `/api/heartbeat-runs/${failedRunId}/events` ||
+        pathname === `/api/heartbeat-runs/${failedRunId}/workspace-operations` ||
+        pathname === `/api/companies/${seed.companyId}/provider-traces`
+      ) {
+        await fulfill(route, []);
+        return;
+      }
+      if (pathname === `/api/heartbeat-runs/${failedRunId}/issues`) {
+        await fulfill(route, [
+          {
+            issueId: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            status: "backlog",
+            priority: "medium",
+          },
+        ]);
+        return;
+      }
+      if (pathname === `/api/heartbeat-runs/${failedRunId}/log`) {
+        await fulfill(route, { runId: failedRunId, content: "", nextOffset: 0 });
+        return;
+      }
+      if (pathname === `/api/agents/${seed.agentId}/wakeup`) {
+        expect(route.request().method()).toBe("POST");
+        wakeups.push(bodyOf(route));
+        await fulfill(
+          route,
+          {
+            error: denial,
+            details: { code: "chat_failed_run_retry_source_denied" },
+          },
+          409,
+        );
+        return;
+      }
+      await route.continue();
+    });
+
+    const canonicalAgentResponse = page.waitForResponse((response) =>
+      isCanonicalAgentRead(response.request().method(), new URL(response.url())),
+    );
+    await page.goto(`/${seed.prefix}/agents/${seed.agentId}/runs/${failedRunId}`);
+    await canonicalReadRequested;
+    await expect(page).toHaveURL(
+      new RegExp(`/${seed.prefix}/agents/maya/runs/${failedRunId}$`),
+    );
+    const retry = page
+      .getByRole("button", { name: "Retry", exact: true })
+      .filter({ visible: true });
+    // The selected run stays on screen while the canonical read is pending.
+    await expect(retry).toHaveCount(1);
+    await retry.click();
+    await expect.poll(() => wakeups.length).toBe(1);
+    expect(wakeups[0]).toEqual({
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "retry_failed_run",
+      failedRunId,
+    });
+    await expect(page.getByText(denial, { exact: true })).toBeVisible();
+
+    releaseCanonicalRead();
+    const response = await canonicalAgentResponse;
+    expect(response.ok()).toBe(true);
+    expect(await response.json()).toMatchObject({
+      id: seed.agentId,
+      companyId: seed.companyId,
+      urlKey: "maya",
+    });
+    // The denial is the operator's only explanation for why the retry did not
+    // start, so it must survive the canonical read.
+    await expect(page.getByText(denial, { exact: true })).toBeVisible();
+    await expect(retry).toBeEnabled();
+    expect(wakeups).toHaveLength(1);
+  });
 });
