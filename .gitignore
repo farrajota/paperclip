@@ -69,6 +69,7 @@ diagnostics/
 # Playwright
 tests/e2e/test-results/
 tests/e2e/playwright-report/
+tests/e2e/postgres-log/
 tests/runner-e2e/results/
 .env.runner-e2e.local
 tests/release-smoke/test-results/
