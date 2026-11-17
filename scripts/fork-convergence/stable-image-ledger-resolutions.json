@@ -1,0 +1,458 @@
+{
+  "decisions": [
+    {
+      "id": "M-2026-11-16",
+      "date": "2026-11-16",
+      "text": "Drop stable #26 (651023fe1) and #28 (6aa948743), the charge for usage a local CLI run streamed before its timeout. zay/main keeps upstream's policy: timed-out partial usage stays a pending receipt (run-completion.ts accountingReceiptReady, run-cost-accounting.ts)."
+    },
+    {
+      "id": "B-PR9-2026-11-16",
+      "date": "2026-11-16",
+      "text": "Stable #9 (2fb77ade6) is not ported as a whole: upstream dabb8c5da (#16022) supersedes its AWS lock tests (plan row B). Its non-AWS remainder was ported in PR #29 (e5f7342fb)."
+    },
+    {
+      "id": "J-RENAME-2026-11-16",
+      "date": "2026-11-16",
+      "text": "The stable migration 0306_issue_one_time_schedules is renamed to 0381 with identical bytes (SHA-256 c7d87e08...9887819, pinned by packages/db/src/issue-one-time-schedules-migration.test.ts); its snapshot is regenerated as meta/0381_snapshot.json."
+    },
+    {
+      "id": "F-GATE-2026-11-16",
+      "date": "2026-11-16",
+      "text": "PR #30 adds a narrow issue_blocked bypass to the governance gate decideBusinessWorkIssueAdmission for child-completion wakes (fork addition, accepted)."
+    },
+    {
+      "id": "H-TEST-2026-11-16",
+      "date": "2026-11-16",
+      "text": "PR #32 adapts the stable 'records no cost for a run stopped before its first model step finished' test to upstream's zero-cent unpriced receipt (accepted)."
+    },
+    {
+      "id": "L-FIXTURE-2026-11-16",
+      "date": "2026-11-16",
+      "text": "PR #34 changes the upstream fixture in execution-blocker-read.test.ts from process to paperclip_runner and applies the retry check to the task-page dead end in task-interruption-presentation.ts (accepted)."
+    },
+    {
+      "id": "SCHEDULES-2026-11-16",
+      "date": "2026-11-16",
+      "text": "Keep the current behaviour where stranded-issue recovery may dispatch a todo issue that also has a pending one-time schedule; documented, not changed."
+    },
+    {
+      "id": "PR6-2026-11-16",
+      "date": "2026-11-16",
+      "text": "Fork PR #6 (Telegram wait merged with zay/main) closed as superseded by PR #29."
+    }
+  ],
+  "resolutions": [
+    {
+      "path": ".github/workflows/pr-trusted.yml",
+      "hunks": ["@@ -230,7 +230,11 @@"],
+      "status": "present",
+      "ref": "PR #27 (merge c76cec80e)",
+      "note": "The stacked-PR scope logic moved upstream into ci-routing.yml; the stable rule 'base zay/stable-image always runs full CI' is ported there as 'base zay/main always runs full CI'.",
+      "evidence": [{"path": ".github/workflows/ci-routing.yml", "contains": "reason='zay/main release gate'"}]
+    },
+    {
+      "path": ".github/workflows/pr.yml",
+      "hunks": ["@@ -10,6 +10,23 @@"],
+      "status": "present",
+      "ref": "PR #27 (merge c76cec80e)",
+      "note": "fork-gate job and fork-local workflow call are present; the job's if guard additionally skips label events other than profile-ci (plan conflict 2).",
+      "evidence": [
+        {"path": ".github/workflows/pr.yml", "contains": "uses: ./.github/workflows/pr-trusted.yml"},
+        {"path": ".github/workflows/pr.yml", "contains": "if: ${{ always() && (github.event.action != 'labeled'"}
+      ]
+    },
+    {
+      "path": "scripts/__tests__/e2e-shard.test.mjs",
+      "hunks": ["@@ -29,11 +29,16 @@", "@@ -157,10 +162,20 @@", "@@ -286,6 +301,12 @@"],
+      "status": "present",
+      "ref": "PR #27 (merge c76cec80e)",
+      "note": "Workflow tests ported with zay/main names: the master-pin regex also covers ci-routing.yml, the fork-gate if assertion moved to its own label-guard test, and the release-gate scope test targets zay/main.",
+      "evidence": [
+        {"path": "scripts/__tests__/e2e-shard.test.mjs", "contains": "PR workflow routing must not depend on mutable upstream master"},
+        {"path": "scripts/__tests__/e2e-shard.test.mjs", "contains": "pr.yml fork-gate skips unrelated label events but still runs when ci fails"},
+        {"path": "scripts/__tests__/e2e-shard.test.mjs", "contains": "runStackScope(middle, \"zay/main\").full_ci"}
+      ]
+    },
+    {
+      "path": "feature-map/task-coordination.md",
+      "hunks": ["@@ -1,8 +1,16 @@", "@@ -27,9 +35,9 @@"],
+      "status": "present",
+      "ref": "PR #37 (merge b8d51ec56)",
+      "note": "Upstream moved the file to maps/feature-map/; the same text is there with links rebased to ../../.",
+      "evidence": [
+        {"path": "maps/feature-map/task-coordination.md", "contains": "[execution policy and child-return barrier](../../server/src/services/issues.ts)"},
+        {"path": "maps/feature-map/task-coordination.md", "contains": "verifies the two-child barrier stays closed while one child is blocked"}
+      ]
+    },
+    {
+      "path": "feature-map/tasks.md",
+      "hunks": ["@@ -48,6 +48,18 @@"],
+      "status": "present",
+      "ref": "PR #39 (merge 2e919e91e)",
+      "note": "Re-applied under maps/feature-map/tasks.md in upstream's format: a bold 'Conversation navigation.' paragraph instead of a ### heading, links rebased to ../../.",
+      "evidence": [{"path": "maps/feature-map/tasks.md", "contains": "**Conversation navigation.** In the task conversation, use the compact edge rail"}]
+    },
+    {
+      "path": "packages/adapters/claude-local/src/server/execute.ts",
+      "hunks": ["@@ -1008,6 +1008,10 @@", "@@ -1015,6 +1019,12 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #26 651023fe1",
+      "note": "Timed-out claude_local usage is not charged on zay/main."
+    },
+    {
+      "path": "packages/adapters/claude-local/src/server/parse.test.ts",
+      "hunks": ["@@ -557,6 +557,56 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #26 651023fe1",
+      "note": "Tests of the streamed-usage parser that M would have added."
+    },
+    {
+      "path": "packages/adapters/claude-local/src/server/parse.ts",
+      "hunks": ["@@ -54,11 +54,55 @@", "@@ -76,6 +120,12 @@", "@@ -94,6 +144,10 @@", "@@ -101,6 +155,7 @@", "@@ -125,6 +180,7 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #26 651023fe1",
+      "note": "zay/main's claude-local adapter already returns streamed usage on timeout, marked usageComplete false; the stable streamedUsage parser is not needed for the kept policy."
+    },
+    {
+      "path": "packages/adapters/opencode-local/src/server/execute.test.ts",
+      "hunks": ["@@ -107,6 +107,55 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #28 6aa948743",
+      "note": "Timed-out opencode_local usage is not charged on zay/main."
+    },
+    {
+      "path": "packages/adapters/opencode-local/src/server/execute.ts",
+      "hunks": ["@@ -674,11 +674,33 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #28 6aa948743",
+      "note": "Timed-out opencode_local usage is not charged on zay/main."
+    },
+    {
+      "path": "packages/adapters/pi-local/src/server/execute.remote.test.ts",
+      "hunks": ["@@ -777,4 +777,61 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #28 6aa948743",
+      "note": "Timed-out pi_local usage is not charged on zay/main."
+    },
+    {
+      "path": "packages/adapters/pi-local/src/server/execute.ts",
+      "hunks": ["@@ -770,11 +770,32 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #28 6aa948743",
+      "note": "Timed-out pi_local usage is not charged on zay/main."
+    },
+    {
+      "path": "server/src/__tests__/claude-local-execute.test.ts",
+      "hunks": ["@@ -45,6 +45,21 @@", "@@ -1594,6 +1609,80 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #26 651023fe1",
+      "note": "Timeout-usage test of the claude_local adapter."
+    },
+    {
+      "path": "server/src/__tests__/heartbeat-process-recovery.test.ts",
+      "hunks": ["@@ -87,6 +87,8 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #26 651023fe1",
+      "note": "The executeClaudeLocal import is used only by the dropped timeout tests; the other added import line of this hunk is on zay/main."
+    },
+    {
+      "path": "server/src/__tests__/heartbeat-process-recovery.test.ts",
+      "hunks": ["@@ -8190,6 +8231,423 @@"],
+      "status": "dropped",
+      "decision": "M-2026-11-16",
+      "ref": "stable #19 72cc8848c/8f712da68 and #26 651023fe1",
+      "note": "Mixed hunk. The #19 stopped-run tests are present via PR #32 (merge 331440601), with 'records no cost for a run stopped before its first model step finished' adapted to an unpriced zero-cent receipt (decision H-TEST-2026-11-16). The #26 claude_local timeout tests (startClaudeCliRunThatTimesOut and three charge tests) are dropped.",
+      "evidence": [
+        {"path": "server/src/__tests__/heartbeat-process-recovery.test.ts", "contains": "charges nothing for a run stopped before its first model step finished"}
+      ]
+    },
+    {
+      "path": "packages/db/src/migrations/meta/0306_snapshot.json",
+      "hunks": ["binary"],
+      "status": "superseded",
+      "decision": "J-RENAME-2026-11-16",
+      "ref": "PR #35 (merge 806a8037b), commit d0ba0ed9b",
+      "note": "Not added; the schema snapshot was regenerated on zay/main as meta/0381_snapshot.json, which includes issue_one_time_schedules (migration-snapshot-drift covers it).",
+      "evidence": [{"path": "packages/db/src/migrations/meta/0381_snapshot.json", "contains": "\"issue_one_time_schedules\""}]
+    },
+    {
+      "path": "packages/db/src/migrations/meta/_journal.json",
+      "hunks": ["binary"],
+      "status": "present",
+      "decision": "J-RENAME-2026-11-16",
+      "ref": "PR #35 (merge 806a8037b)",
+      "note": "The stable journal entry (idx 306) is present as idx 381 with tag 0381_issue_one_time_schedules after the fork's 0380.",
+      "evidence": [{"path": "packages/db/src/migrations/meta/_journal.json", "contains": "\"tag\": \"0381_issue_one_time_schedules\""}]
+    },
+    {
+      "path": "packages/paperclip-runner/docs/capability-contract.md",
+      "hunks": ["@@ -8,9 +8,9 @@", "@@ -50,29 +50,30 @@"],
+      "status": "superseded",
+      "ref": "PR #37 (merge b8d51ec56)",
+      "note": "Generated file. Regenerated on zay/main from zay/main's SKILL.md, so counts, hash and SKILL.md line anchors differ from stable; the new 'managing-specialist-child-work' row is present. check:capability-contract and check:capability-inventory exit 0 on PR #37.",
+      "evidence": [{"path": "packages/paperclip-runner/docs/capability-contract.md", "contains": "SKILL.md:managing-specialist-child-work:"}]
+    },
+    {
+      "path": "packages/paperclip-runner/generated/capability/capabilities.yaml",
+      "hunks": ["@@ -85,8 +85,8 @@", "@@ -94,196 +94,205 @@"],
+      "status": "superseded",
+      "ref": "PR #37 (merge b8d51ec56)",
+      "note": "Generated file, regenerated on zay/main from zay/main's SKILL.md (different line anchors).",
+      "evidence": [{"path": "packages/paperclip-runner/generated/capability/capabilities.yaml", "contains": ":managing-specialist-child-work\""}]
+    },
+    {
+      "path": "packages/paperclip-runner/generated/capability/capability-contract.md",
+      "hunks": ["@@ -2,9 +2,9 @@"],
+      "status": "superseded",
+      "ref": "PR #37 (merge b8d51ec56)",
+      "note": "Generated heading count and content hash, regenerated on zay/main.",
+      "evidence": [{"path": "packages/paperclip-runner/generated/capability/capability-contract.md", "contains": "- Skill/reference headings: "}]
+    },
+    {
+      "path": "packages/paperclip-runner/scripts/check-capability-inventory.test.mjs",
+      "hunks": ["@@ -42,7 +42,7 @@"],
+      "status": "superseded",
+      "ref": "PR #37 (merge b8d51ec56)",
+      "note": "Expected row count bumped by one for the new heading, from zay/main's 166 to 167 (stable: 161 to 162).",
+      "evidence": [{"path": "packages/paperclip-runner/scripts/check-capability-inventory.test.mjs", "contains": "Array.from({ length: 167 }"}]
+    },
+    {
+      "path": "packages/paperclip-runner/scripts/lib/capability-inventory.mjs",
+      "hunks": ["@@ -247,7 +247,7 @@"],
+      "status": "superseded",
+      "ref": "PR #37 (merge b8d51ec56)",
+      "note": "Expected capability count bumped by one, from zay/main's 166 to 167 (stable: 161 to 162).",
+      "evidence": [{"path": "packages/paperclip-runner/scripts/lib/capability-inventory.mjs", "contains": "capabilities: 167,"}]
+    },
+    {
+      "path": "packages/paperclip-runner/spec/capability/capabilities.yaml",
+      "hunks": [
+        "@@ -150,9 +150,24 @@", "@@ -161,13 +176,13 @@", "@@ -176,13 +191,13 @@", "@@ -191,13 +206,13 @@",
+        "@@ -206,13 +221,13 @@", "@@ -221,13 +236,13 @@", "@@ -236,13 +251,13 @@", "@@ -251,13 +266,13 @@",
+        "@@ -266,13 +281,13 @@", "@@ -281,13 +296,13 @@", "@@ -296,13 +311,13 @@", "@@ -311,13 +326,13 @@",
+        "@@ -326,13 +341,13 @@", "@@ -341,13 +356,13 @@", "@@ -356,13 +371,13 @@", "@@ -371,13 +386,13 @@",
+        "@@ -386,13 +401,13 @@", "@@ -401,13 +416,13 @@", "@@ -416,13 +431,13 @@", "@@ -431,13 +446,13 @@",
+        "@@ -446,13 +461,13 @@", "@@ -461,13 +476,13 @@", "@@ -476,13 +491,13 @@", "@@ -491,7 +506,7 @@"
+      ],
+      "status": "superseded",
+      "ref": "PR #37 (merge b8d51ec56)",
+      "note": "Generated spec, regenerated on zay/main. The new heading row is present; the remaining hunks only shift SKILL.md line anchors, which differ because zay/main's SKILL.md differs from stable's.",
+      "evidence": [{"path": "packages/paperclip-runner/spec/capability/capabilities.yaml", "contains": "\"title\": \"Managing specialist child work\""}]
+    },
+    {
+      "path": "packages/paperclip-runner/src/generated/capability-contract.ts",
+      "hunks": ["@@ -6,9 +6,9 @@"],
+      "status": "superseded",
+      "ref": "PR #37 (merge b8d51ec56)",
+      "note": "Generated counts, regenerated on zay/main (167 headings, 273 rows).",
+      "evidence": [{"path": "packages/paperclip-runner/src/generated/capability-contract.ts", "contains": "\"skillReferenceCapabilities\": 167"}]
+    },
+    {
+      "path": "server/src/__tests__/issue-one-time-schedules.test.ts",
+      "hunks": ["@@ -0,0 +1,690 @@"],
+      "status": "present",
+      "decision": "J-RENAME-2026-11-16",
+      "ref": "PR #35 (merge 806a8037b)",
+      "note": "Ported with two adaptations: cleanup truncates companies with cascade instead of stable's per-table deletes (zay/main schema), and a non-member's schedule read asserts 404 equal to GET /api/issues/:id, because zay/main hides unreadable issues with 404 (stable expected 403); a private-task test is added.",
+      "evidence": [
+        {"path": "server/src/__tests__/issue-one-time-schedules.test.ts", "contains": "truncate table companies restart identity cascade"},
+        {"path": "server/src/__tests__/issue-one-time-schedules.test.ts", "contains": "expect(nonmemberRead.status, nonmemberRead.text).toBe(404);"}
+      ]
+    },
+    {
+      "path": "server/src/__tests__/secrets-service.test.ts",
+      "hunks": ["@@ -930,7 +930,7 @@", "@@ -997,7 +1027,7 @@"],
+      "status": "superseded",
+      "decision": "B-PR9-2026-11-16",
+      "ref": "upstream dabb8c5da (#16022)",
+      "note": "Upstream names the same spies through a preparedAwsVersion helper, so stable's lines differ only in the mock value.",
+      "evidence": [
+        {"path": "server/src/__tests__/secrets-service.test.ts", "contains": "const createSecretSpy = vi.spyOn(awsSecretsManagerProvider, \"createSecret\").mockResolvedValue(preparedAwsVersion("},
+        {"path": "server/src/__tests__/secrets-service.test.ts", "contains": "const createVersionSpy = vi.spyOn(awsSecretsManagerProvider, \"createVersion\").mockResolvedValue(preparedAwsVersion("}
+      ]
+    },
+    {
+      "path": "server/src/__tests__/vitest-chat-shards.test.ts",
+      "hunks": ["@@ -36,7 +41,7 @@"],
+      "status": "present",
+      "ref": "PR #29 (merge e0d663316)",
+      "note": "The scaled child deadline is combined with upstream's PAPERCLIP_CI_PROFILE env on the same line (plan conflict 18).",
+      "evidence": [{"path": "server/src/__tests__/vitest-chat-shards.test.ts", "contains": "timeout: childTimeoutMs, maxBuffer"}]
+    },
+    {
+      "path": "server/src/services/execution-blocker.ts",
+      "hunks": ["@@ -2,9 +2,10 @@", "@@ -18,6 +19,18 @@", "@@ -79,10 +92,13 @@", "@@ -110,7 +129,7 @@"],
+      "status": "present",
+      "decision": "L-FIXTURE-2026-11-16",
+      "ref": "PR #34 (merge 54635e2a5)",
+      "note": "supportsExplicitContinuation is exported with a narrower run type and mirrors zay/main's admission checks; canRetry and the eligible-continuation flag also respect upstream's restoreHold; imports follow zay/main's module.",
+      "evidence": [
+        {"path": "server/src/services/execution-blocker.ts", "contains": "export async function supportsExplicitContinuation("},
+        {"path": "server/src/services/execution-blocker.ts", "contains": "const canRetry = Boolean(!restoreHold && run && continuationSupported"}
+      ]
+    },
+    {
+      "path": "ui/src/components/ExecutionBlockerNotice.tsx",
+      "hunks": ["@@ -48,7 +48,7 @@"],
+      "status": "superseded",
+      "ref": "upstream d33b40a5c (#16965)",
+      "note": "Upstream rewrote the notice to render a server presentation and no longer reads the blocker's canRetry/canContinue flags; the stable dead-end fix is applied server-side in task-interruption-presentation.ts by PR #34.",
+      "evidence": [
+        {"path": "ui/src/components/ExecutionBlockerNotice.tsx", "contains": "canRetry && presentation.canRetry"},
+        {"path": "server/src/services/task-interruption-presentation.ts", "contains": "supportsExplicitContinuation(db, companyId, hold.cause, run)"}
+      ]
+    },
+    {
+      "path": "ui/src/components/ExecutionBlockerNotice.test.tsx",
+      "hunks": ["@@ -26,6 +26,7 @@", "@@ -61,6 +62,19 @@"],
+      "status": "superseded",
+      "ref": "upstream d33b40a5c (#16965)",
+      "note": "Tests of the removed blocker-flag rendering; upstream's tests cover the presentation's canRetry instead, and PR #34 tests the server-side check.",
+      "evidence": [{"path": "ui/src/components/ExecutionBlockerNotice.test.tsx", "contains": "canRetry: false"}]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -422,7 +423,7 @@"],
+      "status": "present",
+      "ref": "PR #30 (merge 3c240bd9a)",
+      "note": "The import moved with the admission code into heartbeat/queue.ts (relative path ../issues.js).",
+      "evidence": [{"path": "server/src/services/heartbeat/queue.ts", "contains": "import { dependencyReadinessWakeReason, type issueService } from \"../issues.js\";"}]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -440,6 +441,12 @@"],
+      "status": "present",
+      "ref": "PR #35 (merge 806a8037b)",
+      "note": "The schedule imports moved with their users into heartbeat/queue.ts and heartbeat/scheduling.ts.",
+      "evidence": [
+        {"path": "server/src/services/heartbeat/queue.ts", "contains": "import { isIssueOneTimeScheduleEligibleStatus } from \"../issue-one-time-schedule.js\";"},
+        {"path": "server/src/services/heartbeat/scheduling.ts", "contains": "import { issueOneTimeScheduleService } from \"../issue-one-time-schedules.js\";"}
+      ]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -7387,6 +7403,22 @@"],
+      "status": "present",
+      "ref": "PR #31 (merge d0059608d)",
+      "note": "runContextSnapshotWrite is exported from heartbeat/run-preparation.ts, applied at the five whole-snapshot writes.",
+      "evidence": [{"path": "server/src/services/heartbeat/run-preparation.ts", "contains": "export function runContextSnapshotWrite(context: Record<string, unknown>)"}]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -19999,6 +20034,7 @@", "@@ -20030,11 +20066,17 @@"],
+      "status": "superseded",
+      "ref": "PR #32 (merge 331440601), commit d3175bed7",
+      "note": "Stable's charge-only mode of updateRuntimeState is not needed: zay/main's updateRuntimeState never charges, and an owned Stop is accounted on a narrow completeRun path that does not touch the agent's session pointers.",
+      "evidence": [{"path": "server/src/services/heartbeat/run-completion.ts", "contains": "let ownedProcessStop = false;"}]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -25472,7 +25514,7 @@", "@@ -25694,11 +25736,55 @@"],
+      "status": "present",
+      "ref": "PR #32 (merge 331440601)",
+      "note": "completeRun moved to heartbeat/run-completion.ts. It reads the settled Stop receipt, and handles an owned process Stop on a narrow path (late metadata write, accounting, agent status) instead of stable's usage_json IS NULL guarded update.",
+      "evidence": [
+        {"path": "server/src/services/heartbeat/run-completion.ts", "contains": "settledProcessRunCancellations.get(run.id) ??"},
+        {"path": "server/src/services/heartbeat/run-completion.ts", "contains": "if (ownedProcessStop) {"}
+      ]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -26909,6 +26995,28 @@"],
+      "status": "present",
+      "ref": "PR #31 (merge d0059608d)",
+      "note": "The executor-cleanup re-admission of a stopped run's execution-stage handoff wake is heartbeat/run-control.ts readmitExecutionStageHandoffsForRun, called from heartbeat.ts.",
+      "evidence": [
+        {"path": "server/src/services/heartbeat/run-control.ts", "contains": "async function readmitExecutionStageHandoffsForRun("},
+        {"path": "server/src/services/heartbeat.ts", "contains": "await runControl.readmitExecutionStageHandoffsForRun(latestRun);"}
+      ]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -27980,6 +28138,102 @@"],
+      "status": "present",
+      "ref": "PR #35 (merge 806a8037b)",
+      "note": "The schedule admission guard is in heartbeat/queue.ts; it reads the guard from opts and matches the schedule by id rather than by issue id.",
+      "evidence": [
+        {"path": "server/src/services/heartbeat/queue.ts", "contains": "const scheduleGuard = opts.issueOneTimeScheduleGuard;"},
+        {"path": "server/src/services/heartbeat/queue.ts", "contains": "eq(issueOneTimeSchedules.id, scheduleGuard.scheduleId),"}
+      ]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -29855,16 +30138,16 @@"],
+      "status": "present",
+      "ref": "PR #32 (merge 331440601)",
+      "note": "cancelRunInternal moved to heartbeat/run-control.ts, which keeps a successful owned Stop receipt in settledProcessRunCancellations.",
+      "evidence": [{"path": "server/src/services/heartbeat/run-control.ts", "contains": "settledProcessRunCancellations.set(run.id, processCancellationSettlement);"}]
+    },
+    {
+      "path": "server/src/services/heartbeat.ts",
+      "hunks": ["@@ -29927,6 +30210,7 @@", "@@ -29943,6 +30227,21 @@", "@@ -29976,8 +30275,11 @@"],
+      "status": "superseded",
+      "ref": "PR #32 (merge 331440601), commit d3175bed7",
+      "note": "Stable's cancelActiveForAgentInternal receipt is not needed on zay/main: every agent-wide cancel goes through cancelRunInternal, which leaves the settled receipt.",
+      "evidence": [{"path": "server/src/services/heartbeat/run-control.ts", "contains": "settledProcessRunCancellations.set(run.id, processCancellationSettlement);"}]
+    },
+    {
+      "path": "server/src/services/recovery/service.ts",
+      "hunks": ["@@ -2910,6 +2912,58 @@"],
+      "status": "present",
+      "ref": "PR #30 (merge 3c240bd9a)",
+      "note": "liveOpenChildIssues takes zay/main's RecoveryIssue pick type; the body matches.",
+      "evidence": [{"path": "server/src/services/recovery/service.ts", "contains": "async function liveOpenChildIssues(issue: Pick<RecoveryIssue, \"id\" | \"companyId\">)"}]
+    },
+    {
+      "path": "tests/e2e/chat-adapters-ui-messaging.spec.ts",
+      "hunks": ["@@ -1437,6 +1437,15 @@", "@@ -1455,6 +1464,12 @@"],
+      "status": "present",
+      "ref": "PR #40 (merge 0185f4bdf)",
+      "note": "Upstream adb69e8f0 (#15683) already waits for the canonical agent read in its loop. The stable assertion (denial survives the canonical read) moved to a separate test that starts at the UUID route and holds the canonical read (plan conflict 23).",
+      "evidence": [{"path": "tests/e2e/chat-adapters-ui-messaging.spec.ts", "contains": "a retry denial from the UUID route survives the canonical agent read"}]
+    },
+    {
+      "path": "ui/src/pages/AgentDetail.tsx",
+      "hunks": ["@@ -813,6 +813,14 @@"],
+      "status": "present",
+      "ref": "PR #40 (merge 0185f4bdf)",
+      "note": "The placeholderData decision is the exported helper sameAgentRoutePlaceholder, which also refuses another company's agent that shares the URL key.",
+      "evidence": [{"path": "ui/src/pages/AgentDetail.tsx", "contains": "sameAgentRoutePlaceholder"}]
+    },
+    {
+      "path": "ui/src/components/TaskChatThread.tsx",
+      "hunks": ["@@ -3124,8 +3127,10 @@", "@@ -3229,6 +3234,7 @@"],
+      "status": "present",
+      "ref": "PR #39 (merge 2e919e91e)",
+      "note": "The dock is mounted on mobile and receives navigationRef; the composer content inside it uses upstream's showComposer && prepareInitialContent fragment.",
+      "evidence": [
+        {"path": "ui/src/components/TaskChatThread.tsx", "contains": "navigationRef={isMobile ? setMobileNavigationContainer : undefined}>"},
+        {"path": "ui/src/components/TaskChatThread.tsx", "contains": "{showComposer && prepareInitialContent ? ("}
+      ]
+    },
+    {
+      "path": "ui/src/components/TaskChatThread.test.tsx",
+      "hunks": ["@@ -3942,6 +4007,82 @@"],
+      "status": "present",
+      "ref": "PR #39 (merge 2e919e91e)",
+      "note": "The mobile dock navigation test is ported against upstream's dock contract (pending dock stays inert, reading position checked on the scroller).",
+      "evidence": [{"path": "ui/src/components/TaskChatThread.test.tsx", "contains": "keeps narrow navigation above the growing native composer in its offset-owning dock"}]
+    },
+    {
+      "path": "ui/storybook/stories/task-chat-mobile-follow.stories.tsx",
+      "hunks": ["@@ -1,19 +1,20 @@"],
+      "status": "present",
+      "ref": "PR #39 (merge 2e919e91e)",
+      "note": "Upstream moved the story to ui/storybook/stories/tasks/ and dropped the scroll prop; the navigation container is wired there.",
+      "evidence": [{"path": "ui/storybook/stories/tasks/task-chat-mobile-follow.stories.tsx", "contains": "navigationHistoryPartial={false} navigationContainer={navigationContainer}"}]
+    }
+  ]
+}
