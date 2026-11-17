@@ -86,4 +86,5 @@ jobs:
           path: |
             tests/e2e/playwright-report/
             tests/e2e/test-results/
+            tests/e2e/postgres-log/
           retention-days: 14
