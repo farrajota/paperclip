@@ -39,6 +39,8 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { terminalizeLegacyExecutionWithOutcome } from "../services/legacy-execution-recovery.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -2067,6 +2069,114 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId }, continuationDelivery: "pending" });
     await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
+  });
+
+  async function seedFailedLegacySource(issueStatus: string) {
+    const fixture = await seedCompany();
+    const runId = randomUUID();
+    const [run] = await db.insert(heartbeatRuns).values({
+      id: runId, companyId: fixture.companyId, agentId: fixture.coderId, invocationSource: "automation",
+      status: "failed", runtimeMode: "legacy", errorCode: "prompt_too_large",
+      error: "Combined task prompt exceeds the runner API limit.",
+      contextSnapshot: { issueId: fixture.sourceIssueId },
+      startedAt: new Date("2026-10-18T08:57:40.000Z"), finishedAt: new Date("2026-10-18T08:57:42.000Z"),
+    }).returning();
+    await db.update(issues).set({ status: issueStatus }).where(eq(issues.id, fixture.sourceIssueId));
+    return { ...fixture, run: run! };
+  }
+
+  async function insertAutomaticNoReplayHold(
+    source: { companyId: string; coderId: string; sourceIssueId: string },
+    runId: string,
+    settledAt: string,
+  ) {
+    const at = new Date(settledAt);
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId: source.companyId, sourceIssueId: source.sourceIssueId, kind: "active_run_watchdog",
+      status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: source.coderId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+      evidence: { runId, originalFailureCode: "prompt_too_large", adapterRecovery: "unsupported_or_unknown", attempt: 1,
+        automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked",
+          actionOutcome: "unknown", recordedAt: at.toISOString() } },
+      createdAt: at, updatedAt: at, resolvedAt: at,
+    }).returning();
+    return hold!;
+  }
+
+  async function occupyOnlyDispatchSlot(companyId: string, agentId: string) {
+    const responsibleUserId = randomUUID();
+    await db.insert(authUsers).values({ id: responsibleUserId, name: "Recovery operator",
+      email: `${responsibleUserId}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId }).where(eq(companies.id, companyId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+    await seedHeartbeatRun({ companyId, agentId, runId: randomUUID(), status: "running" });
+  }
+
+  it("does not open a second hold when an automatic no-replay hold already covers the failed legacy run", async () => {
+    // The board moved the blocked task back to todo without recording outcomes,
+    // so the stranded-work sweep revisits the same failed run.
+    const source = await seedFailedLegacySource("todo");
+    const older = await insertAutomaticNoReplayHold(source, source.run.id, "2026-10-18T08:57:48.000Z");
+
+    const outcome = await terminalizeLegacyExecutionWithOutcome({
+      db, run: source.run, status: "failed", fromStatuses: ["failed"],
+    });
+
+    expect(outcome.escalated).toBe(false);
+    const holds = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, source.sourceIssueId));
+    expect(holds.map(hold => hold.id)).toEqual([older.id]);
+    expect(await getExecutionBlocker(db, source.companyId, source.sourceIssueId))
+      .toMatchObject({ recoveryActionId: older.id, runId: source.run.id });
+  });
+
+  it("delivers the continuation when the board reconciles the newer of two holds for one failed run", async () => {
+    const source = await seedFailedLegacySource("blocked");
+    const older = await insertAutomaticNoReplayHold(source, source.run.id, "2026-10-18T08:57:48.000Z");
+    const newer = await insertAutomaticNoReplayHold(source, source.run.id, "2026-10-18T11:09:51.000Z");
+    await occupyOnlyDispatchSlot(source.companyId, source.coderId);
+
+    await request(createApp()).post(`/api/issues/${source.sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: newer.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId: source.run.id, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Provider journal shows the request was rejected before any tool call ran." },
+    }).expect(200);
+    await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+
+    const wakes = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${newer.id}`));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({ status: "queued" });
+    const [delivered] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, newer.id));
+    expect(delivered!.evidence).toMatchObject({ continuationDelivery: "delivered", continuationRunId: wakes[0]!.runId });
+    const [retired] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, older.id));
+    expect(retired).toMatchObject({ status: "resolved", outcome: "blocked" });
+    expect(retired!.evidence).toMatchObject({
+      runId: source.run.id,
+      automaticRecovery: { policy: "preserve_without_replay_v1", replay: "execution_reconciliation",
+        reconciliationRecoveryActionId: newer.id },
+    });
+  });
+
+  it("keeps another failed run's no-replay hold when one run's outcomes are reconciled", async () => {
+    const source = await seedFailedLegacySource("blocked");
+    const otherRunId = randomUUID();
+    await seedHeartbeatRun({ companyId: source.companyId, agentId: source.coderId, runId: otherRunId,
+      issueId: source.sourceIssueId, status: "failed" });
+    const other = await insertAutomaticNoReplayHold(source, otherRunId, "2026-10-18T08:00:00.000Z");
+    const reconciled = await insertAutomaticNoReplayHold(source, source.run.id, "2026-10-18T08:57:48.000Z");
+
+    await request(createApp()).post(`/api/issues/${source.sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: reconciled.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId: source.run.id, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Provider journal shows the request was rejected before any tool call ran." },
+    }).expect(200);
+
+    const [kept] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, other.id));
+    expect(kept!.evidence).toEqual(other.evidence);
+    expect(await getExecutionBlocker(db, source.companyId, source.sourceIssueId))
+      .toMatchObject({ recoveryActionId: other.id, runId: otherRunId });
   });
 
   async function seedReconciledDelivery() {
