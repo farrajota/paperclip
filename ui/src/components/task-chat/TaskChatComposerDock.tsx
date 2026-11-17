@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ReactNode, Ref } from "react";
 import { cn } from "@/lib/utils";
 
 interface TaskChatComposerDockProps {
@@ -6,10 +6,11 @@ interface TaskChatComposerDockProps {
   mobile: boolean;
   streamlined: boolean;
   concealed?: boolean;
+  navigationRef?: Ref<HTMLDivElement>;
 }
 
 /** A normal flex footer beside the message scroller, on desktop and mobile. */
-export function TaskChatComposerDock({ children, mobile, streamlined, concealed = false }: TaskChatComposerDockProps) {
+export function TaskChatComposerDock({ children, mobile, streamlined, concealed = false, navigationRef }: TaskChatComposerDockProps) {
   return <div
     data-testid="task-chat-composer-dock"
     data-conversation-typography=""
@@ -26,6 +27,7 @@ export function TaskChatComposerDock({ children, mobile, streamlined, concealed 
         "bg-background/80 pt-1 backdrop-blur supports-[backdrop-filter]:bg-background/60 dark:bg-transparent dark:backdrop-blur-none dark:supports-[backdrop-filter]:bg-transparent",
     )}
   >
+    {navigationRef ? <div ref={navigationRef} data-testid="task-chat-navigation-slot" className="min-w-0 empty:hidden" /> : null}
     {children}
   </div>;
 }
