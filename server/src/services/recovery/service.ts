@@ -109,6 +109,7 @@ import {
   legacyExecutionNeedsReconciliationWithEvidence,
   legacyReconciliationRunFields,
   terminalizeLegacyExecution,
+  terminalizeLegacyExecutionWithOutcome,
 } from "../legacy-execution-recovery.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
@@ -4899,14 +4900,18 @@ export function recoveryService(
             ),
           );
         if (source && await legacyExecutionNeedsReconciliationWithEvidence(db, source)) {
-          await terminalizeLegacyExecution({
+          const { escalated } = await terminalizeLegacyExecutionWithOutcome({
             db,
             run: source,
             status: source.status,
             fromStatuses: [source.status],
           });
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
+          if (escalated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
       }

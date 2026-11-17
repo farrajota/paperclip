@@ -61,6 +61,82 @@ const support = await getEmbeddedPostgresTestSupport();
     return { commentIds, queueId, busy };
   }
 
+  // Production shape: a failed legacy run with a no-replay hold, then a saved
+  // user comment whose issue later left the statuses admission can deliver to.
+  async function seedHeldSavedComment(issueStatus: string, interrupt = false) {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const runId = randomUUID(), actionId = randomUUID(), commentId = randomUUID(), queueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Held saved comment", defaultResponsibleUserId: "board", issuePrefix: "H" + companyId.replaceAll("-", "") });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", adapterType: "process", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Stopped work", status: issueStatus, assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, runtimeMode: "legacy", status: "failed",
+      errorCode: "missing_output", startedAt: new Date(Date.now() - 180_000), finishedAt: new Date(Date.now() - 120_000),
+      contextSnapshot: { issueId, taskId: issueId } });
+    await db.insert(issueRecoveryActions).values({ id: actionId, companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: "legacy-execution:" + runId,
+      status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: agentId, nextAction: "Inspect the stopped work.",
+      evidence: { runId, attempt: 1, adapterRecovery: "unsupported_or_unknown", originalFailureCode: "missing_output",
+        automaticRecovery: { runId, policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } } });
+    await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorType: "user", authorUserId: "board",
+      body: "Continue from the saved state.", createdAt: new Date(Date.now() - 90_000) });
+    await db.insert(agentWakeupRequests).values({ id: queueId, companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: "issue_reopened_via_comment", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board",
+      updatedAt: new Date(Date.now() - 60_000),
+      payload: { issueId, mutation: "comment", commentId, reopenedFrom: "blocked",
+        ...(interrupt ? { queuedCommentInterrupt: { actorId: "board" } } : {}),
+        executionWait: { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved.", recoveryActionId: actionId },
+        _paperclipWakeContext: { issueId, taskId: issueId, source: "issue.comment.reopen", wakeReason: "issue_reopened_via_comment",
+          wakeCommentId: commentId, wakeCommentIds: [commentId] } } });
+    return { companyId, agentId, issueId, runId, queueId };
+  }
+
+  async function guardRefusals(agentId: string) {
+    return db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "issue_state_guard_mismatch")));
+  }
+
+  it.each([
+    ["done", false], ["cancelled", false], ["cancelled", true], ["backlog", false],
+  ] as const)("keeps a held saved comment without an admission refusal per tick for a %s issue (interrupt: %s)", async (status, interrupt) => {
+    const f = await seedHeldSavedComment(status, interrupt);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+    await heartbeatService(db).resumeQueuedRuns();
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(agentWakeupRequests.id, f.queueId));
+    await heartbeatService(db).resumeQueuedRuns();
+    expect(await guardRefusals(f.agentId)).toHaveLength(0);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.queueId)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null, finishedAt: null });
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]).toMatchObject({ status });
+    expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      eq(heartbeatRuns.status, "queued")))).toHaveLength(0);
+  });
+
+  it("does not count an already reconciled legacy failure as a new escalation", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Reconciled failure", defaultResponsibleUserId: "board", issuePrefix: "Z" + companyId.replaceAll("-", "") });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", adapterType: "process", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Handed back", status: "todo", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, runtimeMode: "legacy", status: "failed",
+      errorCode: "prompt_too_large", startedAt: new Date(Date.now() - 120_000), finishedAt: new Date(Date.now() - 100_000),
+      contextSnapshot: { issueId, taskId: issueId } });
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: "legacy-execution:" + runId,
+      status: "resolved", outcome: "handed_back", ownerType: "board", returnOwnerAgentId: agentId, nextAction: "Continue.",
+      resolvedAt: new Date(Date.now() - 50_000),
+      evidence: { runId, attempt: 1, adapterRecovery: "unsupported_or_unknown", originalFailureCode: "prompt_too_large",
+        continuationDelivery: "pending",
+        executionReconciliation: { runId, actorId: "board", actionOutcome: "not_performed", recordedAt: new Date(Date.now() - 50_000).toISOString() } } });
+    const actionsBefore = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    const issueBefore = (await db.select().from(issues).where(eq(issues.id, issueId)))[0];
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toEqual(actionsBefore);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toEqual(issueBefore);
+    expect(result.issueIds).not.toContain(issueId);
+    expect(result.escalated).toBe(0);
+  });
+
   it("does not create another provider recovery incident for an admission denial", async () => {
     const f = await seed();
     expect(await legacyExecutionNeedsReconciliationWithEvidence(db, f.run)).toBe(false);

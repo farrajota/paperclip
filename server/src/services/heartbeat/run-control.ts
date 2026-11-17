@@ -138,6 +138,8 @@ type ProcessRunCancellationSettlement = {
   error?: unknown;
 };
 
+const SAVED_COMMENT_DELIVERY_STATUSES = ["todo", "in_progress", "in_review", "blocked"];
+
 // This bounds external Stop concurrency across scopes and heartbeat service
 // instances sharing a database. Durable cancellation rows own recovery.
 const budgetStopDeliveryLimits = new WeakMap<Db, { active: number; waiting: Array<() => void> }>();
@@ -627,6 +629,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     let commentIds = queuedCommentIdsFromWakePayload(payload);
     const issueId = readNonEmptyString(payload.issueId);
     if (!issueId || wake.idempotencyKey?.startsWith("chat-inbound:")) return;
+    if (!opts?.retryCleanup) {
+      // Admission's issue-state guard below refuses these with a durable receipt.
+      // Periodic sweeps must not ask again every tick. The message stays
+      // deferred for release admission, which owns reopening terminal work.
+      const [task] = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+      if (task && (!SAVED_COMMENT_DELIVERY_STATUSES.includes(task.status) || task.assigneeAgentId !== wake.agentId)) return;
+    }
     const response = await readQueuedInteractionResponse(db, companyId, issueId, payload);
     if (!commentIds.length && !response) return;
     // Resolved cards are immutable input. Only an explicit Interrupt click can
@@ -728,7 +738,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           }, commentIds),
       requestedByActorType: "user", requestedByActorId: actorId,
       ...(interrupted ? { queuedCommentInterruptId: queueId } : { queuedCommentRequestId: queueId }),
-      issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
+      issueStateGuard: { assigneeAgentId: wake.agentId, statuses: SAVED_COMMENT_DELIVERY_STATUSES },
       idempotencyKey: `queued-comment-${interrupted ? "interrupt" : "delivery"}:${queueId}`,
     }, queueId);
   }
