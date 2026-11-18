@@ -7,7 +7,7 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, not, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -237,6 +237,29 @@ export async function markExecutionReconciliation(
         and(
           eq(issueRecoveryActions.companyId, action.companyId),
           eq(issueRecoveryActions.id, action.id),
+        ),
+      );
+    // The decision records this run's observed outcomes, so it also answers any
+    // other settled no-replay verdict on the same run. Left in place, such a
+    // sibling stays the effective blocker and defers this continuation forever.
+    if (!options?.workspaceRepairOnly) await tx
+      .update(issueRecoveryActions)
+      .set({
+        evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery}',
+          (${issueRecoveryActions.evidence}->'automaticRecovery') || ${JSON.stringify({
+            replay: "execution_reconciliation",
+            reconciliationRecoveryActionId: action.id,
+          })}::jsonb)`,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, action.companyId),
+          eq(issueRecoveryActions.sourceIssueId, action.sourceIssueId),
+          ne(issueRecoveryActions.id, action.id),
+          inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
+          sql`${issueRecoveryActions.evidence}->>'runId' = ${decision.runId}`,
+          sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+          sql`not (${issueRecoveryActions.evidence} ?| array['workspaceRestoreFailure', 'workspaceRestoreRecovery'])`,
         ),
       );
   });

@@ -16,6 +16,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { logActivity } from "./activity-log.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { issueService } from "./issues.js";
+import { executionBlockerPredicate } from "./execution-blocker.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
@@ -243,6 +244,9 @@ export async function terminalizeLegacyExecutionWithOutcome(
       // its recorded decision instead of creating another hold. The explicit
       // receipt must identify an actual successor under the same task/agent;
       // retained user intent remains authoritative after that successor finishes.
+      // A settled no-replay hold for this run is already its effective blocker.
+      // The source-scoped upsert sees only active rows, so another hold would
+      // duplicate the fingerprint and could outlive a reconciliation of either.
       const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
@@ -269,8 +273,10 @@ export async function terminalizeLegacyExecutionWithOutcome(
             ),
             and(
               sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
-              or(sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
-                sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`),
+              hasWorkspaceRestoreFailure(updated.resultJson)
+                ? or(sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
+                  sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`)
+                : executionBlockerPredicate(),
               sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
             ),
           ),
