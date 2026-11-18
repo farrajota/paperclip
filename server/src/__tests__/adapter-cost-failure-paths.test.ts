@@ -237,7 +237,7 @@ describe("CLI adapter accounting on timeout", () => {
       context: {}, onLog: async () => {},
     });
     expect(result.timedOut).toBe(true);
-    expect(result.usageComplete).toBe(["codex", "cursor", "gemini", "kimi"].includes(fixture.name));
+    expect(result.usageComplete).toBe(["claude", "codex", "cursor", "gemini", "kimi"].includes(fixture.name));
     if (fixture.name === "kimi") expect(result.costStatus).toBe("unpriced");
     expect(result.usageBasis).toBe("per_run");
     expect(result.provider).toBeTruthy();
