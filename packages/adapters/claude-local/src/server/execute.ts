@@ -987,7 +987,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
-    return { proc, parsedStream, parsed };
+    return { proc, parsedStream, parsed, streamed: consumeAccounting("") };
   };
 
   const toAdapterResult = (
@@ -995,10 +995,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       proc: RunProcessResult;
       parsedStream: ReturnType<typeof parseClaudeStreamJson>;
       parsed: Record<string, unknown> | null;
+      streamed: ReturnType<typeof parseClaudeStreamJson>;
     },
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
-    const { proc, parsedStream, parsed } = attempt;
+    const { proc, parsedStream, parsed, streamed } = attempt;
     const loginMeta = detectClaudeLoginRequired({
       parsed,
       stdout: proc.stdout,
@@ -1085,11 +1086,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? "claude_transient_upstream"
         : null;
       const errorFamily = providerQuota ? "provider_quota" : transientUpstream ? "transient_upstream" : null;
+      // Claude prints its system init event before its first model request, so
+      // an exited CLI that streamed neither init nor usage made no billable call.
+      const sessionStarted = streamed.sessionId !== null || streamed.usage !== null;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: false,
-        usageComplete: parsedStream.resultJson !== null,
+        // The exited CLI can no longer write its result event, and the host has
+        // no other receipt source for this run.
+        usageComplete: true,
         usage: parsedStream.usage ?? undefined,
         usageBasis: "per_run",
         provider: "anthropic",
@@ -1097,7 +1103,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         model: Object.keys(parseObject(parsedStream.resultJson?.modelUsage)).length > 1 ? "mixed" : parsedStream.model || model,
         usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
         billingType,
-        costUsd: parsedStream.costUsd,
+        costUsd: sessionStarted ? parsedStream.costUsd : 0,
         errorMessage: fallbackErrorMessage,
         errorCode,
         errorFamily,

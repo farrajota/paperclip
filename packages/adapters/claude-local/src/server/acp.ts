@@ -405,9 +405,10 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
       ...ctx,
       config: buildClaudeAcpConfig(ctx.config, target?.kind === "remote" ? {} : process.env),
     });
-    // A timeout closes the ACP runtime. Without its post-turn receipt the
+    // A timeout or failure ends the ACP turn. Without its post-turn receipt the
     // streamed usage is the last evidence the host will receive for this run.
-    return mapClaudeAcpAuthErrorCode(result.timedOut ? { ...result, usageComplete: true } : result);
+    const turnEnded = result.timedOut || result.exitCode !== 0;
+    return mapClaudeAcpAuthErrorCode(turnEnded ? { ...result, usageComplete: true } : result);
   };
 }
 
