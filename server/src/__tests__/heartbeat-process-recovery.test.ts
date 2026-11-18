@@ -8349,26 +8349,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  // A timed-out claude_local run is stopped before Claude reports the run's
-  // totals: the CLI is killed before its result event, and the ACP runtime is
-  // closed without a post-turn usage receipt. The usage it already streamed
-  // belongs to model calls that were made.
+  // A claude_local run that times out or fails is stopped before Claude reports
+  // the run's totals: the CLI exits before its result event, and the ACP runtime
+  // ends the turn without a post-turn usage receipt. The usage it already
+  // streamed belongs to model calls that were made.
+  type ClaudeRunEnding = "timeout" | "failure" | "startup_crash";
   const claudeTimeoutUsage = { inputTokens: 1_200, cachedInputTokens: 400, outputTokens: 75 };
-  async function writeTimingOutClaudeCli(root: string) {
+  async function writeStoppingClaudeCli(root: string, ending: ClaudeRunEnding) {
     const commandPath = path.join(root, "claude");
     const sessionId = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
-    const events = [
+    const events = ending === "startup_crash" ? [] : [
       { type: "system", subtype: "init", session_id: sessionId, model: "claude-sonnet-5" },
       { type: "assistant", session_id: sessionId, message: { id: "msg_timeout_1",
         content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "sleep 600" } }],
         usage: { input_tokens: 10, cache_creation_input_tokens: 1_190, cache_read_input_tokens: 400, output_tokens: 75 } } },
     ];
+    const end = ending === "timeout" ? "setInterval(() => {}, 1000);" : 'process.stderr.write("fatal: claude crashed\\n"); process.exit(1);';
     await fs.writeFile(commandPath, `#!/usr/bin/env node\nif (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }\n${
-      events.map(event => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("\n")}\nsetInterval(() => {}, 1000);\n`, "utf8");
+      events.map(event => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("\n")}\n${end}\n`, "utf8");
     await fs.chmod(commandPath, 0o755);
     return commandPath;
   }
-  function timingOutClaudeAcpExecutor() {
+  function stoppingClaudeAcpExecutor(ending: ClaudeRunEnding) {
     let release = () => {};
     const cancelled = new Promise<void>(resolve => { release = resolve; });
     return createClaudeAcpExecutor({
@@ -8380,9 +8382,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           events: (async function* () {
             yield { type: "status", text: "usage", tag: "usage_update",
               breakdown: { inputTokens: 1_200, outputTokens: 75, cachedReadTokens: 400 } };
-            await cancelled;
+            if (ending === "timeout") await cancelled;
           })(),
-          result: cancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+          result: ending === "timeout"
+            ? cancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" }))
+            : Promise.resolve({ status: "failed", error: { code: "INTERNAL", message: "claude-agent-acp exited" } }),
           cancel: async () => release(),
           closeStream: async () => {},
         }),
@@ -8395,14 +8399,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }) as never,
     });
   }
-  async function runClaudeUntilTimeout(engine: "cli" | "acp", env: Record<string, string> = {}) {
+  async function runClaudeUntilStopped(engine: "cli" | "acp", ending: ClaudeRunEnding, env: Record<string, string> = {}) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-timeout-usage-"));
     const workspace = path.join(root, "workspace");
     await fs.mkdir(workspace, { recursive: true });
     const adapterConfig = engine === "cli"
-      ? { engine, command: await writeTimingOutClaudeCli(root), cwd: workspace, timeoutSec: 1, graceSec: 1, promptTemplate: "Follow the paperclip heartbeat.", env }
+      ? { engine, command: await writeStoppingClaudeCli(root, ending), cwd: workspace, timeoutSec: 1, graceSec: 1, promptTemplate: "Follow the paperclip heartbeat.", env }
       : { engine, cwd: workspace, stateDir: path.join(root, "state"), timeoutSec: 1, promptTemplate: "Follow the paperclip heartbeat.", env };
-    const execute = engine === "cli" ? executeClaudeLocal : timingOutClaudeAcpExecutor();
+    const execute = engine === "cli" ? executeClaudeLocal : stoppingClaudeAcpExecutor(ending);
     mockAdapterExecute.mockImplementationOnce((async (input: unknown) =>
       execute(input as Parameters<typeof executeClaudeLocal>[0])) as typeof mockAdapterExecute);
     const fixture = await seedRunFixture({ runtimeMode: "legacy", adapterType: "claude_local", agentStatus: "idle", runStatus: "queued" });
@@ -8422,6 +8426,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
     return fixture;
   }
+  const runClaudeUntilTimeout = (engine: "cli" | "acp", env: Record<string, string> = {}) => runClaudeUntilStopped(engine, "timeout", env);
+
+  it.each(["cli", "acp"] as const)("settles the usage a subscription claude_local %s run streamed before it failed without a result", async engine => {
+    const { companyId, agentId, runId } = await runClaudeUntilStopped(engine, "failure");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0])).toMatchObject({
+      status: "failed", costAccountingPending: false, costAccountedAt: expect.any(Date),
+      usageJson: { accountingReceiptReady: true, ...claudeTimeoutUsage, usageSource: "per_run", provider: "anthropic",
+        billingType: "subscription_included", costStatus: "reported" },
+    });
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toMatchObject({ agentId, billingType: "subscription_included", ...claudeTimeoutUsage, costCents: 0, costStatus: "reported" });
+    expect((await db.select().from(budgetReservations).where(eq(budgetReservations.runId, runId)))[0]?.state).toBe("settled");
+    expect((await db.select().from(companies).where(eq(companies.id, companyId)))[0]?.pauseReason).toBeNull();
+    expect(await db.select().from(budgetIncidents).where(eq(budgetIncidents.companyId, companyId))).toEqual([]);
+  });
+
+  it("records the tokens of a failed API-billed claude_local CLI run as unpriced instead of holding its accounting", async () => {
+    const { agentId, runId } = await runClaudeUntilStopped("cli", "failure", { ANTHROPIC_API_KEY: "test-placeholder" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0])).toMatchObject({
+      status: "failed", costAccountingPending: false, costAccountedAt: expect.any(Date),
+      usageJson: { accountingReceiptReady: true, billingType: "metered_api", costStatus: "unpriced" },
+    });
+    expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId))).toEqual([
+      expect.objectContaining({ agentId, billingType: "metered_api", ...claudeTimeoutUsage, costCents: 0, costStatus: "unpriced" })]);
+  });
+
+  // Claude prints its system init event before its first model request. A CLI
+  // that exits before printing anything made no billable request.
+  it("does not charge an API-billed claude_local CLI run that crashed before Claude started a session", async () => {
+    const { companyId, runId } = await runClaudeUntilStopped("cli", "startup_crash", { ANTHROPIC_API_KEY: "test-placeholder" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0])).toMatchObject({
+      status: "failed", costAccountingPending: false, costAccountedAt: expect.any(Date),
+      usageJson: { accountingReceiptReady: true, costStatus: "reported" },
+    });
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs.filter(cost => cost.costStatus === "unpriced" || cost.costCents !== 0)).toEqual([]);
+    expect((await db.select().from(budgetReservations).where(eq(budgetReservations.runId, runId)))[0]?.state).not.toBe("held");
+    expect((await db.select().from(companies).where(eq(companies.id, companyId)))[0]?.pauseReason).toBeNull();
+    expect(await db.select().from(budgetIncidents).where(eq(budgetIncidents.companyId, companyId))).toEqual([]);
+  });
 
   it.each(["cli", "acp"] as const)("settles the usage a subscription claude_local %s run streamed before it timed out", async engine => {
     const { companyId, agentId, runId, issueId } = await runClaudeUntilTimeout(engine);
