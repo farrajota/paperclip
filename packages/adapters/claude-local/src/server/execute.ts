@@ -1016,7 +1016,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: true,
-        usageComplete: parsedStream.resultJson !== null,
+        // The killed CLI can never write its result event, and the host has no
+        // other receipt source for this run. Certify what it streamed, or the
+        // run's accounting waits for a receipt that cannot arrive.
+        usageComplete: true,
         usage: parsedStream.usage ?? undefined,
         usageBasis: "per_run",
         provider: "anthropic",

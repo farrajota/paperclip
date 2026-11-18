@@ -108,6 +108,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
 import { parseOpenCodeJsonl } from "@paperclipai/adapter-opencode-local/server";
+import { createClaudeAcpExecutor, execute as executeClaudeLocal } from "@paperclipai/adapter-claude-local/server";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolvePaperclipInstanceRoot,
@@ -8346,6 +8347,110 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       factory.mockRestore();
       append.mockRestore();
     }
+  });
+
+  // A timed-out claude_local run is stopped before Claude reports the run's
+  // totals: the CLI is killed before its result event, and the ACP runtime is
+  // closed without a post-turn usage receipt. The usage it already streamed
+  // belongs to model calls that were made.
+  const claudeTimeoutUsage = { inputTokens: 1_200, cachedInputTokens: 400, outputTokens: 75 };
+  async function writeTimingOutClaudeCli(root: string) {
+    const commandPath = path.join(root, "claude");
+    const sessionId = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+    const events = [
+      { type: "system", subtype: "init", session_id: sessionId, model: "claude-sonnet-5" },
+      { type: "assistant", session_id: sessionId, message: { id: "msg_timeout_1",
+        content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "sleep 600" } }],
+        usage: { input_tokens: 10, cache_creation_input_tokens: 1_190, cache_read_input_tokens: 400, output_tokens: 75 } } },
+    ];
+    await fs.writeFile(commandPath, `#!/usr/bin/env node\nif (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }\n${
+      events.map(event => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("\n")}\nsetInterval(() => {}, 1000);\n`, "utf8");
+    await fs.chmod(commandPath, 0o755);
+    return commandPath;
+  }
+  function timingOutClaudeAcpExecutor() {
+    let release = () => {};
+    const cancelled = new Promise<void>(resolve => { release = resolve; });
+    return createClaudeAcpExecutor({
+      createRuntime: () => ({
+        ensureSession: async (input: { sessionKey: string; cwd?: string }) => ({ sessionKey: input.sessionKey, backend: "acpx",
+          runtimeSessionName: "runtime-1", cwd: input.cwd, acpxRecordId: "record-1", backendSessionId: "acp-1", agentSessionId: "agent-1" }),
+        startTurn: () => ({
+          requestId: "request-1",
+          events: (async function* () {
+            yield { type: "status", text: "usage", tag: "usage_update",
+              breakdown: { inputTokens: 1_200, outputTokens: 75, cachedReadTokens: 400 } };
+            await cancelled;
+          })(),
+          result: cancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+          cancel: async () => release(),
+          closeStream: async () => {},
+        }),
+        getCapabilities: () => ({ controls: [] }),
+        getStatus: async () => ({}),
+        setConfigOption: async () => {},
+        setMode: async () => {},
+        cancel: async () => release(),
+        close: async () => {},
+      }) as never,
+    });
+  }
+  async function runClaudeUntilTimeout(engine: "cli" | "acp", env: Record<string, string> = {}) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-timeout-usage-"));
+    const workspace = path.join(root, "workspace");
+    await fs.mkdir(workspace, { recursive: true });
+    const adapterConfig = engine === "cli"
+      ? { engine, command: await writeTimingOutClaudeCli(root), cwd: workspace, timeoutSec: 1, graceSec: 1, promptTemplate: "Follow the paperclip heartbeat.", env }
+      : { engine, cwd: workspace, stateDir: path.join(root, "state"), timeoutSec: 1, promptTemplate: "Follow the paperclip heartbeat.", env };
+    const execute = engine === "cli" ? executeClaudeLocal : timingOutClaudeAcpExecutor();
+    mockAdapterExecute.mockImplementationOnce((async (input: unknown) =>
+      execute(input as Parameters<typeof executeClaudeLocal>[0])) as typeof mockAdapterExecute);
+    const fixture = await seedRunFixture({ runtimeMode: "legacy", adapterType: "claude_local", agentStatus: "idle", runStatus: "queued" });
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, fixture.agentId));
+    await db.insert(budgetPolicies).values({ companyId: fixture.companyId, scopeType: "company", scopeId: fixture.companyId,
+      metric: "billed_cents", windowKind: "calendar_month_utc", amount: 1_000, reservationCents: "10.0000000", isActive: true });
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    const heartbeat = heartbeatService(db);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+    return fixture;
+  }
+
+  it.each(["cli", "acp"] as const)("settles the usage a subscription claude_local %s run streamed before it timed out", async engine => {
+    const { companyId, agentId, runId, issueId } = await runClaudeUntilTimeout(engine);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0])).toMatchObject({
+      status: "timed_out", costAccountingPending: false, costAccountedAt: expect.any(Date),
+      usageJson: { accountingReceiptReady: true, ...claudeTimeoutUsage, usageSource: "per_run", provider: "anthropic",
+        billingType: "subscription_included", costStatus: "reported" },
+    });
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toMatchObject({ agentId, issueId, provider: "anthropic", billingType: "subscription_included",
+      ...claudeTimeoutUsage, costCents: 0, costStatus: "reported" });
+    expect((await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId)))[0]).toMatchObject({
+      totalInputTokens: 1_200, totalCachedInputTokens: 400, totalOutputTokens: 75 });
+    expect((await db.select().from(budgetReservations).where(eq(budgetReservations.runId, runId)))[0]?.state).toBe("settled");
+    expect((await db.select().from(companies).where(eq(companies.id, companyId)))[0]?.pauseReason).toBeNull();
+    expect(await db.select().from(budgetIncidents).where(eq(budgetIncidents.companyId, companyId))).toEqual([]);
+  });
+
+  it("records the tokens of a timed-out API-billed claude_local CLI run as unpriced instead of holding its accounting", async () => {
+    const { agentId, runId } = await runClaudeUntilTimeout("cli", { ANTHROPIC_API_KEY: "test-placeholder" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0])).toMatchObject({
+      status: "timed_out", costAccountingPending: false, costAccountedAt: expect.any(Date),
+      usageJson: { accountingReceiptReady: true, billingType: "metered_api", costStatus: "unpriced" },
+    });
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs).toHaveLength(1);
+    expect(costs[0]).toMatchObject({ agentId, model: "claude-sonnet-5", billingType: "metered_api", ...claudeTimeoutUsage,
+      costCents: 0, costStatus: "unpriced" });
   });
 
   it("persists a failed capture before heartbeat failure finalization settles an older receipt", async () => {
